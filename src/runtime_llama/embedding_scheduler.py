@@ -1,0 +1,195 @@
+"""Adapter-scoped, bounded admission for external embedding requests."""
+
+from __future__ import annotations
+
+from collections import deque
+from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
+from dataclasses import dataclass
+from threading import Condition
+from typing import Any, Callable
+
+from runtime_llama.errors import LLMBackendError
+
+
+@dataclass(eq=False)
+class _Job:
+    run: Callable[[str], Any]
+    check: Callable[[], None]
+    future: Future
+    model: str
+
+
+class EmbeddingScheduler:
+    """Plan balanced alias quotas and admit them on one bounded shared queue."""
+
+    def __init__(self, parallelism: int, queue_size: int, replicas: dict[str, int]):
+        self.parallelism, self.queue_size = parallelism, queue_size
+        self._limits = dict(replicas)
+        self._aliases = tuple(replicas)
+        self._replica_active = dict.fromkeys(replicas, 0)
+        self._replica_peak = dict.fromkeys(replicas, 0)
+        self._condition = Condition()
+        self._queue: deque[_Job] = deque()
+        self._active = self._peak_active = self._peak_queued = 0
+        self._next_alias = 0
+        self._closed = False
+        self._executor = ThreadPoolExecutor(
+            max_workers=parallelism, thread_name_prefix="runtime_llama_embedding"
+        )
+
+    def plan_window(self, text_count: int) -> tuple[tuple[str, int], ...]:
+        """Rotate distinct destinations for one total text budget.
+
+        Occupancy only affects admission, not the quota or topology. The caller
+        owns the contiguous input slices corresponding to the returned sizes.
+        """
+        if (
+            not isinstance(text_count, int)
+            or isinstance(text_count, bool)
+            or text_count < 0
+        ):
+            raise ValueError("text_count must be a nonnegative integer")
+        with self._condition:
+            if self._closed:
+                raise LLMBackendError("llamacpp_embedding_adapter_closed")
+            if text_count == 0:
+                return ()
+            count = min(text_count, len(self._aliases), self.parallelism)
+            if count == 0:
+                raise LLMBackendError("llamacpp_embedding_no_usable_replica")
+            base, remainder = divmod(text_count, count)
+            planned = tuple(
+                (
+                    self._aliases[(self._next_alias + offset) % len(self._aliases)],
+                    base + (offset < remainder),
+                )
+                for offset in range(count)
+            )
+            self._next_alias = (self._next_alias + count) % len(self._aliases)
+            return planned
+
+    def _can_dispatch(self, model: str) -> bool:
+        return (
+            self._active < self.parallelism
+            and self._replica_active[model] < self._limits[model]
+        )
+
+    @staticmethod
+    def _fail(job: _Job, exc: BaseException) -> None:
+        try:
+            job.future.set_exception(exc)
+        except InvalidStateError:
+            # A caller may cancel its Future before it has been dispatched.
+            pass
+
+    def _dispatch(self, job: _Job) -> None:
+        self._active += 1
+        self._replica_active[job.model] += 1
+        self._peak_active = max(self._peak_active, self._active)
+        self._replica_peak[job.model] = max(
+            self._replica_peak[job.model], self._replica_active[job.model]
+        )
+        self._executor.submit(self._run, job)
+
+    def _run(self, job: _Job) -> None:
+        running = False
+        result = None
+        failure = None
+        try:
+            running = job.future.set_running_or_notify_cancel()
+            if running:
+                try:
+                    job.check()
+                    result = job.run(job.model)
+                except BaseException as exc:
+                    failure = exc
+        finally:
+            with self._condition:
+                self._active -= 1
+                self._replica_active[job.model] -= 1
+                self._pump()
+                self._condition.notify_all()
+        # Completion is the drain boundary: the quota's transport has returned
+        # and its scheduler permits have been released before callers wake.
+        if running:
+            if failure is not None:
+                job.future.set_exception(failure)
+            else:
+                job.future.set_result(result)
+
+    def _pump(self) -> None:
+        while self._queue and not self._closed:
+            candidate = None
+            for job in tuple(self._queue):
+                if job.future.cancelled():
+                    self._queue.remove(job)
+                    continue
+                try:
+                    job.check()
+                except BaseException as exc:
+                    self._queue.remove(job)
+                    self._fail(job, exc)
+                    continue
+                # The oldest eligible job wins. Skipping a busy alias cannot
+                # overtake an older admitted job for that same alias.
+                if candidate is None and self._can_dispatch(job.model):
+                    candidate = job
+            if candidate is None:
+                break
+            self._queue.remove(candidate)
+            self._dispatch(candidate)
+
+    def submit(
+        self,
+        run: Callable[[str], Any],
+        check: Callable[[], None],
+        *,
+        model: str,
+    ) -> Future:
+        """Admit an affine quota; blocked submitters stay outside the queue."""
+        job = _Job(run, check, Future(), model)
+        with self._condition:
+            while True:
+                check()
+                if self._closed:
+                    raise LLMBackendError("llamacpp_embedding_adapter_closed")
+                if model not in self._limits:
+                    raise LLMBackendError("llamacpp_embedding_unknown_replica")
+                self._pump()
+                same_alias_queued = any(queued.model == model for queued in self._queue)
+                if self._can_dispatch(model) and not same_alias_queued:
+                    self._dispatch(job)
+                    return job.future
+                if len(self._queue) < self.queue_size:
+                    self._queue.append(job)
+                    self._peak_queued = max(self._peak_queued, len(self._queue))
+                    return job.future
+                self._condition.wait(0.05)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._condition:
+            return {
+                "in_flight": self._active,
+                "queued": len(self._queue),
+                "peak_in_flight": self._peak_active,
+                "peak_queued": self._peak_queued,
+                "replicas": {
+                    alias: {
+                        "in_flight": self._replica_active[alias],
+                        "peak_in_flight": self._replica_peak[alias],
+                        "max_in_flight": self._limits[alias],
+                    }
+                    for alias in self._aliases
+                },
+            }
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            while self._queue:
+                self._fail(
+                    self._queue.popleft(),
+                    LLMBackendError("llamacpp_embedding_adapter_closed"),
+                )
+            self._condition.notify_all()
+        self._executor.shutdown(wait=True)

@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "fixed_before_live_execution": true,
+  "endpoint": null,
+  "model": null,
+  "expected_build": null,
+  "targets_prompt_tokens": [
+    8192,
+    32768,
+    65536
+  ],
+  "target_tolerance_fraction": 0.02,
+  "history_user_assistant_pairs_minimum": 24,
+  "inference_requests_per_size": 2,
+  "output_token_budget_per_request": 128,
+  "sampling": {
+    "temperature": 0,
+    "seed": 4242,
+    "reasoning": "off"
+  },
+  "idle_timeout_seconds": 900,
+  "absolute_call_budget_seconds": 1500,
+  "slot_poll_interval_seconds": 10,
+  "calibration_template_offset_abs_max": 16,
+  "usage_prompt_delta_vs_calibrated_template_max": 8,
+  "library_oracles": [
+    "Outgoing wire messages are byte-semantically identical to all caller messages; no truncation or tool ID changes.",
+    "All three distant markers and the two correlated tool calls/results survive template rendering.",
+    "Exactly one normalized terminal event, last in stream, with completed reason and observed provider terminal.",
+    "Normalized visible content is identical to raw provider SSE content for these plain JSON/integer cases.",
+    "Observed prompt usage is within 8 tokens of tokenizer count plus small-template calibration offset; total usage is additive and completion <=128.",
+    "Normalized usage agrees with observed raw provider usage.",
+    "A real follow-up reuses actual previous assistant output plus complete existing history."
+  ],
+  "model_oracles": {
+    "recall": {
+      "early": "AMBER7",
+      "middle": "COBALT3",
+      "late": "JADE9",
+      "tool_a": 314,
+      "tool_b": 271
+    },
+    "followup_visible_exact": "585",
+    "response_schema_does_not_encode_expected_values": true
+  },
+  "failure_classification": {
+    "model_behavior_failure": "Wire/template/metadata preserved, raw provider output equals normalized output, but exact distant recall or arithmetic is wrong.",
+    "library_contract_failure": "Messages/tool structures change on wire, provider text or usage is lost/changed, terminal contract invalid.",
+    "server_or_transport_failure": "Typed HTTP/network/timeout/context failures; preserve diagnostics and stop next size until no task is busy.",
+    "harness_failure": "Unexpected script/preflight/schema error; preserve and report without counting as product failure."
+  },
+  "no_hidden_retries": true,
+  "no_runtime_admin_mutations": true,
+  "scope_limits": [
+    "24 historical exchanges per case are seeded synthetic fixtures, not 24 independent completed inference calls.",
+    "This qualifies complete multi-turn HTTP history plus two actual generated turns at each size.",
+    "Not a maximum-context test at 262144 tokens or a quality/performance benchmark.",
+    "Tool history is supplied by the test; no MCP executor is invoked.",
+    "Each case has an independent history and no implicit cross-case server/session memory is assumed."
+  ]
+}

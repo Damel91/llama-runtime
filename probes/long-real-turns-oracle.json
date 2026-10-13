@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "fixed_before_execution": true,
+  "live_generation_calls_exact": 24,
+  "one_adapter_and_client_reused": true,
+  "final_prompt_tokens_minimum": 8192,
+  "sizing_target_tokens": 10000,
+  "sizing_tolerance_fraction": 0.03,
+  "output_token_budget_per_request": 32,
+  "expected_visible": {
+    "turns_1_to_22": "ACK followed by the exact two-digit turn number, for example ACK01",
+    "turn_23": "AMBER7 COBALT3 JADE9",
+    "turn_24": "40"
+  },
+  "library_checks_each_turn": [
+    "Exactly one HTTP generation request and the selected model on every request.",
+    "All caller history, including the actual preceding assistant outputs, survives unchanged on wire.",
+    "Provider visible SSE content and normalized visible output agree exactly.",
+    "Completed terminal is observed; usage is additive, completion<=32 and provider usage is preserved.",
+    "Prompt usage agrees within8tokens with server rendering/tokenizer count plus the prior fixed calibration overhead."
+  ],
+  "global_budget_seconds_including_long_cases": 2700,
+  "no_retries": true,
+  "no_runtime_admin_actions": true,
+  "scope": "24 actual consecutive generation calls over an explicitly accumulated conversation. The client is a stateless HTTP adapter: caller-supplied history is reused, not hidden server memory. Synthetic inventory input; no MCP executor and no consumer migration."
+}

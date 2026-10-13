@@ -1,0 +1,42 @@
+{
+  "protocol": 1,
+  "declared_before_execution": true,
+  "scope": "Controlled HTTP socket fault injection; never claim injected failures came from Noxi.",
+  "modes": {
+    "fixture": "All HTTP responses synthetic, loopback only.",
+    "live_proxy": "Injected faults synthetic; unfaulted responses forwarded unchanged from externally managed Noxi. No server control endpoints."
+  },
+  "embedding_adaptive_capacity": {
+    "injection": "First embedding batch of four returns HTTP400/type exceed_context_size_error.",
+    "expected_provider_batch_sizes": "[4,2,2] + 32 successful batches of2 + [4]",
+    "initial_reduction": 2,
+    "child_successes_toward_recovery": 0,
+    "recovery_success_window": 32,
+    "restored_size": 4,
+    "all_outputs": "Finite vectors with expected dimension and exact input count. No truncation. Numeric identity/order is independently qualified by the ingest campaign."
+  },
+  "embedding_http_errors": {
+    "statuses": [401,429,500],
+    "expected": "ClientHTTPError exact status; exactly one failing embedding request, no split/retry. Next call on same adapter succeeds."
+  },
+  "embedding_invalid_payloads": {
+    "cases": ["duplicate_index", "nonfinite_vector"],
+    "expected": "LLMBackendError, exactly one failing embedding request; no vectors published and next call succeeds."
+  },
+  "embedding_single_capacity": "One input context error must not retry, split or truncate; next call succeeds.",
+  "llm_http_errors": {
+    "statuses": [401,429,500],
+    "expected": "ClientHTTPError exact status; one chat request, no hidden retry; diagnostics exclude prompt/body/key/path. Next call on same adapter returns RECOVERED with fresh usage."
+  },
+  "llm_stream_errors": {
+    "malformed_sse": "LLMBackendError llama_server_malformed_sse_json",
+    "early_eof": "LLMBackendError llama_stream_ended_before_finish_reason; diagnostic terminal_reason early_eof",
+    "invalid_usage": "LLMBackendError llama_malformed_usage_counter",
+    "socket_disconnect": "LLMBackendError llama_server_transport_failure",
+    "expected_common": "One chat request per failure, no hidden retry; get_last_usage is None and terminal backend_error. Same adapter then succeeds and has fresh usage."
+  },
+  "missing_usage": "Completed response without usage keeps usage unknown; following normal response has fresh usage.",
+  "injected_timeouts": "LLM stream and embedding responses deliberately delayed0.2seconds: timeout0.04seconds yields typed LLMTimeoutError with no hidden retry; next call on same adapter succeeds with fresh state. Late synthetic response cannot overwrite fresh usage. This does not prove remote inference cancellation.",
+  "selected_model_guard": "Every chat request must carry the exact selected LLM alias; embedding/tokenize bodies and props query must carry the exact selected embedding alias. Missing, changed or duplicate props aliases are rejected before upstream forwarding and fail the campaign. Fixture-only self-test exercises nine rejected and four accepted route/model combinations with loopback upstream.",
+  "not_qualified": ["actual Noxi restart", "real VPN/TLS disruption", "server crash or OOM", "remote timeout cancellation latency", "MCP consumer behavior"]
+}
