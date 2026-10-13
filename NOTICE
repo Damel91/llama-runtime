@@ -1,0 +1,20 @@
+llama-runtime
+Python distribution: runtime-llama
+
+Copyright (c) 2026 Davide Mele.
+
+This project is distributed under the Apache License, Version 2.0, in LICENSE.
+The following upstream attribution and license remain applicable to the
+respective derived component.
+
+The HTTP client in src/runtime_llama/client.py is adapted from LlamaCppClient
+in llamatelemetry/llamatelemetry at a0a1df88e3b143d1e38e241b2599e82c56092a0b.
+Copyright (c) 2024 Waqas Muhammad. The original MIT license is reproduced at
+src/runtime_llama/_vendor/llamatelemetry.LICENSE and included in distributions.
+Request dispatch, headers, and endpoint/payload mappings derive from upstream;
+stream parsing, cancellation, closure and raw response handling were adapted.
+
+Functional contracts, error/runaway handling, MCP data contracts, usage types,
+generation and embedding behaviors, and selected regression cases derive from
+the project owner's earlier lmstudio-agent-runtime implementation.
+See docs/PROVENANCE.md for the component boundaries and adaptation details.
