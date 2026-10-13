@@ -1,31 +1,51 @@
 # llama-runtime
 
-Python adapters for **llama.cpp / llama-server HTTP servers**: streaming
-generation, reasoning, structured tool calls, embeddings and replica discovery.
-Connect to a server on your machine, a remote host or a private network while
-keeping control of its build, model loading and hardware configuration.
+A Python library for **llama.cpp / llama-server HTTP servers**, providing
+generation and embedding adapters for local servers, remote hosts and private
+networks. The Python distribution is `runtime-llama` and the import namespace is
+`runtime_llama`. Python 3.11 or later is required; `requests` is the only runtime
+dependency.
 
-| Capability | Library behavior |
+## Why this library exists
+
+`llama-runtime` was created to give agents, coding tools, retrieval pipelines
+and other Python applications reusable building blocks for llama.cpp inference.
+It brings conversation handling, streaming, tool-call data, exact embedding
+preparation and replica scheduling into a common client API.
+
+Applications configure inference requests and consume typed results. The server
+operator controls the llama.cpp build, model loading, context allocation,
+processes and hardware. This separation lets applications use a manually
+started server, a managed service or a remote endpoint through the same adapters.
+Sampling settings can be adjusted per request while a model stays loaded.
+
+## Features
+
+| Capability | What the library provides |
 | --- | --- |
-| Conversations | Preserves message roles, structured tool calls and tool results. |
-| Generation | Supports streaming, separate reasoning, usage and request-time sampling overrides. |
-| Embeddings | Applies task-aware prefixes, measures exact tokens and enforces known input limits. |
-| Replica scheduling | Discovers verified loaded replicas, balances text quotas and bounds shared concurrency. |
-| Client lifecycle | Provides finite timeouts, cancellation, typed errors and drained shutdown. |
+| Text generation | Blocking calls, text streaming and streams containing text, reasoning, tool fragments and final metadata. |
+| Conversations | Structured message histories, including system, developer, user, assistant and tool messages; preserves tool identifiers and additional message fields. |
+| Inference controls | Output budgets, temperature, top-p, top-k, min-p, repetition penalties, template options and per-call server extensions. |
+| Structured output | JSON output mode and JSON schema forwarding, subject to the server build and model's support. |
+| Reasoning | Separate reasoning output, configurable reasoning policies and removal of inline thinking from visible text. |
+| Tool calls | Tool definitions and choice controls, streamed argument assembly, complete structured calls and correlation with tool results. |
+| Usage and outcomes | Token counters, terminal reasons and bounded transport metadata; unavailable counters remain unknown. |
+| Embeddings | Query, document and raw input modes; optional normalization; validates result order, cardinality, vector dimensions and finite values. |
+| Task-aware preparation | Configurable model-specific query/document prefixes and exact server tokenization, including special tokens; measures oversized inputs and safely reuses verified counts. |
+| Batching | Configurable total text windows, balanced quotas across usable replicas and HTTP packing within known input/context and aggregate token budgets. Inputs are never silently truncated. |
+| Replica discovery | Explicit aliases or automatic discovery using content and semantic identity tags from a compatible server manager; identity pinning and bounded topology refresh. |
+| Shared concurrency | Per-adapter global and per-replica admission, bounded queues, backpressure, separate tokenizer limits and ordered results across concurrent callers. Each automatic replica admits one active embedding request. |
+| Lifecycle and errors | Typed backend, timeout, cancellation and runaway errors; cooperative cancellation, repetition protection and drained embedding shutdown. Embedding calls have overall deadlines; generation supports bounded HTTP and stream-idle waits. |
+| Diagnostics | Optional bounded thinking capture, invocation correlation and final diagnostic sinks, including interrupted calls. |
+| HTTP access | Authentication and TLS verification, raw requests and helpers for chat/completion, embeddings, tokenization/detokenization, health, server properties and model catalogs. |
+| MCP data contracts | Validated integration, call, event and result types for consumer-managed MCP execution. |
 
-The repository is named `llama-runtime`. The Python distribution remains
-`runtime-llama` and imports remain `runtime_llama` for compatibility. Version
-`0.4.1` updates publication metadata, documentation and licensing; it preserves
-the inference and embedding behavior of `0.4.0`.
-
-The only runtime dependency is `requests`. The HTTP client is adapted from
-llamatelemetry's `LlamaCppClient` and isolated from its package initialization
-and server bootstrap. Importing this library does not require OpenAI, LM Studio,
-llamatelemetry or local inference bindings.
-
-The server operator owns builds, processes, model files, loading and hardware.
-The library connects to the configured server. Server-managed auto-loading is
-allowed; the client does not impose `autoload=false`.
+The consumer executes tools and MCP calls and supplies subsequent conversation
+messages. Reasoning and structured-output behavior depend on the selected
+server build, model and chat template. Responses are not locally validated
+against the forwarded JSON Schema. Splitting source documents and tracking their
+fragments belong to the consuming application. The server's own auto-loading
+policy is supported.
 
 ## Install and generate
 
