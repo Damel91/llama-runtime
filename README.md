@@ -1,8 +1,17 @@
 # llama-runtime
 
-Python adapters for the HTTP APIs of an externally managed **llama.cpp /
-llama-server**. The library provides generation, streaming, separated reasoning,
-structured tool calls, embeddings and optional embedding replica discovery.
+Python adapters for **llama.cpp / llama-server HTTP servers**: streaming
+generation, reasoning, structured tool calls, embeddings and replica discovery.
+Connect to a server on your machine, a remote host or a private network while
+keeping control of its build, model loading and hardware configuration.
+
+| Capability | Library behavior |
+| --- | --- |
+| Conversations | Preserves message roles, structured tool calls and tool results. |
+| Generation | Supports streaming, separate reasoning, usage and request-time sampling overrides. |
+| Embeddings | Applies task-aware prefixes, measures exact tokens and enforces known input limits. |
+| Replica scheduling | Discovers verified loaded replicas, balances text quotas and bounds shared concurrency. |
+| Client lifecycle | Provides finite timeouts, cancellation, typed errors and drained shutdown. |
 
 The repository is named `llama-runtime`. The Python distribution remains
 `runtime-llama` and imports remain `runtime_llama` for compatibility. Version
@@ -20,7 +29,14 @@ allowed; the client does not impose `autoload=false`.
 
 ## Install and generate
 
-From a checkout, with Python 3.11 or later:
+With Python 3.11 or later, install the tagged source:
+
+```bash
+python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.4.1'
+```
+
+Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.4.1),
+or run the following from a checkout:
 
 ```bash
 python -m pip install .
@@ -137,8 +153,8 @@ build from the checkout:
 ```bash
 python -m pip install '.[dev]'
 python -m pytest -q
-ruff check src tests probes
-ruff format --check src tests probes
+ruff check src tests probes _build_backend.py
+ruff format --check src tests probes _build_backend.py
 python -m build --no-isolation
 ```
 
@@ -151,6 +167,10 @@ This public release makes no new live qualification or consumer acceptance
 claim. Local tests, a particular server/model qualification and application
 acceptance are separate. Closing a client stream does not by itself prove
 that remote inference stopped. Missing usage values remain missing.
+
+See the [0.4.1 release verification](docs/verification/PUBLIC-RELEASE-0.4.1.md)
+for the checks performed on this distribution. Release assets include SHA-256
+checksums for the wheel and source archive.
 
 ## Documentation and license
 

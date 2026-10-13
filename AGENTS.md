@@ -8,7 +8,8 @@
 - Preserve copyright and upstream attribution in LICENSE, NOTICE and the
   vendored MIT license.
 - For source or package changes run `python -m pytest -q`,
-  `ruff check src tests probes`, `ruff format --check src tests probes` and
+  `ruff check src tests probes _build_backend.py`,
+  `ruff format --check src tests probes _build_backend.py` and
   `python -m build --no-isolation`. HTTP loopback tests require socket access.
 - When runtime contents or packaging change, install-smoke the built wheel
   in a clean environment outside the source tree.
