@@ -19,6 +19,9 @@ processes and hardware. This separation lets applications use a manually
 started server, a managed service or a remote endpoint through the same adapters.
 Sampling settings can be adjusted per request while a model stays loaded.
 
+The project's engineering lifecycle is managed with
+[Flower MCP](#development-with-flower-mcp).
+
 ## Features
 
 | Capability | What the library provides |
@@ -191,6 +194,22 @@ that remote inference stopped. Missing usage values remain missing.
 See the [0.4.1 release verification](docs/verification/PUBLIC-RELEASE-0.4.1.md)
 for the checks performed on this distribution. Release assets include SHA-256
 checksums for the wheel and source archive.
+
+## Development with Flower MCP
+
+This library's development lifecycle is managed with
+[Flower MCP](https://github.com/Damel91/flower-mcp). The associated Flower
+project is `llama-runtime`. Requirements, milestones, implementation packets,
+plan validation, verification evidence and handovers are maintained in its
+persistent project ledger.
+
+The Markdown documentation in this repository is intentionally focused on
+installation, public APIs, architecture and contributor guidance. The detailed
+engineering lifecycle and its history live in Flower, which keeps the repository
+documentation compact instead of duplicating the complete project record.
+
+Flower is development tooling. Installing and using the library requires only
+the Python dependencies declared by this package.
 
 ## Documentation and license
 
