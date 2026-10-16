@@ -41,6 +41,7 @@ The project's engineering lifecycle is managed with
 | Lifecycle and errors | Typed backend, timeout, cancellation and runaway errors; cooperative cancellation, repetition protection and drained embedding shutdown. Embedding calls have overall deadlines; generation supports bounded HTTP and stream-idle waits. |
 | Diagnostics | Optional bounded thinking capture, invocation correlation and final diagnostic sinks, including interrupted calls. |
 | HTTP access | Authentication and TLS verification, raw requests and helpers for chat/completion, embeddings, tokenization/detokenization, health, server properties and model catalogs. |
+| Read-only model catalog | Typed observations of catalog entries and proven loaded models, explicit capability unknowns, identity tags and context provenance; bounded GET-only discovery without model loading. |
 | MCP data contracts | Validated integration, call, event and result types for consumer-managed MCP execution. |
 
 The consumer executes tools and MCP calls and supplies subsequent conversation
@@ -55,10 +56,10 @@ policy is supported.
 With Python 3.11 or later, install the tagged source:
 
 ```bash
-python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.4.1'
+python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.5.0'
 ```
 
-Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.4.1),
+Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.5.0),
 or run the following from a checkout:
 
 ```bash
@@ -104,6 +105,26 @@ fields. `num_ctx` is a logical consumer limit; it does not reallocate server
 context. Reasoning, templates and JSON schema support depend on the server
 build and model. The library forwards JSON schemas without locally validating
 the response against JSON Schema.
+
+## Discover available and loaded models
+
+```python
+from runtime_llama import discover_models
+
+catalog = discover_models("https://inference.example.net", timeout=5.0)
+for model in catalog.loaded_models:
+    print(model.id, model.identity.model_name)
+    print(model.capabilities.chat, model.capabilities.embeddings)
+```
+
+`catalog.models` contains the observed catalog; `loaded_models` contains only
+entries proved loaded. Capabilities remain `None` when the server does not
+declare them. The API uses a bounded `GET /v1/models` and optional root
+`GET /props`, with one deadline and cooperative cancellation. It neither
+selects nor loads a model. Authentication is optional and explicit; TLS is
+verified and ambient authentication/proxy settings are ignored. See the
+[model discovery API](docs/MODEL-DISCOVERY.md) for signatures, identity tags,
+context provenance, limits and failure handling.
 
 ## Tool calls and MCP
 
@@ -191,7 +212,7 @@ claim. Local tests, a particular server/model qualification and application
 acceptance are separate. Closing a client stream does not by itself prove
 that remote inference stopped. Missing usage values remain missing.
 
-See the [0.4.1 release verification](docs/verification/PUBLIC-RELEASE-0.4.1.md)
+See the [0.5.0 release verification](docs/verification/PUBLIC-RELEASE-0.5.0.md)
 for the checks performed on this distribution. Release assets include SHA-256
 checksums for the wheel and source archive.
 
@@ -216,6 +237,7 @@ the Python dependencies declared by this package.
 - [Functional requirements](docs/REQUIREMENTS.md)
 - [Architecture and mapping](docs/ARCHITECTURE.md)
 - [Functional parity and limits](docs/FUNCTIONAL-PARITY.md)
+- [Read-only model discovery](docs/MODEL-DISCOVERY.md)
 - [Embedding preparation and batching](docs/EMBEDDING-CONTRACTS.md)
 - [Concurrency and diagnostics](docs/CONCURRENCY-AND-DIAGNOSTICS.md)
 - [Provenance and attribution](docs/PROVENANCE.md)

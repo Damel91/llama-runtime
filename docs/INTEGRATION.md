@@ -1,4 +1,4 @@
-# Contratto di integrazione — runtime-llama 0.4.1
+# Contratto di integrazione — runtime-llama 0.5.0
 
 La libreria usa il `llama-server` scelto dal consumer, locale o remoto.
 Il gestore del server possiede build, processo, pesi, dispositivi, contesto e
@@ -8,8 +8,9 @@ Il consumer possiede l'esecuzione dei tool e la continuazione della conversazion
 Questo documento descrive API e responsabilità. Tutti gli alias, endpoint e
 limiti degli esempi sono illustrativi: sostituirli con la propria configurazione.
 Il repository si chiama `llama-runtime`; distribuzione `runtime-llama` e import
-`runtime_llama` restano compatibili. La pubblicazione `0.4.1` conserva il
-comportamento di `0.4.0` e non dichiara una nuova qualifica live.
+`runtime_llama` restano compatibili. La versione `0.5.0` aggiunge la discovery
+pubblica tipizzata, conservando le API esistenti di generazione ed embedding.
+Non dichiara una nuova qualifica live.
 
 ## Connessione e disponibilità
 
@@ -31,6 +32,18 @@ controlla prima il catalogo e richiede alias già caricati.
 API key opzionale con `api_key_env` o `api_key`; preferire la variabile d'ambiente.
 TLS verificato per default. Non inserire credenziali nell'URL. Il client non
 segue redirect né ripete automaticamente una richiesta fallita.
+
+## Catalogo pubblico read-only
+
+`discover_models(base_url, timeout=5.0)` restituisce `ModelCatalog`: `models`
+conserva il catalogo osservato, `loaded_models` include solo il caricamento
+provato. Le capacità `chat` ed `embeddings` restano `None` se non dichiarate.
+L'API usa solo GET al catalogo e, se serve, alle proprietà root, senza selezionare
+un modello. Ha limiti di risposta e cardinalità, timeout condiviso, cancellazione
+e autenticazione esplicita. Il client posseduto ignora credenziali e proxy
+ambientali. Contesto caricato, contesto di training e larghezza architetturale
+restano osservazioni distinte con fonte. Vedi [MODEL-DISCOVERY.md](MODEL-DISCOVERY.md)
+per firma completa, esempi, limiti e stati sconosciuti.
 
 ## Embedding: discovery automatica dal modello logico
 

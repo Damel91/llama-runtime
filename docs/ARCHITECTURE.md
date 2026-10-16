@@ -7,8 +7,9 @@ llamatelemetry, isolato dal package initializer e dal bootstrap CUDA.
 
 La libreria comprende scheduler embedding, prefissi per modello, diagnostica
 per invocazione e discovery delle repliche per identità del contenuto pubblicata
-dal runtime. La versione pubblica `0.4.1` aggiorna metadati, documentazione e
-licenza, conservando il comportamento runtime di `0.4.0`. I test non certificano
+dal runtime. La versione `0.5.0` aggiunge una proiezione pubblica read-only del
+catalogo e dei modelli provati caricati, sopra lo stesso client HTTP.
+Generazione, embedding e scheduler mantengono le API esistenti. I test non certificano
 compatibilità universale con ogni modello/template; l'integrazione dei consumer
 resta una fase distinta.
 
@@ -46,7 +47,8 @@ flowchart TD
 | --- | --- |
 | `configuration.py` | Profili immutabili distinti per server, ruolo e generazione; prefissi embedding per modello; identità fisica indipendente da sampling, credenziali e prefissi |
 | `contracts.py`, `usage.py`, `errors.py`, `runaway.py` | Accumulazione del testo, reasoning, budget visibile, interruzione, esiti e diagnostica della baseline adattati |
-| `client.py` | HTTP `requests`, parsing JSON/SSE rigoroso, cleanup, cancellazione durante l'attesa, errori classificati e API raw |
+| `client.py` | HTTP `requests`, parsing JSON/SSE rigoroso, limite JSON opzionale, policy ambientale esplicita, cleanup, cancellazione, errori classificati e API raw |
+| `model_discovery.py` | Catalogo pubblico tipizzato e bounded, soli GET catalogo/root props, stati e capacità sconosciuti espliciti, identità e metadati con fonte |
 | `adapters/llama.py` | `/v1/chat/completions`, storia completa, sampling, reasoning/template, schema, tool delta e usage |
 | `adapters/embedding.py` | Preparazione query/document/raw, `/v1/embeddings`, `/tokenize`, `/props`, batching, limiti, ordine e integrità numerica |
 | `embedding_scheduler.py` | Ammissione condivisa, coda limitata, routing per alias e tetti globali/per replica |
@@ -150,7 +152,7 @@ senza trasferire questi dettagli al consumer. Il contratto completo è in
 I [requisiti funzionali](REQUIREMENTS.md) collegano contratti e test locali.
 Una prova live deve identificare build, modello, template, configurazione di
 caricamento e consumer, includendo tool, reasoning, schema, embedding, timeout
-e arresto della generazione remota. La pubblicazione `0.4.1` non dichiara una
+e arresto della generazione remota. La pubblicazione `0.5.0` non dichiara una
 nuova qualifica live o acceptance del consumer.
 
 Riferimenti versionati del mapping:

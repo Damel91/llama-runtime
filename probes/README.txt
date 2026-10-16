@@ -8,8 +8,8 @@ Eseguire dalla root del checkout con Python 3.11+ e dipendenze di sviluppo:
 In alternativa usare PYTHONPATH=src per qualificare i sorgenti del checkout.
 I probe sono strumenti del repository, non API distribuite nel wheel.
 Repository: llama-runtime; distribuzione Python: runtime-llama; import: runtime_llama.
-La pubblicazione 0.4.1 conserva il comportamento 0.4.0 e non dichiara una nuova
-qualifica live o acceptance del consumer.
+La versione 0.5.0 aggiunge discovery pubblica read-only e mantiene le API di
+inferenza esistenti. Non dichiara una nuova qualifica live o acceptance del consumer.
 
 Sostituire negli esempi SERVER, LLM_ALIAS, EMBEDDING_ALIAS e BUILD con i valori
 esatti del proprio server. I probe live richiedono modelli gia' caricati e non

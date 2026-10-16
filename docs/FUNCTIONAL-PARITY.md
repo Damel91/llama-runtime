@@ -85,6 +85,13 @@ Version 0.4.1 changes public distribution metadata and documentation while
 preserving the inference and embedding behavior of 0.4.0. It does not extend a
 historical live qualification to a new deployment or consumer.
 
+Version 0.5.0 adds the [public read-only discovery API](MODEL-DISCOVERY.md):
+immutable catalog and loaded observations, explicit capability unknowns,
+independent identity assertions and context provenance. The shared HTTP client
+adds optional decompressed JSON limits and explicit ambient-session policy.
+Existing generation and embedding APIs remain compatible; new deterministic
+checks do not establish live or consumer acceptance.
+
 ## Licensing and attribution
 
 The project uses [Apache-2.0](../LICENSE), copyright 2026 Davide Mele. The derived

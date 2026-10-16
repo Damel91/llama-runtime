@@ -1,9 +1,10 @@
 # Provenance and attribution
 
 The public `llama-runtime` repository preserves the Python distribution name
-`runtime-llama` and import namespace `runtime_llama`. Version `0.4.1` changes
-publication metadata, documentation and licensing while preserving `0.4.0`
-inference and embedding behavior. This document identifies reused components;
+`runtime-llama` and import namespace `runtime_llama`. Version `0.5.0` adds typed,
+read-only model discovery and bounded JSON transport while preserving existing
+generation and embedding APIs. Version `0.4.1` established the public
+distribution metadata and licensing. This document identifies reused components;
 it does not transfer historical deployment results to the public release.
 
 ## Functional baseline
@@ -41,7 +42,8 @@ it is not a dependency pin to the complete upstream package.
 Explicit adaptations include strict incremental SSE parsing, cancellation
 while waiting for JSON or SSE, exclusive reusable sessions for concurrent
 requests, response closure, classified errors without remote body dumps and
-raw JSON responses preserving unknown fields. Missing usage counters are not
+raw JSON responses preserving unknown fields, optional decompressed JSON limits
+and an explicit ambient-session policy. Missing usage counters are not
 converted to zero. These adaptations are described in [NOTICE](../NOTICE) and
 the source header while the original MIT license remains reproduced intact.
 
@@ -50,7 +52,9 @@ the source header while the original MIT license remains reproduced intact.
 The configured server manager owns build, compilation, binaries, model files,
 processes, devices, loading and unloading. The library uses HTTP APIs of the
 selected server. Server-managed auto-loading is allowed. It does not add a
-local inference fallback or explicit administrative loading calls.
+local inference fallback or explicit administrative loading calls. The additive
+[public discovery API](MODEL-DISCOVERY.md) uses only catalog and root properties
+GETs, with no model selection or auto-loading request.
 
 Optional replica discovery consumes the `noxi-*` content, embedding-semantic
 and model-name tags documented in

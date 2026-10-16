@@ -11,6 +11,7 @@ ledger or certify a particular deployment.
 | Preserve blocking and streamed generation, conversation fields, reasoning, usage and terminal states | [Functional parity](FUNCTIONAL-PARITY.md); generation, client and adapter tests |
 | Preserve tool calls and their correlation while leaving execution to the consumer | [Integration](INTEGRATION.md); generation and MCP data contract tests |
 | Separate server reachability from model readiness | [Integration](INTEGRATION.md); adapter and discovery tests |
+| Observe a bounded typed catalog without loading models; preserve unknown capabilities and metadata provenance | [Model discovery](MODEL-DISCOVERY.md); public discovery and transport tests |
 | Keep physical configuration distinct from per-call sampling and logical consumer limits | [Architecture](ARCHITECTURE.md); configuration tests |
 | Prepare model-specific query/document prefixes exactly once and count server special tokens | [Embedding contracts](EMBEDDING-CONTRACTS.md); prefix and preparation tests |
 | Distribute a total text window across replicas and respect known aggregate HTTP token budgets | [Embedding contracts](EMBEDDING-CONTRACTS.md); embedding contract and scheduler tests |
@@ -28,6 +29,6 @@ template and configuration actually exercised.
 
 Generation template behavior, schema conformance, numerical equivalence across
 replicas, server-side cancellation and a consuming application's full tool
-workflow require qualification in that environment. The public `0.4.1`
-publication changes metadata, documentation and licensing while preserving
-`0.4.0` runtime behavior; it makes no new live qualification or acceptance claim.
+workflow require qualification in that environment. The public `0.5.0`
+release adds read-only discovery with deterministic verification; it makes no
+new live qualification or consumer acceptance claim.
