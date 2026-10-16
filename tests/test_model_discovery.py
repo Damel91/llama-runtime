@@ -99,15 +99,19 @@ def test_string_loaded_status_uses_existing_helper_without_root_props(endpoint):
 
 
 @pytest.mark.parametrize("sleeping", [False, True])
-def test_single_unknown_model_proved_only_by_explicit_root_metadata(endpoint, sleeping):
+@pytest.mark.parametrize("explicit_role", [False, True])
+def test_single_unknown_model_proved_only_by_explicit_root_metadata(
+    endpoint, sleeping, explicit_role
+):
     entry = {"id": "chosen", "aliases": ["exact-alias"], "meta": {"n_ctx": 100}}
     props = {
-        "role": "model",
         "model_alias": "exact-alias",
         "is_sleeping": sleeping,
         "default_generation_settings": {"n_ctx": 2048},
         "total_slots": 4,
     }
+    if explicit_role:
+        props["role"] = "model"
     base_url, observed = fixture_server(endpoint, [entry], props)
     catalog = discover_models(base_url)
     model = catalog.models[0]
@@ -128,7 +132,8 @@ def test_single_unknown_model_proved_only_by_explicit_root_metadata(endpoint, sl
     [
         {},
         {"role": "router", "model_alias": "chosen", "is_sleeping": False},
-        {"model_alias": "chosen", "is_sleeping": False},
+        {"role": None, "model_alias": "chosen", "is_sleeping": False},
+        {"role": "unknown", "model_alias": "chosen", "is_sleeping": False},
         {"role": "model", "model_alias": "different", "is_sleeping": False},
         {"role": "model", "model_alias": "chosen"},
         {"role": "model", "model_alias": "chosen", "is_sleeping": 0},
@@ -153,6 +158,26 @@ def test_multi_model_catalog_never_promoted_by_root_alias(endpoint):
     assert [model.state for model in catalog.models] == ["loaded", "unknown"]
     assert [model.id for model in catalog.loaded_models] == ["loaded"]
     assert len(observed) == 2
+
+
+@pytest.mark.parametrize("state", ["unknown", "future-native-state"])
+def test_explicit_unknown_or_future_state_cannot_be_promoted_by_root_props(
+    endpoint, state
+):
+    props = {
+        "model_alias": "chosen",
+        "is_sleeping": False,
+        "default_generation_settings": {"n_ctx": 2048},
+    }
+    base_url, observed = fixture_server(
+        endpoint, [fixture_entry(state=state, meta={"n_ctx": 8192})], props
+    )
+    catalog = discover_models(base_url)
+    assert catalog.models[0].state == "unknown"
+    assert catalog.models[0].loaded_context is None
+    assert catalog.loaded_models == ()
+    assert "root_props_load_state_unverified" in catalog.diagnostics
+    assert observed == [("/v1/models", None), ("/props", None)]
 
 
 @pytest.mark.parametrize("status", [404, 405, 501])

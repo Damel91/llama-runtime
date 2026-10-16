@@ -233,18 +233,22 @@ def _observe(entry: dict[str, Any], diagnostics: set[str]) -> ModelObservation:
 
 
 def _root_proof(
-    observations: list[ModelObservation], props: Any, diagnostics: set[str]
+    observations: list[ModelObservation],
+    props: Any,
+    diagnostics: set[str],
+    *,
+    eligible: bool,
 ) -> None:
     if not isinstance(props, dict):
         _invalid()
-    if len(observations) != 1:
+    if len(observations) != 1 or not eligible:
         diagnostics.add("root_props_load_state_unverified")
         return
     observed = observations[0]
     alias = props.get("model_alias")
     sleeping = props.get("is_sleeping")
     if (
-        props.get("role") != "model"
+        ("role" in props and props["role"] != "model")
         or not isinstance(alias, str)
         or alias not in observed.aliases
         or not isinstance(sleeping, bool)
@@ -374,6 +378,13 @@ def discover_models(
             claimed.update(observation.aliases)
             observations.append(observation)
         if any(model.state == "unknown" for model in observations):
+            # Native standalone catalogs omit load status, and root props omit
+            # role. A future explicit state is not the legacy missing-status
+            # case and cannot be promoted by this fallback observation.
+            status = entries[0].get("status") if len(entries) == 1 else None
+            eligible = status is None or (
+                isinstance(status, dict) and status.get("value") is None
+            )
             try:
                 http_requests += 1
                 props = client.props(
@@ -387,7 +398,7 @@ def discover_models(
                     raise
                 diagnostics.add("root_props_unavailable")
             else:
-                _root_proof(observations, props, diagnostics)
+                _root_proof(observations, props, diagnostics, eligible=eligible)
         remaining()
     return ModelCatalog(
         tuple(observations),
