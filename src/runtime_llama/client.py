@@ -230,10 +230,12 @@ class _HTTPCall:
         timeout: float,
         cancel: CancellationProbe | None,
         cancel_wait: bool,
+        max_response_bytes: int | None = None,
     ) -> None:
         self._client, self._method, self._path = client, method, path
         self._body, self._timeout, self._cancel = body, timeout, cancel
         self._cancel_wait = cancel_wait
+        self._max_response_bytes = max_response_bytes
         self._stop = Event()
         self._session: Any = None
         self._response: Any = None
@@ -313,6 +315,11 @@ class _HTTPCall:
         ):
             body = bytearray()
             for chunk in self._chunks():
+                if (
+                    self._max_response_bytes is not None
+                    and len(body) + len(chunk) > self._max_response_bytes
+                ):
+                    raise LLMBackendError("llama_server_json_response_too_large")
                 body.extend(chunk)
             if self._stop.is_set():
                 raise LLMCancelledError()
@@ -321,6 +328,13 @@ class _HTTPCall:
             # performing one uninterruptible full-body read.
             self._response._content = bytes(body)
             self._response._content_consumed = True
+        elif isinstance(self._response, requests.Response):
+            content = self._response.content
+            if (
+                self._max_response_bytes is not None
+                and len(content) > self._max_response_bytes
+            ):
+                raise LLMBackendError("llama_server_json_response_too_large")
         return self._response.json()
 
     def _signal_close(self) -> None:
@@ -483,19 +497,38 @@ class LlamaCppClient:
         timeout: float = 600.0,
         verify_ssl: bool = True,
         session: Any = None,
+        *,
+        trust_env: bool = True,
     ) -> None:
-        parsed = urlsplit(base_url)
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.hostname
-            or parsed.username
-            or parsed.password
-            or parsed.query
-            or parsed.fragment
-        ):
-            raise ValueError(
-                "base_url must be an HTTP(S) server URL without credentials/query/fragment"
-            )
+        invalid_url = (
+            "base_url must be an HTTP(S) server URL without "
+            "credentials/query/fragment/whitespace/backslashes"
+        )
+        try:
+            if not isinstance(base_url, str) or any(
+                char.isspace()
+                or ord(char) < 32
+                or 127 <= ord(char) <= 159
+                or char == "\\"
+                for char in base_url
+            ):
+                raise ValueError
+            parsed = urlsplit(base_url)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+                or parsed.port == 0
+            ):
+                raise ValueError
+        except (ValueError, TypeError):
+            raise ValueError(invalid_url) from None
+        if not isinstance(trust_env, bool):
+            raise ValueError("trust_env must be a boolean")
+        self.trust_env = trust_env
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = _timeout(timeout)
@@ -509,9 +542,11 @@ class LlamaCppClient:
         self._streams_lock = Lock()
         self._closed = False
 
-    @staticmethod
-    def _new_session() -> Any:
+    def _new_session(self) -> Any:
         session = requests.Session()
+        # An explicit policy applies to every owned lease, including sessions
+        # created later for concurrent requests. Borrowed sessions are untouched.
+        session.trust_env = self.trust_env
         session.mount("http://", requests.adapters.HTTPAdapter(max_retries=0))
         session.mount("https://", requests.adapters.HTTPAdapter(max_retries=0))
         return session
@@ -597,7 +632,14 @@ class LlamaCppClient:
         *,
         timeout: float | None = None,
         cancel_wait: bool = False,
+        max_response_bytes: int | None = None,
     ) -> dict[str, Any] | list[Any] | Iterator[dict[str, Any]]:
+        """Read JSON or SSE; optionally bound decompressed JSON/error bodies.
+
+        ``max_response_bytes`` does not change the existing SSE frame limit.
+        The bound is enforced while reading network responses, before buffering
+        additional bytes. Borrowed custom response objects own their decoding.
+        """
         _cancelled(cancel)
         route = urlsplit(path)
         if (
@@ -614,10 +656,18 @@ class LlamaCppClient:
         bound = self.timeout if timeout is None else _timeout(timeout)
         if not isinstance(cancel_wait, bool):
             raise ValueError("cancel_wait must be a boolean")
+        if max_response_bytes is not None and (
+            isinstance(max_response_bytes, bool)
+            or not isinstance(max_response_bytes, int)
+            or max_response_bytes <= 0
+        ):
+            raise ValueError("max_response_bytes must be a positive integer")
         if self._closed:
             raise LLMBackendError("llama_server_client_closed")
         reader = _SSEStream if stream else _JSONCall
-        result = reader(self, method, path, json, bound, cancel, cancel_wait)
+        result = reader(
+            self, method, path, json, bound, cancel, cancel_wait, max_response_bytes
+        )
         with self._streams_lock:
             if self._closed:
                 raise LLMBackendError("llama_server_client_closed")
@@ -746,6 +796,7 @@ class LlamaCppClient:
         *,
         timeout: float | None = None,
         cancel_wait: bool = False,
+        max_response_bytes: int | None = None,
     ) -> Any:
         query = "?" + urlencode({"model": model}) if model is not None else ""
         return self.request(
@@ -754,6 +805,7 @@ class LlamaCppClient:
             cancel=cancel,
             timeout=timeout,
             cancel_wait=cancel_wait,
+            max_response_bytes=max_response_bytes,
         )
 
     def models(
@@ -762,9 +814,15 @@ class LlamaCppClient:
         *,
         timeout: float | None = None,
         cancel_wait: bool = False,
+        max_response_bytes: int | None = None,
     ) -> Any:
         return self.request(
-            "GET", "/v1/models", cancel=cancel, timeout=timeout, cancel_wait=cancel_wait
+            "GET",
+            "/v1/models",
+            cancel=cancel,
+            timeout=timeout,
+            cancel_wait=cancel_wait,
+            max_response_bytes=max_response_bytes,
         )
 
     def close(self) -> None:
