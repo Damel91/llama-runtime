@@ -44,6 +44,16 @@ from runtime_llama.mcp import (
     MCPToolCall,
 )
 from runtime_llama.client import ClientHTTPError, LlamaCppClient
+from runtime_llama.model_discovery import (
+    ModelCapabilities,
+    ModelCatalog,
+    ModelIdentity,
+    ModelObservation,
+    ModelState,
+    ObservationSource,
+    ObservedInt,
+    discover_models,
+)
 from runtime_llama.adapters.llama import LlamaCppAdapter
 from runtime_llama.adapters.embedding import LlamaCppEmbeddingAdapter
 from runtime_llama.factory import build_adapter, build_embedding_adapter
@@ -85,6 +95,14 @@ __all__ = [
     "MCPToolCall",
     "ClientHTTPError",
     "LlamaCppClient",
+    "ModelCapabilities",
+    "ModelCatalog",
+    "ModelIdentity",
+    "ModelObservation",
+    "ModelState",
+    "ObservationSource",
+    "ObservedInt",
+    "discover_models",
     "LlamaCppAdapter",
     "LlamaCppEmbeddingAdapter",
     "build_adapter",
