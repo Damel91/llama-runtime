@@ -289,7 +289,7 @@ def test_keepalive_reuse_and_stale_close_cannot_abort_new_lease(endpoint):
     assert observed[0][2] == observed[1][2]
 
 
-def test_disabled_idle_error_status_does_not_wait_for_json_body(endpoint):
+def test_disabled_idle_error_status_has_finite_json_body_budget(endpoint):
     release = Event()
     endpoint.release_on_cleanup(release)
 

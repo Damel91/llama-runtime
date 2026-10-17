@@ -19,7 +19,7 @@ import json as json_module
 import math
 from queue import Empty, Full, Queue
 import re
-from threading import Event, Lock, Thread
+from threading import Event, Lock, Thread, Timer
 import time
 from typing import Any, Callable, Iterator
 from urllib.parse import urlencode, urlsplit
@@ -37,6 +37,8 @@ CancellationProbe = Callable[[], bool]
 _SAFE_CODE = re.compile(r"[A-Za-z0-9_.-]{1,64}\Z")
 _END = object()
 _MAX_FRAME = 8 * 1024 * 1024
+_MAX_ERROR_BODY = 64 * 1024
+_MAX_ERROR_BODY_SECONDS = 5.0
 _INHERIT_IDLE_TIMEOUT = object()
 
 
@@ -333,17 +335,19 @@ class _HTTPCall:
                     return
                 yield chunk
 
-    def _read_json(self) -> Any:
+    def _read_json(self, *, max_response_bytes: int | None = None) -> Any:
+        bound = (
+            self._max_response_bytes
+            if max_response_bytes is None
+            else max_response_bytes
+        )
         if (
             isinstance(self._response, requests.Response)
             and getattr(self._response, "raw", None) is not None
         ):
             body = bytearray()
             for chunk in self._chunks():
-                if (
-                    self._max_response_bytes is not None
-                    and len(body) + len(chunk) > self._max_response_bytes
-                ):
+                if bound is not None and len(body) + len(chunk) > bound:
                     raise LLMBackendError("llama_server_json_response_too_large")
                 body.extend(chunk)
             if self._stop.is_set():
@@ -355,10 +359,7 @@ class _HTTPCall:
             self._response._content_consumed = True
         elif isinstance(self._response, requests.Response):
             content = self._response.content
-            if (
-                self._max_response_bytes is not None
-                and len(content) > self._max_response_bytes
-            ):
+            if bound is not None and len(content) > bound:
                 raise LLMBackendError("llama_server_json_response_too_large")
         return self._response.json()
 
@@ -468,6 +469,43 @@ class _SSEStream(_HTTPCall, Iterator[dict[str, Any]]):
             except Full:
                 continue
 
+    def _bounded_http_error(self) -> ClientHTTPError:
+        """Keep structured codes without making error-body reads unlimited."""
+        assert self._interrupt is not None
+        bound = min(
+            _MAX_ERROR_BODY,
+            self._max_response_bytes
+            if self._max_response_bytes is not None
+            else _MAX_ERROR_BODY,
+        )
+        budget = min(self._timeout, _MAX_ERROR_BODY_SECONDS)
+        deadline = time.monotonic() + budget
+        expired = Event()
+
+        def expire() -> None:
+            # Expiry belongs to this optional body, not user cancellation or
+            # stream closure. The original HTTP status must remain observable.
+            expired.set()
+            self._interrupt.abort()
+
+        watchdog = Timer(budget, expire)
+        watchdog.name = "runtime_llama_http_error_watchdog"
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            error = _http_error(
+                self._response,
+                lambda: self._read_json(max_response_bytes=bound),
+            )
+        finally:
+            # Complete watchdog cleanup before response/session cleanup so a
+            # late expiry cannot interrupt a later lease of a keep-alive socket.
+            watchdog.cancel()
+            watchdog.join()
+        if expired.is_set() or time.monotonic() >= deadline:
+            return ClientHTTPError(int(self._response.status_code))
+        return error
+
     def _read(self) -> None:
         try:
             if self._stop.is_set() or self._send() is None:
@@ -476,9 +514,7 @@ class _SSEStream(_HTTPCall, Iterator[dict[str, Any]]):
                 return
             if not 200 <= int(self._response.status_code) < 300:
                 if self._idle_timeout is None:
-                    # Do not replace disabled SSE idle with an unbounded JSON
-                    # error-body read. Status remains available and sanitized.
-                    raise ClientHTTPError(int(self._response.status_code))
+                    raise self._bounded_http_error()
                 raise _http_error(self._response, self._read_json)
             for payload in _sse(self._chunks()):
                 if self._stop.is_set():
@@ -684,7 +720,9 @@ class LlamaCppClient:
         a positive value overrides SSE idle while keeping a finite connection
         budget. Explicit ``None`` disables SSE idle on owned sessions, with
         socket interruption for cancellation. JSON calls remain finite.
-        Disabled-idle HTTP errors report status without reading provider codes.
+        Disabled-idle HTTP errors preserve sanitized codes within a separate
+        finite body budget (at most five seconds and 64 KiB, or lower caller
+        limits). Incomplete, excessive or late bodies retain only the status.
         """
         _cancelled(cancel)
         if idle_timeout is not _INHERIT_IDLE_TIMEOUT:
