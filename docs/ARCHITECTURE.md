@@ -13,6 +13,22 @@ Generazione, embedding e scheduler mantengono le API esistenti. I test non certi
 compatibilità universale con ogni modello/template; l'integrazione dei consumer
 resta una fase distinta.
 
+La versione `0.6.0` aggiunge il trasporto opzionale
+[Tailscale/Headscale](TAILNET.md). `TailnetConfig` mantiene la configurazione
+del consumer; `TailnetHelper` supervisiona un binario Go separato che espone
+un proxy loopback autenticato. `_proxy.py` valida la route esplicita e il client
+la applica a ogni sessione HTTP posseduta. I default e il wheel Python restano
+indipendenti dall'helper: nessun avvio, login o download implicito.
+
+Il backend è fissato a tsnet `1.104.1` e Go `1.27.1`. Dopo una verifica del
+peer corrente, lo shim netstack userspace evita il fallback del dialer generico
+a DNS o connessioni di inferenza del sistema. Lo shim usa un'API upstream
+instabile e richiede revisione prima di cambiare pin. Il proxy mantiene TLS
+end-to-end attraverso CONNECT; HTTP usa connessioni upstream nuove per evitare
+replay automatici. Stop riguarda la singola richiesta, mentre shutdown chiude
+e drena helper, client gestiti, discovery e tunnel. I profili costruiti dal
+consumer con `proxy_url` devono essere chiusi dal loro proprietario.
+
 ## Responsabilità
 
 Il gestore del server possiede build, compilazione, binario, processo,
@@ -50,6 +66,8 @@ flowchart TD
 | `client.py` | HTTP `requests`, parsing JSON/SSE rigoroso, limite JSON opzionale, policy ambientale esplicita, cleanup, cancellazione, errori classificati e API raw |
 | `_http_interrupt.py` | Hook per connessione owned della singola richiesta SSE senza idle; shutdown, detach prima del riuso e mapping locali a sessione/proxy |
 | `model_discovery.py` | Catalogo pubblico tipizzato e bounded, soli GET catalogo/root props, stati e capacità sconosciuti espliciti, identità e metadati con fonte |
+| `tailnet.py`, `_proxy.py` | Configurazione consumer, protocollo stdin limitato, supervisor dell'helper e route loopback esplicita per tutte le sessioni possedute |
+| `helpers/tsnet` | Binario opzionale con stato dedicato, peer verificati, netstack userspace, proxy HTTP/CONNECT autenticato e teardown drenato |
 | `adapters/llama.py` | `/v1/chat/completions`, storia completa, sampling, reasoning/template, schema, tool delta e usage |
 | `adapters/embedding.py` | Preparazione query/document/raw, `/v1/embeddings`, `/tokenize`, `/props`, batching, limiti, ordine e integrità numerica |
 | `embedding_scheduler.py` | Ammissione condivisa, coda limitata, routing per alias e tetti globali/per replica |

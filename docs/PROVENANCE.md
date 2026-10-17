@@ -76,3 +76,30 @@ Deterministic tests and local HTTP fixtures verify library behavior. The
 Each live qualification applies to the build, model and configuration actually
 tested; it does not certify other deployments or consumer applications.
 Application integration, tool execution and acceptance remain separate work.
+
+## Optional native tailnet helper
+
+Version `0.6.0` adds a separately built helper based on
+[Tailscale tsnet v1.104.1](https://github.com/tailscale/tailscale/tree/v1.104.1/tsnet).
+Its BSD-3-Clause license is retained in
+[`TAILSCALE-LICENSE.txt`](../helpers/tsnet/TAILSCALE-LICENSE.txt).
+The Go toolchain is pinned to `1.27.1`; module versions and checksums are
+recorded in `go.mod` and `go.sum`. The helper's own source remains Apache-2.0.
+The Python wheel does not contain the native executable or the Go SDK.
+
+The native archives include the project's LICENSE and NOTICE, Tailscale's
+license and the complete [`third_party` notice inventory](../helpers/tsnet/third_party/README.md),
+covering the dependency and Go runtime licenses, authors, patent notices and
+source attributions used by the delivered target union. Each copied notice
+and native executable has a SHA-256 entry. Native builds use
+`-trimpath -buildvcs=false -tags ts_omit_webclient`: source provenance is
+provided by the separate release manifest rather than host paths or embedded
+working-tree Git metadata. The web UI and its embedded assets are excluded.
+
+Verified peer dialing uses a narrow shim over the pinned `Server.Sys()`
+netstack callback. Upstream declares that API unstable. The generic
+`Server.Dial`/`UserDial` route can fall back to OS resolution or dialing, so
+it is deliberately excluded from this inference transport. The
+[tailnet guide](TAILNET.md) documents this boundary and the need to requalify
+upstream upgrades. Tailscale/Headscale configuration tests, native compilation
+and offline smoke do not establish a real enrollment or deployment result.

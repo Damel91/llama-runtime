@@ -43,6 +43,7 @@ The project's engineering lifecycle is managed with
 | Diagnostics | Optional bounded thinking capture, invocation correlation and final diagnostic sinks, including interrupted calls. |
 | HTTP access | Authentication and TLS verification, raw requests and helpers for chat/completion, embeddings, tokenization/detokenization, health, server properties and model catalogs. |
 | Read-only model catalog | Typed observations of catalog entries and proven loaded models, explicit capability unknowns, identity tags and context provenance; bounded GET-only discovery without model loading. |
+| Optional embedded VPN client | A separately built Go tsnet helper for Tailscale or Headscale, with consumer-owned configuration, authenticated loopback proxy, verified peer routing, TLS and bounded teardown; no system VPN installation. |
 | MCP data contracts | Validated integration, call, event and result types for consumer-managed MCP execution. |
 
 The consumer executes tools and MCP calls and supplies subsequent conversation
@@ -57,10 +58,10 @@ policy is supported.
 With Python 3.11 or later, install the tagged source:
 
 ```bash
-python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.5.1'
+python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.6.0'
 ```
 
-Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.5.1),
+Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.6.0),
 or run the following from a checkout:
 
 ```bash
@@ -132,6 +133,27 @@ selects nor loads a model. Authentication is optional and explicit; TLS is
 verified and ambient authentication/proxy settings are ignored. See the
 [model discovery API](docs/MODEL-DISCOVERY.md) for signatures, identity tags,
 context provenance, limits and failure handling.
+
+## Optional Tailscale and Headscale transport
+
+Version `0.6.0` adds `TailnetConfig`, `TailnetHelper` and `TailnetError`.
+The consumer supplies the native helper executable, a dedicated node-state
+directory, hostname, enrollment credentials when needed, coordination server
+and inference endpoint. The Python wheel remains portable and contains no
+native binary. Importing or constructing the library never launches a VPN.
+
+The [release](https://github.com/Damel91/llama-runtime/releases/tag/v0.6.0)
+provides separate helper archives for macOS ARM64, Linux AMD64 and Windows
+AMD64. Go is needed to build the helper from source, not to run a supplied
+binary. Both Tailscale's coordinator and an explicit HTTPS Headscale
+coordinator are supported by configuration.
+
+`TailnetHelper` provides managed raw clients and discovery. Its ephemeral
+`proxy_url` also routes generation and embedding adapter profiles through the
+same authenticated helper. Request Stop stays separate from shared-helper
+shutdown. Configuration belongs to the consumer and is never persisted in
+the repository. See the [tailnet guide](docs/TAILNET.md) for examples, build
+commands, ownership, supported peer addresses and qualification boundaries.
 
 ## Tool calls and MCP
 
@@ -219,9 +241,11 @@ claim. Local tests, a particular server/model qualification and application
 acceptance are separate. Closing a client stream does not by itself prove
 that remote inference stopped. Missing usage values remain missing.
 
-See the [0.5.1 release verification](docs/verification/PUBLIC-RELEASE-0.5.1.md)
+See the [0.6.0 release verification](docs/verification/PUBLIC-RELEASE-0.6.0.md)
 for the checks performed on this distribution. Release assets include SHA-256
-checksums for the wheel and source archive.
+checksums for the wheel, source archive, native helper archives and source
+manifest. Native Linux/Windows assets are crossbuilt; this release does not
+claim execution on those systems or live VPN enrollment/inference.
 
 ## Development with Flower MCP
 
@@ -236,8 +260,9 @@ installation, public APIs, architecture and contributor guidance. The detailed
 engineering lifecycle and its history live in Flower, which keeps the repository
 documentation compact instead of duplicating the complete project record.
 
-Flower is development tooling. Installing and using the library requires only
-the Python dependencies declared by this package.
+Flower is development tooling. Core library use requires the Python
+dependencies declared by this package. The optional tailnet transport also
+requires its separately distributed native helper.
 
 ## Documentation and license
 
@@ -248,9 +273,12 @@ the Python dependencies declared by this package.
 - [Embedding preparation and batching](docs/EMBEDDING-CONTRACTS.md)
 - [Concurrency and diagnostics](docs/CONCURRENCY-AND-DIAGNOSTICS.md)
 - [Stream timeouts and cancellation](docs/STREAM-TIMEOUTS.md)
+- [Optional Tailscale and Headscale transport](docs/TAILNET.md)
 - [Provenance and attribution](docs/PROVENANCE.md)
 
 Copyright 2026 Davide Mele. The project is licensed under
 [Apache-2.0](LICENSE). The client adapted from llamatelemetry retains its
 [upstream MIT license](src/runtime_llama/_vendor/llamatelemetry.LICENSE).
 See [NOTICE](NOTICE) for attribution.
+The optional native helper retains Tailscale's BSD-3-Clause license and the
+dependency notices shipped with each helper archive.
