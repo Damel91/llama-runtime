@@ -4,3 +4,7 @@ recursive-include docs *.md
 recursive-include src/runtime_llama *.LICENSE py.typed
 recursive-include tests *.py
 recursive-include probes *.py *.json *.txt
+include helpers/tsnet/go.mod helpers/tsnet/go.sum helpers/tsnet/build.sh
+include helpers/tsnet/TAILSCALE-LICENSE.txt helpers/tsnet/collect_licenses.py
+recursive-include helpers/tsnet/cmd *.go
+recursive-include helpers/tsnet/third_party *

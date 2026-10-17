@@ -16,6 +16,7 @@ import time
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence
 
 from runtime_llama.client import LlamaCppClient
+from runtime_llama._proxy import assert_client_proxy, normalize_proxy_url, proxy_secrets
 from runtime_llama.configuration import (
     AdapterProfile,
     LlamaGenerationConfig,
@@ -55,6 +56,7 @@ _RESERVED_REQUEST_FIELDS = {
     "verify_ssl",
     "api_key",
     "api_key_env",
+    "proxy_url",
     "cancel",
     "num_predict",
     "num_ctx",
@@ -113,10 +115,21 @@ class LlamaCppAdapter(LLMAdapter):
         generation_config: Optional[LlamaGenerationConfig] = None,
         client: Optional[LlamaCppClient] = None,
         thinking_diagnostics: Optional[ThinkingDiagnosticsConfig] = None,
+        proxy_url: str | None = None,
     ) -> None:
+        if (
+            model_config is not None
+            and proxy_url is not None
+            and getattr(model_config, "proxy_url", None)
+            != normalize_proxy_url(proxy_url)
+        ):
+            raise ValueError(
+                "explicit proxy conflicts with the model_config proxy route"
+            )
         self._model_config = model_config or LlamaServerConfig(
             model=model,
             base_url=base_url,
+            proxy_url=proxy_url,
         )
         self._role_config = role_config or LlamaRoleConfig(
             role_id=role_id,
@@ -154,7 +167,12 @@ class LlamaCppAdapter(LLMAdapter):
             if self._generation_config.api_key_env
             else None
         )
-        self._diagnostic_secrets = (token,) if token else ()
+        assert_client_proxy(client, self._model_config.proxy_url)
+        self._diagnostic_secrets = (
+            ((token,) if token else ())
+            + proxy_secrets(self._model_config.proxy_url)
+            + proxy_secrets(getattr(client, "proxy_url", None))
+        )
         self._owns_client = client is None
         self._client = client or LlamaCppClient(
             self._model_config.base_url,
@@ -165,6 +183,7 @@ class LlamaCppAdapter(LLMAdapter):
                 else self._generation_config.stream_idle_timeout_sec
             ),
             verify_ssl=self._model_config.verify_ssl,
+            proxy_url=self._model_config.proxy_url,
         )
 
     @classmethod

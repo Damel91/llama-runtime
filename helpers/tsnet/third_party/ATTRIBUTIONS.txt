@@ -1,0 +1,244 @@
+Native helper source copyright/SPDX attribution inventory.
+Full license and notice texts are preserved under licenses/.
+
+filippo.io/edwards25519@v1.2.0
+Copyright (c) 2016 The Go Authors. All rights reserved.
+Copyright (c) 2017 The Go Authors. All rights reserved.
+Copyright (c) 2019 The Go Authors. All rights reserved.
+Copyright (c) 2021 The Go Authors. All rights reserved.
+
+github.com/alexbrainman/sspi@v0.0.0-20250919150558-7d374ff0d59e
+Copyright 2015 The Go Authors. All rights reserved.
+Copyright 2016 The Go Authors. All rights reserved.
+Copyright 2018 The Go Authors. All rights reserved.
+Copyright 2021 The Go Authors. All rights reserved.
+
+github.com/coder/websocket@v1.8.15
+
+
+github.com/creachadair/msync@v0.10.1
+
+
+github.com/dblohm7/wingoes@v0.0.0-20260526185140-fb298caac7ca
+Copyright (c) 2022 Tailscale Inc & AUTHORS. All rights reserved.
+Copyright (c) 2023 Tailscale Inc & AUTHORS. All rights reserved.
+Copyright (c) 2024 Tailscale Inc & AUTHORS. All rights reserved.
+Copyright (c) Tailscale Inc & AUTHORS
+SPDX-License-Identifier: BSD-3-Clause
+
+github.com/fxamacker/cbor/v2@v2.9.3
+Copyright (c) Faye Amacker. All rights reserved.
+
+github.com/gaissmai/bart@v0.29.0
+Copyright (c) 2026 Karl Gaissmaier
+SPDX-License-Identifier: MIT
+
+github.com/go-json-experiment/json@v0.0.0-20260820222146-c27c302e5fc3
+Copyright 2025 The Go Authors. All rights reserved.
+Copyright 2026 The Go Authors. All rights reserved.
+
+github.com/godbus/dbus/v5@v5.2.2
+
+
+github.com/golang/groupcache@v0.0.0-20241129210726-2c02b8208cf8
+Copyright 2013 Google Inc.
+
+github.com/google/btree@v1.1.3
+Copyright 2014-2022 Google Inc.
+
+github.com/hdevalence/ed25519consensus@v0.2.0
+Copyright 2016 Henry de Valence. All rights reserved.
+Copyright 2016 The Go Authors. All rights reserved.
+
+github.com/huin/goupnp@v1.3.0
+
+
+github.com/jsimonetti/rtnetlink@v1.4.2
+
+
+github.com/klauspost/compress@v1.20.0
+Based on work Copyright (c) 2013, Yann Collet, released under BSD License.
+Copyright 2011 The Snappy-Go Authors. All rights reserved.
+Copyright 2016 The Snappy-Go Authors. All rights reserved.
+Copyright 2018 Klaus Post. All rights reserved.
+Copyright 2019+ Klaus Post. All rights reserved.
+Copyright 2020+ Klaus Post. All rights reserved.
+Copyright 2025+ Klaus Post. All rights reserved.
+
+github.com/mdlayher/netlink@v1.11.2
+
+
+github.com/mdlayher/socket@v0.7.0
+
+
+github.com/mitchellh/go-ps@v1.0.0
+
+
+github.com/pires/go-proxyproto@v0.15.0
+
+
+github.com/safchain/ethtool@v0.7.0
+regarding copyright ownership.  The ASF licenses this file
+
+github.com/tailscale/certstore@v0.1.1-0.20260409135935-3638fb84b77d
+
+
+github.com/tailscale/go-winio@v0.0.0-20231025203758-c4f33415bf55
+
+
+github.com/tailscale/hujson@v0.0.0-20260727124030-b80ff77dac4f
+Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
+
+github.com/tailscale/peercred@v0.0.0-20250107143737-35a0c7bd7edc
+Copyright (c) 2021 AUTHORS All rights reserved.
+
+github.com/tailscale/wireguard-go@v0.0.0-20260928213032-417aef361226
+Copyright (C) 2017-2023 WireGuard LLC. All Rights Reserved.
+Copyright 2015 Microsoft
+Copyright 2021 The Go Authors. All rights reserved.
+SPDX-License-Identifier: BSD-3-Clause
+SPDX-License-Identifier: MIT
+
+github.com/x448/float16@v0.8.4
+Copyright 2019 Montgomery Edwards⁴⁴⁸ and Faye Amacker
+
+go-stdlib@go1.27.1
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+Copyright (c) 2016 The Go Authors. All rights reserved.
+Copyright (c) 2017 The Go Authors. All rights reserved.
+Copyright (c) 2019 The Go Authors. All rights reserved.
+Copyright (c) 2021 The Go Authors. All rights reserved.
+Copyright 2009 The Go Authors. All rights reserved.
+Copyright 2009,2010 The Go Authors. All rights reserved.
+Copyright 2009-2010 The Go Authors. All rights reserved.
+Copyright 2010 The Go Authors. All rights reserved.
+Copyright 2011 The Go Authors. All rights reserved.
+Copyright 2012 The Go Authors. All rights reserved.
+Copyright 2013 The Go Authors. All rights reserved.
+Copyright 2014 Google Inc. All Rights Reserved.
+Copyright 2014 The Go Authors. All rights reserved.
+Copyright 2015 The Go Authors. All rights reserved.
+Copyright 2016 The Go Authors. All rights reserved.
+Copyright 2017 The Go Authors. All rights reserved.
+Copyright 2018 The Go Authors. All rights reserved.
+Copyright 2019 The Go Authors. All rights reserved.
+Copyright 2020 The Go Authors. All rights reserved.
+Copyright 2021 The Go Authors. All rights reserved.
+Copyright 2022 The Go Authors. All rights reserved.
+Copyright 2023 The Go Authors. All rights reserved.
+Copyright 2024 The Go Authors. All rights reserved.
+Copyright 2025 The Go Authors. All rights reserved.
+Copyright 2026 The Go Authors. All rights reserved.
+Copyright © 1994-1999 Lucent Technologies Inc. All rights reserved.
+Portions Copyright 2009 The Go Authors. All rights reserved.
+Revisions Copyright © 2000-2007 Vita Nuova Holdings Limited (www.vitanuova.com).  All rights reserved.
+The above copyright notice and this permission notice shall be included in
+
+go4.org/mem@v0.0.0-20240501181205-ae6ca9944745
+Copyright 2020 The Go4 AUTHORS
+
+go4.org/netipx@v0.0.0-20260823151212-3075585bcbeb
+Copyright 2020 The Inet.Af AUTHORS. All rights reserved.
+Copyright 2021 The Inet.Af AUTHORS. All rights reserved.
+
+golang.org/x/crypto@v0.57.0
+Copyright 2012 The Go Authors. All rights reserved.
+Copyright 2014 The Go Authors. All rights reserved.
+Copyright 2016 The Go Authors. All rights reserved.
+Copyright 2017 The Go Authors. All rights reserved.
+Copyright 2018 The Go Authors. All rights reserved.
+Copyright 2019 The Go Authors. All rights reserved.
+Copyright 2025 The Go Authors. All rights reserved.
+
+golang.org/x/exp@v0.0.0-20260908205506-85c1c2202aba
+Copyright 2021 The Go Authors. All rights reserved.
+
+golang.org/x/net@v0.59.0
+Copyright 2009 The Go Authors. All rights reserved.
+Copyright 2011 The Go Authors. All rights reserved.
+Copyright 2012 The Go Authors. All rights reserved.
+Copyright 2013 The Go Authors. All rights reserved.
+Copyright 2014 The Go Authors. All rights reserved.
+Copyright 2015 The Go Authors. All rights reserved.
+Copyright 2016 The Go Authors. All rights reserved.
+Copyright 2017 The Go Authors. All rights reserved.
+Copyright 2018 The Go Authors. All rights reserved.
+Copyright 2019 The Go Authors. All rights reserved.
+Copyright 2020 The Go Authors. All rights reserved.
+Copyright 2021 The Go Authors. All rights reserved.
+Copyright 2025 The Go Authors. All rights reserved.
+
+golang.org/x/oauth2@v0.37.0
+Copyright 2014 The Go Authors. All rights reserved.
+Copyright 2017 The Go Authors. All rights reserved.
+Copyright 2023 The Go Authors. All rights reserved.
+
+golang.org/x/sync@v0.23.0
+Copyright 2016 The Go Authors. All rights reserved.
+
+golang.org/x/sys@v0.48.0
+Copyright 2009 The Go Authors. All rights reserved.
+Copyright 2009,2010 The Go Authors. All rights reserved.
+Copyright 2010 The Go Authors. All rights reserved.
+Copyright 2011 The Go Authors. All rights reserved.
+Copyright 2012 The Go Authors. All rights reserved.
+Copyright 2014 The Go Authors. All rights reserved.
+Copyright 2015 The Go Authors. All rights reserved.
+Copyright 2016 The Go Authors. All rights reserved.
+Copyright 2017 The Go Authors. All rights reserved.
+Copyright 2018 The Go Authors. All rights reserved.
+Copyright 2019 The Go Authors. All rights reserved.
+Copyright 2020 The Go Authors. All rights reserved.
+Copyright 2021 The Go Authors. All rights reserved.
+Copyright 2022 The Go Authors. All rights reserved.
+Copyright 2023 The Go Authors. All rights reserved.
+Copyright 2024 The Go Authors. All rights reserved.
+Copyright 2025 The Go Authors. All rights reserved.
+Copyright 2026 The Go Authors. All rights reserved.
+
+golang.org/x/term@v0.46.0
+Copyright 2011 The Go Authors. All rights reserved.
+Copyright 2013 The Go Authors. All rights reserved.
+Copyright 2019 The Go Authors. All rights reserved.
+Copyright 2021 The Go Authors. All rights reserved.
+
+golang.org/x/text@v0.42.0
+Copyright 2011 The Go Authors. All rights reserved.
+Copyright 2013 The Go Authors. All rights reserved.
+Copyright 2015 The Go Authors. All rights reserved.
+Copyright 2016 The Go Authors. All rights reserved.
+
+golang.org/x/time@v0.16.0
+Copyright 2015 The Go Authors. All rights reserved.
+Copyright 2022 The Go Authors. All rights reserved.
+
+golang.zx2c4.com/wintun@v0.0.0-20230126152724-0fa3db229ce2
+Copyright (C) 2017-2021 WireGuard LLC. All Rights Reserved.
+SPDX-License-Identifier: MIT
+
+golang.zx2c4.com/wireguard/windows@v1.0.1
+Copyright (C) 2019-2026 WireGuard LLC. All Rights Reserved.
+SPDX-License-Identifier: MIT
+
+gvisor.dev/gvisor@v0.0.0-20260915211658-a6f909f08a72
+Copyright 2009 The Go Authors. All rights reserved.
+Copyright 2018 The gVisor Authors.
+Copyright 2019 The gVisor Authors.
+Copyright 2020 The gVisor Authors.
+Copyright 2021 The gVisor Authors.
+Copyright 2022 The gVisor Authors.
+Copyright 2023 The gVisor Authors.
+Copyright 2024 The gVisor Authors.
+Copyright 2025 The gVisor Authors.
+Copyright 2026 The gVisor Authors.
+
+tailscale.com@v1.104.1
+Copyright (c) Tailscale Inc & contributors
+Copyright 2009 The Go Authors. All rights reserved.
+Copyright 2011 The Go Authors. All rights reserved.
+Copyright 2013 The Go Authors. All rights reserved.
+Copyright 2015 The Go Authors. All rights reserved.
+Copyright 2016 The Go Authors. All rights reserved.
+Copyright 2018 The Go Authors. All rights reserved.
+Copyright 2019 The Go Authors. All rights reserved.
+SPDX-License-Identifier: BSD-3-Clause

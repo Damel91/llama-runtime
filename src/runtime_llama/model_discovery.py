@@ -287,6 +287,7 @@ def discover_models(
     cancellation_probe: CancellationProbe | None = None,
     max_response_bytes: int = 1048576,
     max_models: int = 256,
+    proxy_url: str | None = None,
 ) -> ModelCatalog:
     """Observe a remote catalog through at most two GETs and one deadline.
 
@@ -353,6 +354,7 @@ def discover_models(
         timeout=timeout,
         verify_ssl=verify_ssl,
         trust_env=False,
+        proxy_url=proxy_url,
     ) as client:
         http_requests += 1
         catalog = client.models(

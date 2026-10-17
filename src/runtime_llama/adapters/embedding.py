@@ -12,6 +12,7 @@ import time
 from typing import Any, Literal, Sequence
 
 from runtime_llama.client import ClientHTTPError, LlamaCppClient
+from runtime_llama._proxy import assert_client_proxy
 from runtime_llama.configuration import AdapterProfile, EmbeddingPrefixes
 from runtime_llama.contracts import EmbeddingAdapter
 from runtime_llama.errors import LLMBackendError, LLMCancelledError, LLMTimeoutError
@@ -154,6 +155,8 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         self.configured_max_input_tokens = profile.max_input_tokens
         self.embedding_dim = int(profile.dimension or 0)
         generation = profile.generation
+        proxy_url = getattr(profile.model_config, "proxy_url", None)
+        assert_client_proxy(client, proxy_url)
         api_key = generation.api_key or (
             os.environ.get(generation.api_key_env) if generation.api_key_env else None
         )
@@ -166,6 +169,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 api_key=api_key,
                 timeout=profile.timeout,
                 verify_ssl=profile.model_config.verify_ssl,
+                proxy_url=proxy_url,
             )
         )
         self._loaded_context_length: int | None = None

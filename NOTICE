@@ -18,3 +18,10 @@ Functional contracts, error/runaway handling, MCP data contracts, usage types,
 generation and embedding behaviors, and selected regression cases derive from
 the project owner's earlier lmstudio-agent-runtime implementation.
 See docs/PROVENANCE.md for the component boundaries and adaptation details.
+
+The optional tsnet helper is a separately built native executable; it is not
+included in the Python wheel. It links tailscale.com v1.104.1, Copyright (c)
+Tailscale Inc & AUTHORS, under the BSD 3-Clause license reproduced in
+helpers/tsnet/TAILSCALE-LICENSE.txt. Native distributions accompany the helper
+with the dependency and Go runtime licenses/attributions collected in
+helpers/tsnet/third_party/. The source distribution includes this bundle.

@@ -31,6 +31,7 @@ from urllib3.exceptions import TimeoutError as Urllib3TimeoutError
 from urllib3.response import HTTPResponse as Urllib3HTTPResponse
 
 from .errors import LLMBackendError, LLMCancelledError, LLMTimeoutError
+from ._proxy import normalize_proxy_url
 from ._http_interrupt import RequestInterrupt, bind_interrupt, unbind_interrupt
 
 CancellationProbe = Callable[[], bool]
@@ -251,7 +252,11 @@ class _HTTPCall:
             else (timeout, idle_timeout)
         )
         self._stop = Event()
-        self._interrupt = RequestInterrupt(self._stop) if idle_timeout is None else None
+        self._interrupt = (
+            RequestInterrupt(self._stop)
+            if idle_timeout is None or client.proxy_url is not None
+            else None
+        )
         self._session: Any = None
         self._response: Any = None
         self._close_lock = Lock()
@@ -574,6 +579,7 @@ class LlamaCppClient:
         session: Any = None,
         *,
         trust_env: bool = True,
+        proxy_url: str | None = None,
     ) -> None:
         invalid_url = (
             "base_url must be an HTTP(S) server URL without "
@@ -603,7 +609,10 @@ class LlamaCppClient:
             raise ValueError(invalid_url) from None
         if not isinstance(trust_env, bool):
             raise ValueError("trust_env must be a boolean")
-        self.trust_env = trust_env
+        self.proxy_url = normalize_proxy_url(proxy_url)
+        if self.proxy_url is not None and session is not None:
+            raise ValueError("explicit proxy routing requires an owned session")
+        self.trust_env = False if self.proxy_url is not None else trust_env
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = _timeout(timeout)
@@ -622,6 +631,8 @@ class LlamaCppClient:
         # An explicit policy applies to every owned lease, including sessions
         # created later for concurrent requests. Borrowed sessions are untouched.
         session.trust_env = self.trust_env
+        if self.proxy_url is not None:
+            session.proxies.update({"http": self.proxy_url, "https": self.proxy_url})
         session.mount("http://", requests.adapters.HTTPAdapter(max_retries=0))
         session.mount("https://", requests.adapters.HTTPAdapter(max_retries=0))
         return session

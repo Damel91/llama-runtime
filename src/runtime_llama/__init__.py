@@ -57,10 +57,14 @@ from runtime_llama.model_discovery import (
 from runtime_llama.adapters.llama import LlamaCppAdapter
 from runtime_llama.adapters.embedding import LlamaCppEmbeddingAdapter
 from runtime_llama.factory import build_adapter, build_embedding_adapter
+from runtime_llama.tailnet import TailnetConfig, TailnetError, TailnetHelper
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 __all__ = [
+    "TailnetConfig",
+    "TailnetError",
+    "TailnetHelper",
     "BaseLLMAdapter",
     "CancellationProbe",
     "EmbeddingAdapter",

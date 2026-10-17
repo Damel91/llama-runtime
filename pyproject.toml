@@ -5,7 +5,7 @@ backend-path = ["."]
 
 [project]
 name = "runtime-llama"
-version = "0.5.1"
+version = "0.6.0"
 description = "Python adapters for llama.cpp HTTP servers: streaming, tool calls, embeddings and replica discovery"
 readme = "README.md"
 requires-python = ">=3.11"

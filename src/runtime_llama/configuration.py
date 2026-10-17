@@ -16,6 +16,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from runtime_llama.diagnostics import ThinkingDiagnosticsConfig
+from runtime_llama._proxy import normalize_proxy_url
 
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8080"
@@ -84,6 +85,7 @@ class LlamaServerConfig:
     context_length: int | None = None
     verify_ssl: bool = True
     runtime_identity: str | None = None
+    proxy_url: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         model = str(self.model or "").strip()
@@ -94,6 +96,7 @@ class LlamaServerConfig:
             raise ValueError("verify_ssl must be boolean")
         object.__setattr__(self, "model", model)
         object.__setattr__(self, "base_url", normalize_rest_root(self.base_url))
+        object.__setattr__(self, "proxy_url", normalize_proxy_url(self.proxy_url))
 
     @property
     def physical_identity(self) -> str:
@@ -366,6 +369,7 @@ class AdapterProfile:
             context_length=merged.get("model_context_length"),
             verify_ssl=merged.get("verify_ssl", True),
             runtime_identity=merged.get("runtime_identity"),
+            proxy_url=merged.get("proxy_url"),
         )
         role_fields = {
             name: merged[name]

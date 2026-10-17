@@ -287,9 +287,11 @@ def test_real_http_failure_stops_unsent_batches_and_next_call_recovers():
 
 def test_cancellation_drains_one_call_without_cancelling_another_borrowed_client():
     with server() as (state, url):
+        item_zero_started = Event()
 
         def action(body):
             if body["input"][0] == "item-0":
+                item_zero_started.set()
                 assert state.release.wait(3)
             return 200, response(body["input"])
 
@@ -307,7 +309,7 @@ def test_cancellation_drains_one_call_without_cancelling_another_borrowed_client
                     [f"item-{index}" for index in range(16)],
                     cancel=cancel.is_set,
                 )
-                assert state.started.wait(2)
+                assert item_zero_started.wait(2)
                 cancel.set()
                 other = callers.submit(adapter.embed_query, "item-99")
                 assert other.result(timeout=3) == [99, 1]
