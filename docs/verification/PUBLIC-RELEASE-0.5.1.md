@@ -17,17 +17,33 @@ Borrowed Requests Sessions reject unbounded SSE before dispatch. See the
 [public timeout and bridge guide](../STREAM-TIMEOUTS.md) for ownership, nullable
 evidence, validation and timing limitations.
 
+An integration review before publication found that the initial no-idle error
+path dropped structured HTTP codes needed to recognize context overflow. The
+release restores safe `error_code` and `error_type`, using a separate total
+error-body deadline of at most 5 seconds (or the smaller finite HTTP timeout)
+and 64 KiB decompressed bytes (or the smaller caller limit). Incomplete, late,
+malformed or excessive bodies retain the HTTP status with optional codes absent.
+The watchdog is cancelled and joined before session reuse. This correction and
+its regressions precede the final artifact qualification; the initial candidate
+was not published.
+
 ## Actual verification
 
 | Check | Result |
 | --- | --- |
-| Stable full deterministic suite | 841 passed in 27.08 seconds |
-| Ruff check and format check | Passed; 56 files formatted |
+| Corrected stable full deterministic suite | 863 passed in 33.26 seconds |
+| Added HTTP error compatibility cases included above | 22 passed in 6.44 seconds |
+| Host focused transport/configuration/adapter/error matrix | 298 passed in 15.58 seconds |
+| Minimum Requests 2.31.0 / urllib3 1.26.20 matrix | 298 passed in 15.80 seconds |
+| Recent Requests 2.34.2 / urllib3 2.8.0 matrix | 298 passed in 15.66 seconds |
+| Python 3.14.6 with recent dependencies matrix | 298 passed in 15.99 seconds |
+| Ruff check and format check | Passed; 57 files formatted |
 | PEP 517 normalized source and wheel build | Passed |
 | Clean stable wheel install outside checkout, Python 3.14.6 | Passed; Requests 2.34.2 / urllib3 2.8.0; pip dependency check passed |
-| Installed HTTP wait before headers | 31.005 seconds, then successful response with idle `None` evidence |
-| Installed Stop before headers | Typed cancellation in 0.051 seconds, fixture gate still closed |
-| Installed request count | Two HTTP requests for two calls, no replay |
+| Installed HTTP wait before headers | 31.015 seconds, then successful response with idle `None` evidence |
+| Installed Stop before headers | Typed cancellation in 0.056 seconds, fixture gate still closed |
+| Installed HTTP 400 overflow through adapter | Both safe context-overflow codes retained; private provider message absent |
+| Installed request count | Three HTTP requests for three calls, no replay |
 | Runtime payload parity, metadata and retained licenses | Passed |
 | Source/package privacy and archive normalization audit | Passed |
 | README and timeout-guide executable Python examples and relative links | Passed |
@@ -38,17 +54,21 @@ bridge-owned raw client injected into the adapter. The bridge closes both
 objects. Timings include artificial waits, transport and Python work; they are
 not GPU timings or throughput claims.
 
-The correction's dependency matrices, recorded in the local qualification,
-also pass with Requests 2.31.0 / urllib3 1.26.20 and the host combination, plus
-Python 3.14.6. Stable promotion changes version metadata and documentation;
-those implementation matrices apply to the unchanged qualified runtime code.
-The full regression and installed artifact smoke above were run for `0.5.1`.
+The four final matrices include the corrected error reader and its regressions.
+The host combination is Python 3.11.15 / Requests 2.33.1 / urllib3 2.6.3;
+minimum and recent matrices also use Python 3.11.15. The full regression and
+installed artifact smoke apply to the corrected `0.5.1` runtime. Earlier local
+development evidence remains historical, with its own source/artifact identity.
 
 HTTP/TLS fixtures retain finite/default/borrowed behavior and cover quiet
 headers/body/events, cancellation, close, concurrent isolation, keep-alive and
 stale cleanup, environment authentication/proxy handling, malformed/truncated
-responses and stalled error bodies. Explicit Content-Length enforcement retains
-typed truncation failures across the supported urllib3 branches.
+responses and stalled error bodies. New HTTP error fixtures also cover the
+adapter's exact context-overflow codes and nullable evidence, decompressed and
+chunked size limits, corrupt gzip, a drip that produces no decoded chunks,
+the independent 5-second cap, Stop during error reading, a stream never iterated
+and watchdog cleanup before keep-alive reuse. Explicit Content-Length enforcement
+retains typed truncation failures across the supported urllib3 branches.
 
 ## Distribution
 

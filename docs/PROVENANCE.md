@@ -50,7 +50,9 @@ requests, response closure, classified errors without remote body dumps and
 raw JSON responses preserving unknown fields, optional decompressed JSON limits
 and an explicit ambient-session policy. Optional idle-free SSE uses a scoped
 connection hook with cancellation/drained cleanup; Content-Length validation
-also covers the older supported urllib3 branch. Missing usage counters are not
+also covers the older supported urllib3 branch. Error bodies under disabled SSE
+idle retain sanitized structured codes using a separate finite total deadline
+and decompressed byte limit. Missing usage counters are not
 converted to zero. These adaptations are described in [NOTICE](../NOTICE) and
 the source header while the original MIT license remains reproduced intact.
 

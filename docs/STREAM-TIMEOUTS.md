@@ -86,9 +86,16 @@ stopped when the local socket closed.
 `LLMTransportAttempt.idle_timeout_sec` is `None`/JSON `null` when disabled;
 the existing default zero remains unknown/unobserved. Normal cancellation polls
 do not allocate diagnostics per event. Existing typed backend, timeout,
-cancellation and runaway errors remain. Disabled-idle SSE HTTP errors return
-sanitized `ClientHTTPError.status_code` immediately, without waiting for optional
-error-body codes; other paths retain structured error behavior.
+cancellation and runaway errors remain. Disabled-idle SSE HTTP errors retain
+sanitized `ClientHTTPError.status_code`, `error_code` and `error_type`. Optional
+codes require a complete JSON error body within a separate total deadline of
+the smaller of the client's effective finite HTTP timeout and 5 seconds, and a
+64 KiB decompressed limit (or the caller's smaller response limit). The deadline
+starts after error headers; it is not a timeout for successful silent prefill.
+Malformed, truncated, oversized or stalled error bodies preserve the status with
+optional codes absent. Provider messages and bodies are never exposed. The
+call-owned watchdog interrupts and drains before session reuse; user
+cancellation retains its typed outcome. No error recovery retries inference.
 
 Actual Requests/urllib3 responses enforce Content-Length while reading,
 including the older branch: valid JSON followed by premature EOF is a typed
