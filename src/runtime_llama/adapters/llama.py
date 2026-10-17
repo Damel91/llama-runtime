@@ -47,6 +47,14 @@ _RESERVED_REQUEST_FIELDS = {
     "max_tokens",
     "n_predict",
     "timeout",
+    "idle_timeout",
+    "stream_idle_timeout_sec",
+    "cancel_wait",
+    "max_response_bytes",
+    "trust_env",
+    "verify_ssl",
+    "api_key",
+    "api_key_env",
     "cancel",
     "num_predict",
     "num_ctx",
@@ -89,7 +97,7 @@ class LlamaCppAdapter(LLMAdapter):
         output_mode: str = "text",
         role_id: str = "unknown",
         role_profile: Any = None,
-        stream_idle_timeout_sec: float = 30.0,
+        stream_idle_timeout_sec: float | None = 30.0,
         api_key: Optional[str] = None,
         api_key_env: Optional[str] = None,
         extra_body: Optional[Dict[str, Any]] = None,
@@ -151,7 +159,11 @@ class LlamaCppAdapter(LLMAdapter):
         self._client = client or LlamaCppClient(
             self._model_config.base_url,
             api_key=token,
-            timeout=self._generation_config.stream_idle_timeout_sec,
+            timeout=(
+                30.0
+                if self._generation_config.stream_idle_timeout_sec is None
+                else self._generation_config.stream_idle_timeout_sec
+            ),
             verify_ssl=self._model_config.verify_ssl,
         )
 
@@ -185,6 +197,43 @@ class LlamaCppAdapter(LLMAdapter):
     @property
     def role_profile(self) -> Any:
         return self._role_profile
+
+    def _stream_idle(self, timeout: Optional[float]) -> float | None:
+        value = (
+            self._generation_config.stream_idle_timeout_sec
+            if timeout is None
+            else timeout
+        )
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("timeout must be positive and finite")
+        try:
+            value = float(value)
+        except (ValueError, OverflowError):
+            raise ValueError("timeout must be positive and finite") from None
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("timeout must be positive and finite")
+        return value
+
+    def _raise_if_cancelled(
+        self,
+        cancellation_probe: Optional[CancellationProbe],
+        *,
+        timeout: Optional[float] = None,
+        diagnostics: Optional[LLMTransportAttempt] = None,
+    ) -> None:
+        if cancellation_probe is None:
+            return
+        idle = self._stream_idle(timeout)
+        try:
+            super()._raise_if_cancelled(
+                cancellation_probe, timeout=timeout, diagnostics=diagnostics
+            )
+        except LLMCancelledError as exc:
+            if diagnostics is None and idle is None and exc.diagnostics is not None:
+                exc.diagnostics = replace(exc.diagnostics, idle_timeout_sec=None)
+            raise
 
     def _chat_messages(self, messages: Any) -> List[Dict[str, Any]]:
         if isinstance(messages, str):
@@ -432,13 +481,7 @@ class LlamaCppAdapter(LLMAdapter):
         cancellation_probe: Optional[CancellationProbe] = None,
         request_options: Optional[Mapping[str, Any]] = None,
     ) -> Iterator[LLMStreamEvent]:
-        idle = (
-            self._generation_config.stream_idle_timeout_sec
-            if timeout is None
-            else float(timeout)
-        )
-        if isinstance(timeout, bool) or not math.isfinite(idle) or idle <= 0:
-            raise ValueError("timeout must be positive")
+        idle = self._stream_idle(timeout)
         self._raise_if_cancelled(cancellation_probe, timeout=idle)
         body = self._body(
             messages,
@@ -475,6 +518,7 @@ class LlamaCppAdapter(LLMAdapter):
                 stream=True,
                 cancel=cancellation_probe,
                 timeout=idle,
+                **({"idle_timeout": None} if idle is None else {}),
                 stream_options={"include_usage": True},
                 **body,
             )
