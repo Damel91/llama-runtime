@@ -20,6 +20,7 @@ ledger or certify a particular deployment.
 | Discover equivalent loaded replicas only from supported content and semantic identity attestations | [Replica discovery](AUTOMATIC-EMBEDDING-REPLICAS.md); discovery and replica configuration tests |
 | Bound admission, queues and tokenization across callers sharing an adapter | [Concurrency](CONCURRENCY-AND-DIAGNOSTICS.md); concurrency and scheduler tests |
 | Preserve typed failures, cancellation, cleanup and resource ownership without automatic retries | [Integration](INTEGRATION.md); transport, cancellation and cleanup tests |
+| Allow explicit idle-free generation while preserving finite non-SSE budgets and exact-call Stop/cleanup | [Stream timeouts](STREAM-TIMEOUTS.md); nullable config, optional idle transport and adapter tests |
 | Capture bounded thinking diagnostics only when enabled | [Concurrency](CONCURRENCY-AND-DIAGNOSTICS.md); thinking diagnostic tests |
 
 Use the commands in the [README](../README.md#verification) to run local

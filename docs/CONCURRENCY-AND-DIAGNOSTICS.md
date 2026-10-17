@@ -53,6 +53,14 @@ promise immediate termination of remote computation. The transport introduces
 no automatic retries. An injected client remains owned by its caller; the
 library closes only resources it creates.
 
+Generation idle can be disabled explicitly with `stream_idle_timeout_sec=None`.
+Connection/JSON budgets remain finite. Owned SSE cancellation interrupts only
+the active leased connection, then drains and detaches its hook before pool
+reuse; an old stream cannot close a later call. A borrowed Requests Session
+rejects unbounded SSE before dispatch. An injected raw client still belongs to
+its caller. See [stream timeouts](STREAM-TIMEOUTS.md) for the public bridge
+pattern, nullable evidence and DNS/connect limitations.
+
 ## Thinking diagnostics
 
 `thinking_diagnostics` accepts `enabled` (default `False`) and `max_chars`

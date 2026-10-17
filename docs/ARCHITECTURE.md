@@ -48,6 +48,7 @@ flowchart TD
 | `configuration.py` | Profili immutabili distinti per server, ruolo e generazione; prefissi embedding per modello; identità fisica indipendente da sampling, credenziali e prefissi |
 | `contracts.py`, `usage.py`, `errors.py`, `runaway.py` | Accumulazione del testo, reasoning, budget visibile, interruzione, esiti e diagnostica della baseline adattati |
 | `client.py` | HTTP `requests`, parsing JSON/SSE rigoroso, limite JSON opzionale, policy ambientale esplicita, cleanup, cancellazione, errori classificati e API raw |
+| `_http_interrupt.py` | Hook per connessione owned della singola richiesta SSE senza idle; shutdown, detach prima del riuso e mapping locali a sessione/proxy |
 | `model_discovery.py` | Catalogo pubblico tipizzato e bounded, soli GET catalogo/root props, stati e capacità sconosciuti espliciti, identità e metadati con fonte |
 | `adapters/llama.py` | `/v1/chat/completions`, storia completa, sampling, reasoning/template, schema, tool delta e usage |
 | `adapters/embedding.py` | Preparazione query/document/raw, `/v1/embeddings`, `/tokenize`, `/props`, batching, limiti, ordine e integrità numerica |
@@ -62,6 +63,15 @@ e valori mancanti. Gli helper includono completion nativa, chat, embedding,
 tokenizer/detokenizer, health, props e modelli. Il trasporto non applica retry o
 redirect automatici; TLS è verificato per default. Le API disponibili dipendono
 dalla build server, non dalla sola presenza dell'helper.
+
+Il quiet timeout SSE può essere esplicitamente disabilitato con
+`stream_idle_timeout_sec=None`. L'adapter eredita il budget HTTP finito del
+client e invia `idle_timeout=None` separatamente. Il default resta 30 secondi;
+JSON, discovery ed embedding rimangono finiti. La cancellazione interrompe il
+socket owned prima di chiudere e drenare la risposta, anche durante l'attesa
+degli header. I hook sono disarmati prima del riuso della sessione; nessuna
+modifica globale alle classi urllib3. I limiti DNS/connect e le sessioni borrowed
+sono descritti in [STREAM-TIMEOUTS.md](STREAM-TIMEOUTS.md).
 
 ## Configurazione fisica e richiesta
 

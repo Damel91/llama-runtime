@@ -7,6 +7,11 @@ generation and embedding APIs. Version `0.4.1` established the public
 distribution metadata and licensing. This document identifies reused components;
 it does not transfer historical deployment results to the public release.
 
+The corrective nullable-idle implementation adds per-call owned-connection
+interruption and preserves finite connection/JSON/default behavior. It uses
+Requests and urllib3 extension points; those packages remain external
+dependencies. See [stream timeouts](STREAM-TIMEOUTS.md) for the contract.
+
 ## Functional baseline
 
 Functional contracts, role configuration, reasoning separation, repetition and
@@ -43,7 +48,9 @@ Explicit adaptations include strict incremental SSE parsing, cancellation
 while waiting for JSON or SSE, exclusive reusable sessions for concurrent
 requests, response closure, classified errors without remote body dumps and
 raw JSON responses preserving unknown fields, optional decompressed JSON limits
-and an explicit ambient-session policy. Missing usage counters are not
+and an explicit ambient-session policy. Optional idle-free SSE uses a scoped
+connection hook with cancellation/drained cleanup; Content-Length validation
+also covers the older supported urllib3 branch. Missing usage counters are not
 converted to zero. These adaptations are described in [NOTICE](../NOTICE) and
 the source header while the original MIT license remains reproduced intact.
 

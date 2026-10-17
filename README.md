@@ -3,8 +3,8 @@
 A Python library for **llama.cpp / llama-server HTTP servers**, providing
 generation and embedding adapters for local servers, remote hosts and private
 networks. The Python distribution is `runtime-llama` and the import namespace is
-`runtime_llama`. Python 3.11 or later is required; `requests` is the only runtime
-dependency.
+`runtime_llama`. Python 3.11 or later is required. Runtime dependencies are
+`requests` and `urllib3`.
 
 ## Why this library exists
 
@@ -39,6 +39,7 @@ The project's engineering lifecycle is managed with
 | Replica discovery | Explicit aliases or automatic discovery using content and semantic identity tags from a compatible server manager; identity pinning and bounded topology refresh. |
 | Shared concurrency | Per-adapter global and per-replica admission, bounded queues, backpressure, separate tokenizer limits and ordered results across concurrent callers. Each automatic replica admits one active embedding request. |
 | Lifecycle and errors | Typed backend, timeout, cancellation and runaway errors; cooperative cancellation, repetition protection and drained embedding shutdown. Embedding calls have overall deadlines; generation supports bounded HTTP and stream-idle waits. |
+| Optional stream idle | Explicit `stream_idle_timeout_sec=None` waits through quiet prefill; connection/JSON budgets remain finite, with per-request socket interruption for Stop and drained close. |
 | Diagnostics | Optional bounded thinking capture, invocation correlation and final diagnostic sinks, including interrupted calls. |
 | HTTP access | Authentication and TLS verification, raw requests and helpers for chat/completion, embeddings, tokenization/detokenization, health, server properties and model catalogs. |
 | Read-only model catalog | Typed observations of catalog entries and proven loaded models, explicit capability unknowns, identity tags and context provenance; bounded GET-only discovery without model loading. |
@@ -98,6 +99,12 @@ values containing reasoning, usage, tool fragments and terminal information.
 Close a generator when stopping early, using `finally` or `contextlib.closing`.
 A `cancellation_probe` supports cooperative cancellation while waiting for a
 response.
+
+To wait through long silent prefill, set `stream_idle_timeout_sec` to `None`
+(`null` in JSON). The default remains 30 seconds; positive per-call `timeout`
+restores a finite idle bound. Connection, JSON, discovery and embedding budgets
+remain finite. See [stream timeouts and cancellation](docs/STREAM-TIMEOUTS.md)
+for the bridge-owned client pattern, authentication policy and cleanup limits.
 
 `num_predict` maps to the request's `max_tokens`. `request_options` accepts
 sampling overrides and server extensions while protecting managed request
@@ -240,6 +247,7 @@ the Python dependencies declared by this package.
 - [Read-only model discovery](docs/MODEL-DISCOVERY.md)
 - [Embedding preparation and batching](docs/EMBEDDING-CONTRACTS.md)
 - [Concurrency and diagnostics](docs/CONCURRENCY-AND-DIAGNOSTICS.md)
+- [Stream timeouts and cancellation](docs/STREAM-TIMEOUTS.md)
 - [Provenance and attribution](docs/PROVENANCE.md)
 
 Copyright 2026 Davide Mele. The project is licensed under

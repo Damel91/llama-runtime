@@ -1,4 +1,4 @@
-# Contratto di integrazione — runtime-llama 0.5.0
+# Contratto di integrazione — runtime-llama 0.5.1.dev1
 
 La libreria usa il `llama-server` scelto dal consumer, locale o remoto.
 Il gestore del server possiede build, processo, pesi, dispositivi, contesto e
@@ -13,6 +13,15 @@ pubblica tipizzata, conservando le API esistenti di generazione ed embedding.
 Non dichiara una nuova qualifica live.
 
 ## Connessione e disponibilità
+
+Per la generazione `stream_idle_timeout_sec=None` elimina solo la scadenza idle
+SSE, anche durante prefill prima degli header o del primo token. Il default
+resta 30 secondi; un timeout numerico per chiamata ripristina il limite.
+Connessione, JSON, discovery ed embedding restano finiti. Stop interrompe il
+socket della singola richiesta; la chiusura viene drenata prima del riuso della
+sessione. Il bridge può usare il client owned con `trust_env=False`, evitando
+session injection e accessi privati; un client iniettato resta del chiamante.
+Vedi [STREAM-TIMEOUTS.md](STREAM-TIMEOUTS.md) per il pattern pubblico e i limiti.
 
 Le factory costruiscono adapter senza rete. `load()` è un controllo di
 disponibilità, equivalente a `is_ready()`, e non un comando amministrativo.
