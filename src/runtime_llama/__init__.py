@@ -58,7 +58,7 @@ from runtime_llama.adapters.llama import LlamaCppAdapter
 from runtime_llama.adapters.embedding import LlamaCppEmbeddingAdapter
 from runtime_llama.factory import build_adapter, build_embedding_adapter
 
-__version__ = "0.5.0"
+__version__ = "0.5.1.dev1"
 
 __all__ = [
     "BaseLLMAdapter",
