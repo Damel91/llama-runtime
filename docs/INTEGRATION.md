@@ -1,4 +1,4 @@
-# Contratto di integrazione — runtime-llama 0.5.1.dev1
+# Contratto di integrazione — runtime-llama 0.5.1
 
 La libreria usa il `llama-server` scelto dal consumer, locale o remoto.
 Il gestore del server possiede build, processo, pesi, dispositivi, contesto e

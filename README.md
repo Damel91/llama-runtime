@@ -57,10 +57,10 @@ policy is supported.
 With Python 3.11 or later, install the tagged source:
 
 ```bash
-python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.5.0'
+python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.5.1'
 ```
 
-Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.5.0),
+Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.5.1),
 or run the following from a checkout:
 
 ```bash
@@ -219,7 +219,7 @@ claim. Local tests, a particular server/model qualification and application
 acceptance are separate. Closing a client stream does not by itself prove
 that remote inference stopped. Missing usage values remain missing.
 
-See the [0.5.0 release verification](docs/verification/PUBLIC-RELEASE-0.5.0.md)
+See the [0.5.1 release verification](docs/verification/PUBLIC-RELEASE-0.5.1.md)
 for the checks performed on this distribution. Release assets include SHA-256
 checksums for the wheel and source archive.
 

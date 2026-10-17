@@ -1,6 +1,7 @@
 # Generation stream timeouts and cancellation
 
-The nullable idle contract starts with the `0.5.1.dev1` qualification build.
+The nullable idle contract is available in `0.5.1`, following the separately
+recorded [`0.5.1.dev1` local qualification](verification/LOCAL-IDLE-0.5.1.dev1.md).
 Set `stream_idle_timeout_sec=None` (`null` in JSON) to wait through silent
 generation before headers, before the first token and between events. This
 disables SSE idle explicitly, without a large numeric workaround. The default
