@@ -28,13 +28,16 @@ import weakref
 import requests
 from urllib3.exceptions import NewConnectionError
 from urllib3.exceptions import TimeoutError as Urllib3TimeoutError
+from urllib3.response import HTTPResponse as Urllib3HTTPResponse
 
 from .errors import LLMBackendError, LLMCancelledError, LLMTimeoutError
+from ._http_interrupt import RequestInterrupt, bind_interrupt, unbind_interrupt
 
 CancellationProbe = Callable[[], bool]
 _SAFE_CODE = re.compile(r"[A-Za-z0-9_.-]{1,64}\Z")
 _END = object()
 _MAX_FRAME = 8 * 1024 * 1024
+_INHERIT_IDLE_TIMEOUT = object()
 
 
 class ClientHTTPError(LLMBackendError):
@@ -231,12 +234,22 @@ class _HTTPCall:
         cancel: CancellationProbe | None,
         cancel_wait: bool,
         max_response_bytes: int | None = None,
+        idle_timeout: Any = _INHERIT_IDLE_TIMEOUT,
     ) -> None:
         self._client, self._method, self._path = client, method, path
         self._body, self._timeout, self._cancel = body, timeout, cancel
         self._cancel_wait = cancel_wait
         self._max_response_bytes = max_response_bytes
+        self._idle_timeout = (
+            timeout if idle_timeout is _INHERIT_IDLE_TIMEOUT else idle_timeout
+        )
+        self._http_timeout = (
+            timeout
+            if idle_timeout is _INHERIT_IDLE_TIMEOUT
+            else (timeout, idle_timeout)
+        )
         self._stop = Event()
+        self._interrupt = RequestInterrupt(self._stop) if idle_timeout is None else None
         self._session: Any = None
         self._response: Any = None
         self._close_lock = Lock()
@@ -266,6 +279,8 @@ class _HTTPCall:
         self._session = self._client._lease_session()
         if self._stop.is_set():
             return None
+        if self._interrupt is not None:
+            bind_interrupt(self._session, self._interrupt)
         # Stream the HTTP body even for JSON: response.json() runs in this
         # reader, while the caller can notice cancellation during body I/O.
         self._response = self._client._send(
@@ -273,9 +288,15 @@ class _HTTPCall:
             self._method,
             self._path,
             self._body,
-            self._timeout,
+            self._http_timeout,
             self._stop,
         )
+        if isinstance(self._response, requests.Response) and isinstance(
+            self._response.raw, Urllib3HTTPResponse
+        ):
+            # urllib3 1.26 defaults to accepting EOF before Content-Length.
+            # Match 2.x integrity checks before decoding either JSON or SSE.
+            self._response.raw.enforce_content_length = True
         return self._response
 
     def _finish(self) -> None:
@@ -285,6 +306,9 @@ class _HTTPCall:
             # operation. Never return that session to the pool before it ends.
             self._response_closed.wait()
         if self._session is not None:
+            if self._interrupt is not None:
+                self._interrupt.detach()
+                unbind_interrupt(self._session, self._interrupt)
             self._client._release_session(self._session)
 
     def _chunks(self) -> Iterator[bytes | str]:
@@ -292,7 +316,8 @@ class _HTTPCall:
 
         read1 returns available data after one underlying read instead of
         waiting to fill a large buffer. Older urllib3 falls back to one-byte
-        iter_content. The HTTP timeout still bounds a completely idle read.
+        iter_content. Finite HTTP read timeouts bound idle reads; disabled SSE
+        idle uses the call-owned socket interrupt for cancellation and closure.
         """
         raw = getattr(self._response, "raw", None)
         read1 = getattr(raw, "read1", None)
@@ -339,6 +364,10 @@ class _HTTPCall:
 
     def _signal_close(self) -> None:
         self._stop.set()
+        if self._interrupt is not None:
+            # Shutdown precedes response.close(): a buffered read can otherwise
+            # keep close waiting forever when the read timeout is disabled.
+            self._interrupt.abort()
         with self._close_lock:
             if self._cleanup_started.is_set():
                 return
@@ -357,9 +386,9 @@ class _HTTPCall:
 
     def close(self) -> None:
         self._signal_close()
-        # A finite HTTP timeout bounds a read that requests cannot interrupt
-        # before headers arrive. Callers choosing cancel_wait retain their
-        # concurrency permit until cleanup finishes; ordinary cancel is prompt.
+        # Disabled-idle calls interrupt their leased socket, including header
+        # reads. Finite connect/TLS budgets still apply before socket capture.
+        # cancel_wait retains the caller's permit until cleanup finishes.
         self._join(timeout=None if self._cancel_wait else 0.1)
 
 
@@ -446,6 +475,10 @@ class _SSEStream(_HTTPCall, Iterator[dict[str, Any]]):
             if self._stop.is_set():
                 return
             if not 200 <= int(self._response.status_code) < 300:
+                if self._idle_timeout is None:
+                    # Do not replace disabled SSE idle with an unbounded JSON
+                    # error-body read. Status remains available and sanitized.
+                    raise ClientHTTPError(int(self._response.status_code))
                 raise _http_error(self._response, self._read_json)
             for payload in _sse(self._chunks()):
                 if self._stop.is_set():
@@ -462,17 +495,23 @@ class _SSEStream(_HTTPCall, Iterator[dict[str, Any]]):
     def __next__(self) -> dict[str, Any]:
         if self._stop.is_set():
             raise StopIteration
-        deadline = time.monotonic() + self._timeout
+        deadline = (
+            None
+            if self._idle_timeout is None
+            else time.monotonic() + self._idle_timeout
+        )
         try:
             while True:
                 _cancelled(self._cancel)
                 if self._stop.is_set():
                     raise StopIteration
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
                     raise LLMTimeoutError("llama_server_stream_idle_timeout")
                 try:
-                    value = self._queue.get(timeout=min(0.05, remaining))
+                    value = self._queue.get(
+                        timeout=0.05 if remaining is None else min(0.05, remaining)
+                    )
                 except Empty:
                     continue
                 _cancelled(self._cancel)
@@ -589,7 +628,7 @@ class LlamaCppClient:
         method: str,
         path: str,
         body: Any,
-        timeout: float,
+        timeout: float | tuple[float, float | None],
         stop: Event,
     ) -> Any:
         locked = False
@@ -633,14 +672,38 @@ class LlamaCppClient:
         timeout: float | None = None,
         cancel_wait: bool = False,
         max_response_bytes: int | None = None,
+        idle_timeout: Any = _INHERIT_IDLE_TIMEOUT,
     ) -> dict[str, Any] | list[Any] | Iterator[dict[str, Any]]:
         """Read JSON or SSE; optionally bound decompressed JSON/error bodies.
 
         ``max_response_bytes`` does not change the existing SSE frame limit.
         The bound is enforced while reading network responses, before buffering
         additional bytes. Borrowed custom response objects own their decoding.
+
+        For SSE only, omitted ``idle_timeout`` inherits the finite ``timeout``;
+        a positive value overrides SSE idle while keeping a finite connection
+        budget. Explicit ``None`` disables SSE idle on owned sessions, with
+        socket interruption for cancellation. JSON calls remain finite.
+        Disabled-idle HTTP errors report status without reading provider codes.
         """
         _cancelled(cancel)
+        if idle_timeout is not _INHERIT_IDLE_TIMEOUT:
+            if not stream:
+                raise ValueError("idle_timeout is only supported for SSE streams")
+            if idle_timeout is None:
+                if not self._owns_session:
+                    raise ValueError("disabled idle_timeout requires an owned session")
+            else:
+                if isinstance(idle_timeout, bool) or not isinstance(
+                    idle_timeout, (int, float)
+                ):
+                    raise ValueError("idle_timeout must be positive finite or None")
+                try:
+                    idle_timeout = _timeout(idle_timeout)
+                except (ValueError, OverflowError):
+                    raise ValueError(
+                        "idle_timeout must be positive finite or None"
+                    ) from None
         route = urlsplit(path)
         if (
             not path.startswith("/")
@@ -666,7 +729,15 @@ class LlamaCppClient:
             raise LLMBackendError("llama_server_client_closed")
         reader = _SSEStream if stream else _JSONCall
         result = reader(
-            self, method, path, json, bound, cancel, cancel_wait, max_response_bytes
+            self,
+            method,
+            path,
+            json,
+            bound,
+            cancel,
+            cancel_wait,
+            max_response_bytes,
+            idle_timeout,
         )
         with self._streams_lock:
             if self._closed:
@@ -684,6 +755,7 @@ class LlamaCppClient:
         *,
         timeout: float | None = None,
         cancel_wait: bool = False,
+        idle_timeout: Any = _INHERIT_IDLE_TIMEOUT,
         **kwargs: Any,
     ) -> Any:
         data = {"messages": messages, **kwargs, "stream": stream}
@@ -697,6 +769,7 @@ class LlamaCppClient:
             cancel=cancel,
             timeout=timeout,
             cancel_wait=cancel_wait,
+            idle_timeout=idle_timeout,
         )
 
     def complete(
@@ -707,6 +780,7 @@ class LlamaCppClient:
         *,
         timeout: float | None = None,
         cancel_wait: bool = False,
+        idle_timeout: Any = _INHERIT_IDLE_TIMEOUT,
         **kwargs: Any,
     ) -> Any:
         data = {"prompt": prompt, **kwargs, "stream": stream}
@@ -718,6 +792,7 @@ class LlamaCppClient:
             cancel=cancel,
             timeout=timeout,
             cancel_wait=cancel_wait,
+            idle_timeout=idle_timeout,
         )
 
     def embeddings(
@@ -730,6 +805,8 @@ class LlamaCppClient:
         cancel_wait: bool = False,
         **kwargs: Any,
     ) -> Any:
+        if "idle_timeout" in kwargs:
+            raise ValueError("idle_timeout is only supported for SSE streams")
         data = {"input": input, **kwargs}
         if model is not None:
             data["model"] = model
@@ -751,6 +828,8 @@ class LlamaCppClient:
         cancel_wait: bool = False,
         **kwargs: Any,
     ) -> Any:
+        if "idle_timeout" in kwargs:
+            raise ValueError("idle_timeout is only supported for SSE streams")
         return self.request(
             "POST",
             "/tokenize",
@@ -769,6 +848,8 @@ class LlamaCppClient:
         cancel_wait: bool = False,
         **kwargs: Any,
     ) -> Any:
+        if "idle_timeout" in kwargs:
+            raise ValueError("idle_timeout is only supported for SSE streams")
         return self.request(
             "POST",
             "/detokenize",
@@ -831,8 +912,8 @@ class LlamaCppClient:
             streams = list(self._streams)
         for stream in streams:
             stream._signal_close()
-        # Signal every reader before draining any of them. A request awaiting
-        # headers can keep this call waiting up to its finite HTTP timeout.
+        # Interrupt every disabled-idle socket before draining any reader.
+        # Ordinary finite calls can still await their configured HTTP timeout.
         for stream in streams:
             stream._join()
         with self._pool_lock:

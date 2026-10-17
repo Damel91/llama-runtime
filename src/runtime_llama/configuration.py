@@ -35,7 +35,10 @@ def _finite(
 ) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be finite numeric")
-    parsed = float(value)
+    try:
+        parsed = float(value)
+    except (ValueError, OverflowError):
+        raise ValueError(f"{name} is out of range") from None
     if (
         not math.isfinite(parsed)
         or parsed < minimum
@@ -113,7 +116,7 @@ class LlamaGenerationConfig:
     min_p: float | None = None
     repeat_penalty: float | None = None
     output_mode: str = "text"
-    stream_idle_timeout_sec: float = 30.0
+    stream_idle_timeout_sec: float | None = 30.0
     api_key: str | None = field(default=None, repr=False, compare=False)
     api_key_env: str | None = None
     extra_body: dict[str, Any] = field(default_factory=dict)
@@ -137,7 +140,10 @@ class LlamaGenerationConfig:
             raise ValueError("top_k must be a nonnegative integer")
         if self.repeat_penalty is not None:
             _finite(self.repeat_penalty, "repeat_penalty", positive=True)
-        _finite(self.stream_idle_timeout_sec, "stream_idle_timeout_sec", positive=True)
+        if self.stream_idle_timeout_sec is not None:
+            _finite(
+                self.stream_idle_timeout_sec, "stream_idle_timeout_sec", positive=True
+            )
         if self.output_mode not in {"text", "json"}:
             raise ValueError("output_mode must be text or json")
         if self.json_schema is not None and not isinstance(self.json_schema, dict):
@@ -265,6 +271,11 @@ class AdapterProfile:
     def __post_init__(self) -> None:
         if self.adapter_type not in {"llm", "embedding"}:
             raise ValueError("adapter_type must be llm or embedding")
+        if (
+            self.adapter_type == "embedding"
+            and self.generation.stream_idle_timeout_sec is None
+        ):
+            raise ValueError("embedding timeout must remain finite and positive")
         for name in (
             "batch_size",
             "batch_token_limit",
@@ -433,7 +444,8 @@ class AdapterProfile:
 
     @property
     def timeout(self) -> float:
-        return self.generation.stream_idle_timeout_sec
+        idle = self.generation.stream_idle_timeout_sec
+        return 30.0 if idle is None else idle
 
     @property
     def num_ctx(self) -> int | None:

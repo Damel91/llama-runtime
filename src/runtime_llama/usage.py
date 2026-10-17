@@ -11,7 +11,7 @@ class LLMTransportAttempt:
     """Bounded, content-free evidence for one transport attempt."""
 
     elapsed_ms: float = 0.0
-    idle_timeout_sec: float = 0.0
+    idle_timeout_sec: float | None = 0.0
     terminal_reason: str = ""
     terminal_event_seen: bool = False
     event_count: int = 0
@@ -22,7 +22,11 @@ class LLMTransportAttempt:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "elapsed_ms": round(max(0.0, float(self.elapsed_ms)), 3),
-            "idle_timeout_sec": max(0.0, float(self.idle_timeout_sec)),
+            "idle_timeout_sec": (
+                None
+                if self.idle_timeout_sec is None
+                else max(0.0, float(self.idle_timeout_sec))
+            ),
             "terminal_reason": str(self.terminal_reason or ""),
             "terminal_event_seen": bool(self.terminal_event_seen),
             "event_count": max(0, int(self.event_count)),
