@@ -53,25 +53,28 @@ against the forwarded JSON Schema. Splitting source documents and tracking their
 fragments belong to the consuming application. The server's own auto-loading
 policy is supported.
 
-## Local 0.7.0 candidate
+## Release 0.7.0
 
-The current candidate corrects native embedding batch budgets, overlaps bounded
+Version 0.7.0 corrects native embedding batch budgets, overlaps bounded
 preparation with ready HTTP work and supports unpatched llama.cpp through the
 standard HTTP connection-close policy. It also reduces generation bookkeeping
 and exposes optional native timings. No server, model or consumer migration is
 performed by the library. See [native HTTP and timing APIs](docs/NATIVE-HTTP.md)
-and [embedding contracts](docs/EMBEDDING-CONTRACTS.md). This candidate is a local
-wheel; the published installation links below still refer to release 0.6.0.
+and [embedding contracts](docs/EMBEDDING-CONTRACTS.md). Qualification includes
+two GPU embedding replicas with Flash Attention disabled, unchanged numerical
+thresholds and the previously failing corpus. See the
+[release verification](docs/verification/PUBLIC-RELEASE-0.7.0.md) for measured
+results and deployment boundaries.
 
 ## Install and generate
 
 With Python 3.11 or later, install the tagged source:
 
 ```bash
-python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.6.0'
+python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.7.0'
 ```
 
-Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.6.0),
+Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.7.0),
 or run the following from a checkout:
 
 ```bash
@@ -152,7 +155,7 @@ directory, hostname, enrollment credentials when needed, coordination server
 and inference endpoint. The Python wheel remains portable and contains no
 native binary. Importing or constructing the library never launches a VPN.
 
-The [release](https://github.com/Damel91/llama-runtime/releases/tag/v0.6.0)
+The [release](https://github.com/Damel91/llama-runtime/releases/tag/v0.7.0)
 provides separate helper archives for macOS ARM64, Linux AMD64 and Windows
 AMD64. Go is needed to build the helper from source, not to run a supplied
 binary. Both Tailscale's coordinator and an explicit HTTPS Headscale
@@ -252,7 +255,7 @@ claim. Local tests, a particular server/model qualification and application
 acceptance are separate. Closing a client stream does not by itself prove
 that remote inference stopped. Missing usage values remain missing.
 
-See the [0.6.0 release verification](docs/verification/PUBLIC-RELEASE-0.6.0.md)
+See the [0.7.0 release verification](docs/verification/PUBLIC-RELEASE-0.7.0.md)
 for the checks performed on this distribution. Release assets include SHA-256
 checksums for the wheel, source archive, native helper archives and source
 manifest. Native Linux/Windows assets are crossbuilt; this release does not
