@@ -31,6 +31,7 @@ class PreparedEmbeddingInput:
     _tokenizer_build: str | None = field(default=None, repr=False)
     _policy: str = field(default="", repr=False)
     _seal: bytes = field(default=b"", repr=False, compare=False)
+    _token_ids: tuple[int, ...] | None = field(default=None, repr=False)
 
     @staticmethod
     def _fits(count: int, limit: int | None) -> bool | None:
@@ -52,7 +53,7 @@ class PreparedEmbeddingInput:
 def _message(record: PreparedEmbeddingInput) -> bytes:
     return json.dumps(
         [
-            "runtime-llama-preparation-v1",
+            "runtime-llama-preparation-v2",
             record.text,
             record.input_type,
             record.token_count,
@@ -64,6 +65,7 @@ def _message(record: PreparedEmbeddingInput) -> bytes:
             record.embedding_sha256,
             record._tokenizer_build,
             record._policy,
+            record._token_ids,
         ],
         ensure_ascii=True,
         separators=(",", ":"),
@@ -82,6 +84,17 @@ def valid_preparation(key: bytes, record: object) -> bool:
     if type(record) is not PreparedEmbeddingInput:
         return False
     try:
+        if record._token_ids is not None and (
+            not isinstance(record._token_ids, tuple)
+            or len(record._token_ids) != record.token_count
+            or any(
+                not isinstance(token, int)
+                or isinstance(token, bool)
+                or not 0 <= token <= 2**31 - 1
+                for token in record._token_ids
+            )
+        ):
+            return False
         expected = hmac.digest(key, _message(record), hashlib.sha256)
         return isinstance(record._seal, bytes) and hmac.compare_digest(
             expected, record._seal

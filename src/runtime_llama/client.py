@@ -585,6 +585,10 @@ class _SSEStream(_HTTPCall, Iterator[dict[str, Any]]):
 class LlamaCppClient:
     """HTTP only: raw llama-server native and /v1 responses, no implicit retry."""
 
+    # llama-server /v1/embeddings accepts nested native token IDs unchanged.
+    # This is an explicit client contract, never an automatic inference probe.
+    supports_embedding_token_ids = True
+
     def __init__(
         self,
         base_url: str,

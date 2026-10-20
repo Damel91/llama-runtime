@@ -57,6 +57,7 @@ class _Replica:
     tokenizer_build: str | None = None
     props_checked: bool = False
     props_identity_verified: bool = False
+    vocab_size: int | None = None
     accepted_aliases: set[str] = field(default_factory=set)
     recovery_window: int = 32
     recovery_successes: int = 0
@@ -75,6 +76,7 @@ class _Observation:
     native_batch_tokens: int | None = None
     native_microbatch_tokens: int | None = None
     total_slots: int | None = None
+    vocab_size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -92,17 +94,22 @@ class _CountedInput:
     embedding_sha256: str | None
     _tokenizer_build: str | None
     _policy: str
+    _token_ids: tuple[int, ...] | None = None
 
 
-@dataclass
+@dataclass(eq=False)
 class _Quota:
     model: str
     offset: int
-    records: list[_CountedInput]
-    observation: _Observation
-    next_index: int = 0
+    records: list[_CountedInput | None]
+    inputs: Sequence[Any]
+    observation: _Observation | None = None
+    ready_at: dict[int, float] = field(default_factory=dict)
+    preparation_done: bool = False
+    dispatched: set[int] = field(default_factory=set)
     pending_requests: int = 0
     sent_indices: set[int] = field(default_factory=set)
+    validated: dict[int, tuple[Any, ...]] = field(default_factory=dict)
     admitted_limits: tuple[int | None, int | None] | None = None
     lock: Any = field(default_factory=Lock)
 
@@ -121,6 +128,7 @@ class _Call:
             raise ValueError("timeout must be a positive finite number")
         self.deadline = time.monotonic() + value
         self.stop = Event()
+        self.wake = Event()
         self.failure: BaseException | None = None
         self.lock = Lock()
         self.dimension = adapter.embedding_dim or None
@@ -161,6 +169,7 @@ class _Call:
                     exc = LLMBackendError("llamacpp_embedding_adapter_closed")
                 self.failure = exc
             self.stop.set()
+        self.wake.set()
 
     def validate_dimensions(self, vectors: list[list[float]]) -> None:
         with self.lock:
@@ -193,6 +202,8 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         self.model_name = profile.model
         self.base_url = profile.base_url
         self.batch_size = profile.batch_size or 32
+        self.embedding_batch_wait_sec = profile.embedding_batch_wait_sec
+        self.embedding_input_format = profile.embedding_input_format
         self.batch_token_limit = profile.batch_token_limit
         self.token_count_parallelism = int(profile.token_count_parallelism or 1)
         self.normalize = bool(profile.normalize)
@@ -546,6 +557,13 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             raise
         context_limit = self._input_limit(loaded_context_length, replica=replica)
         batch_limit = self._minimum(self.batch_token_limit, replica.batch_token_limit)
+        vocab_size = None
+        if replica.identity is not None and isinstance(entry, dict):
+            metadata = entry.get("meta")
+            if isinstance(metadata, dict) and "n_vocab" in metadata:
+                vocab_size = self._positive_int(metadata["n_vocab"])
+                if vocab_size is None:
+                    raise LLMBackendError("llamacpp_embedding_invalid_tokenizer_vocab")
         with replica.lock:
             replica.context_length = loaded_context_length
             replica.total_slots = total_slots
@@ -553,6 +571,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             replica.loaded_batch_token_limit = native.n_batch
             replica.native_microbatch_tokens = native.n_ubatch
             replica.tokenizer_build = build
+            replica.vocab_size = vocab_size
             if replica is self._primary:
                 self._loaded_context_length = loaded_context_length
         # A native slot bounds active sequences, not HTTP array length. Unknown
@@ -578,6 +597,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             native.n_batch,
             native.n_ubatch,
             native.total_slots,
+            vocab_size,
         )
 
     @staticmethod
@@ -590,6 +610,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         replica.loaded_batch_token_limit = None
         replica.native_microbatch_tokens = None
         replica.tokenizer_build = None
+        replica.vocab_size = None
         replica.props_identity_verified = False
         if replica is self._primary:
             self._loaded_context_length = None
@@ -664,7 +685,9 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         )
         return "add_special=true;parse_special=true;prefix=" + prefix
 
-    def _token_count(self, text: str, replica: _Replica, call: _Call) -> int:
+    def _tokenize_input(
+        self, text: str, replica: _Replica, call: _Call
+    ) -> tuple[int, ...]:
         acquired = False
         try:
             while not acquired:
@@ -685,14 +708,53 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             call.check()
             tokens = result.get("tokens") if isinstance(result, dict) else None
             if not isinstance(tokens, list) or any(
-                not isinstance(token, int) or isinstance(token, bool) or token < 0
+                not isinstance(token, int)
+                or isinstance(token, bool)
+                or not 0 <= token <= 2**31 - 1
                 for token in tokens
             ):
                 raise LLMBackendError("llamacpp_embedding_invalid_tokenization")
-            return len(tokens)
+            return tuple(tokens)
         finally:
             if acquired:
                 self._tokenizer_permits.release()
+
+    def _token_count(self, text: str, replica: _Replica, call: _Call) -> int:
+        return len(self._tokenize_input(text, replica, call))
+
+    def _embedding_input(self, texts, records, replica, observation):
+        if records is not None and observation is not None:
+            for record in records:
+                self._validate_vocab(record._token_ids, observation)
+        if self.embedding_input_format == "text":
+            return texts
+        usable = (
+            getattr(self._client, "supports_embedding_token_ids", None) is True
+            and observation is not None
+            and records is not None
+            and len(records) == len(texts)
+            and all(
+                self._can_reuse(record, replica, observation)
+                and isinstance(record._token_ids, tuple)
+                and len(record._token_ids) == record.token_count
+                and bool(record._token_ids)
+                for record in records
+            )
+        )
+        if usable:
+            return [list(record._token_ids) for record in records]
+        if self.embedding_input_format == "tokens":
+            raise LLMBackendError("llamacpp_embedding_token_input_unavailable")
+        return texts
+
+    @staticmethod
+    def _validate_vocab(token_ids, observation):
+        if (
+            token_ids is not None
+            and observation.vocab_size is not None
+            and any(token >= observation.vocab_size for token in token_ids)
+        ):
+            raise LLMBackendError("llamacpp_embedding_invalid_tokenization")
 
     def _can_reuse(self, record, replica, observation):
         identity = replica.identity
@@ -719,25 +781,29 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         future.add_done_callback(lambda _: permits.release())
         return future
 
-    def _prepare_quota(self, inputs, replica, call, observation, conservative):
+    def _prepare_quota(
+        self, inputs, replica, call, observation, conservative, publish=None
+    ):
         context_limit = self._minimum(observation.context_token_limit, conservative[0])
         batch_limit = self._minimum(observation.batch_token_limit, conservative[1])
 
-        def prepare(item):
+        def prepare(item, positions):
             try:
                 call.check()
                 if isinstance(item, PreparedEmbeddingInput):
                     text, input_type = item.text, item.input_type
-                    count = (
-                        item.token_count
-                        if self._can_reuse(item, replica, observation)
-                        else self._token_count(text, replica, call)
-                    )
+                    if self._can_reuse(item, replica, observation):
+                        count, token_ids = item.token_count, item._token_ids
+                    else:
+                        token_ids = self._tokenize_input(text, replica, call)
+                        count = len(token_ids)
                 else:
                     text, input_type = item
-                    count = self._token_count(text, replica, call)
+                    token_ids = self._tokenize_input(text, replica, call)
+                    count = len(token_ids)
                 identity = replica.identity
-                return _CountedInput(
+                self._validate_vocab(token_ids, observation)
+                record = _CountedInput(
                     text=text,
                     input_type=input_type,
                     token_count=count,
@@ -749,7 +815,18 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                     embedding_sha256=identity.embedding_sha256 if identity else None,
                     _tokenizer_build=observation.tokenizer_build,
                     _policy=self._policy(input_type),
+                    _token_ids=(
+                        token_ids
+                        if identity is not None
+                        and observation.tokenizer_build is not None
+                        and (context_limit is None or count <= context_limit)
+                        and (batch_limit is None or count <= batch_limit)
+                        else None
+                    ),
                 )
+                if publish is not None:
+                    publish(record, positions)
+                return record
             except BaseException as exc:
                 call.fail(exc)
                 raise
@@ -784,7 +861,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                     future = self._submit_bounded(
                         self._tokenizer_executor,
                         self._tokenizer_pending,
-                        lambda item=item: prepare(item),
+                        lambda item=item, positions=positions: prepare(item, positions),
                         call,
                     )
                     pending[future] = positions
@@ -980,7 +1057,12 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 generation = replica.generation
             try:
                 payload = self._client.embeddings(
-                    texts[start:stop],
+                    self._embedding_input(
+                        texts[start:stop],
+                        None if records is None else records[start:stop],
+                        replica,
+                        observed,
+                    ),
                     model=replica.model,
                     timeout=current_timeout,
                     cancel=cancel,
@@ -989,7 +1071,8 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             except ClientHTTPError as exc:
                 size = stop - start
                 if (
-                    exc.status_code != 400
+                    getattr(self._client, "supports_embedding_token_ids", None) is True
+                    or exc.status_code != 400
                     or getattr(exc, "error_type", None) != "exceed_context_size_error"
                     or size <= 1
                 ):
@@ -1007,26 +1090,124 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
 
         return send(0, len(texts), recovery_child, observation)
 
-    def _prepare_job(self, inputs, model, offset, call, conservative):
+    def _batch_now(self):
+        """Clock isolated from cancellation/deadline clocks for deterministic checks."""
+        return time.monotonic()
+
+    def _prepare_job(self, quota, model, offset, call, conservative):
         replica = self._replicas[model]
         try:
             call.check()
             observation = self._observe_replica(
                 replica=replica, cancel=call.probe, call=call
             )
-            records = self._prepare_quota(
-                inputs, replica, call, observation, conservative
+            with quota.lock:
+                quota.observation = observation
+
+            def publish(record, positions):
+                call.check()
+                now = self._batch_now()
+                with quota.lock:
+                    for index in positions:
+                        quota.records[index] = record
+                        quota.ready_at[index] = now
+                call.wake.set()
+
+            self._prepare_quota(
+                quota.inputs, replica, call, observation, conservative, publish
             )
-            return _Quota(model, offset, records, observation)
+            return quota
         except BaseException as exc:
             call.fail(exc)
             raise
+        finally:
+            with quota.lock:
+                quota.preparation_done = True
+            call.wake.set()
 
-    def _run_ready_batch(self, quota, start, stop, call):
+    def _quota_observation(self, quota, observed):
+        prior = quota.admitted_limits or (None, None)
+        return _Observation(
+            observed.context_length,
+            self._minimum(
+                prior[0],
+                observed.context_token_limit,
+                quota.observation.context_token_limit,
+            ),
+            self._minimum(
+                prior[1],
+                observed.batch_token_limit,
+                quota.observation.batch_token_limit,
+            ),
+            observed.tokenizer_build,
+            observed.identity_key,
+            observed.native_batch_tokens,
+            observed.native_microbatch_tokens,
+            observed.total_slots,
+            observed.vocab_size,
+        )
+
+    def _admit_known_records(self, quota, replica, effective):
+        # A late record is admitted under the most restrictive limit already
+        # observed. Unknown records never cause a previously successful replay.
+        key = (
+            effective.context_token_limit,
+            effective.batch_token_limit,
+            effective.tokenizer_build,
+            effective.identity_key,
+            effective.vocab_size,
+        )
+        for index, record in enumerate(quota.records):
+            if (
+                record is not None
+                and index not in quota.sent_indices
+                and quota.validated.get(index) != key
+            ):
+                self._admit(record, effective)
+                self._validate_vocab(record._token_ids, effective)
+                if self.embedding_input_format == "tokens":
+                    self._embedding_input([record.text], [record], replica, effective)
+                quota.validated[index] = key
+
+    def _ready_indices(self, quota, replica):
+        """Choose a coalesced batch without treating current readiness as its cap.
+
+        Called with quota.lock held. No HTTP or blocking queue insertion occurs.
+        """
+        if not quota.ready_at or quota.observation is None:
+            return None
+        effective = self._quota_observation(quota, quota.observation)
+        maximum = self._current_batch_size(
+            len(quota.inputs) - len(quota.dispatched), replica
+        )
+        indices, tokens = [], 0
+        budget = effective.batch_token_limit
+        budget_full = False
+        for index in sorted(quota.ready_at):
+            if len(indices) >= maximum:
+                break
+            count = quota.records[index].token_count
+            if indices and budget is not None and tokens + count > budget:
+                budget_full = True
+                break
+            indices.append(index)
+            tokens += count
+        elapsed = self._batch_now() - min(quota.ready_at.values())
+        if not (
+            len(indices) == maximum
+            or budget_full
+            or (budget is not None and tokens >= budget)
+            or quota.preparation_done
+            or elapsed >= self.embedding_batch_wait_sec
+        ):
+            return None
+        return tuple(indices)
+
+    def _run_ready_batch(self, quota, indices, call):
         replica = self._replicas[quota.model]
         try:
-            result, cursor = [], start
-            while cursor < stop:
+            result, cursor = [], 0
+            while cursor < len(indices):
                 call.check()
                 observed = self._observe_replica(
                     replica=replica, cancel=call.probe, call=call
@@ -1034,54 +1215,33 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 if observed.tokenizer_build != quota.observation.tokenizer_build:
                     raise LLMBackendError("llamacpp_embedding_tokenizer_policy_changed")
                 with quota.lock:
-                    prior = quota.admitted_limits or (None, None)
-                    context_limit = self._minimum(
-                        prior[0],
-                        observed.context_token_limit,
-                        quota.observation.context_token_limit,
+                    effective = self._quota_observation(quota, observed)
+                    self._admit_known_records(quota, replica, effective)
+                    quota.admitted_limits = (
+                        effective.context_token_limit,
+                        effective.batch_token_limit,
                     )
-                    http_limit = self._minimum(
-                        prior[1],
-                        observed.batch_token_limit,
-                        quota.observation.batch_token_limit,
-                    )
-                    effective = _Observation(
-                        observed.context_length,
-                        context_limit,
-                        http_limit,
-                        observed.tokenizer_build,
-                        observed.identity_key,
-                        observed.native_batch_tokens,
-                        observed.native_microbatch_tokens,
-                        observed.total_slots,
-                    )
-                    key = (context_limit, http_limit)
-                    if quota.admitted_limits != key:
-                        # Validate all unsent inputs before the first POST at a
-                        # new limit; completed/in-flight requests cannot replay.
-                        for index, record in enumerate(quota.records):
-                            if index not in quota.sent_indices:
-                                self._admit(record, effective)
-                        quota.admitted_limits = key
                     end, tokens = cursor, 0
-                    while end < stop:
-                        count = quota.records[end].token_count
+                    while end < len(indices):
+                        count = quota.records[indices[end]].token_count
                         if (
                             end > cursor
-                            and http_limit is not None
-                            and tokens + count > http_limit
+                            and effective.batch_token_limit is not None
+                            and tokens + count > effective.batch_token_limit
                         ):
                             break
                         tokens += count
                         end += 1
-                    quota.sent_indices.update(range(cursor, end))
+                    selected = indices[cursor:end]
+                    records = [quota.records[index] for index in selected]
+                    quota.sent_indices.update(selected)
                 vectors = self._request_batch_adaptive(
-                    [item.text for item in quota.records[cursor:end]],
+                    [item.text for item in records],
                     replica=replica,
                     cancel=call.probe,
                     call=call,
                     observation=effective,
-                    records=quota.records[cursor:end],
+                    records=records,
                 )
                 call.validate_dimensions(vectors)
                 result.extend(vectors)
@@ -1108,7 +1268,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             self._calls.add(call)
         outputs = [None] * len(inputs)
         preparations, requests = {}, {}
-        ready = []
+        quotas = []
         joined = False
         leased_quotas = 0
         try:
@@ -1119,7 +1279,6 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             ):
                 call.check()
             try:
-                # One catalog for all aliases at this boundary, with per-model props.
                 catalog = None
                 models = getattr(self._client, "models", None)
                 if callable(models):
@@ -1150,18 +1309,14 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             pending_limit = max(
                 1, self.embedding_request_parallelism + self.embedding_queue_size
             )
-            while (
-                window_start < len(inputs)
-                or descriptors
-                or preparations
-                or ready
-                or requests
-            ):
+            while window_start < len(inputs) or descriptors or quotas or requests:
                 call.check()
-                # A bounded lookahead overlaps preparation with active HTTP.
-                while len(preparations) + len(ready) + len(
-                    requests
-                ) < pending_limit and (descriptors or window_start < len(inputs)):
+                call.wake.clear()
+                # A permit bounds one quota's raw, counted, ready and HTTP work
+                # until BOTH its producer and every admitted request have drained.
+                while len(quotas) < pending_limit and (
+                    descriptors or window_start < len(inputs)
+                ):
                     if not descriptors:
                         window_end = min(len(inputs), window_start + self.batch_size)
                         offset = window_start
@@ -1175,91 +1330,100 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                         break
                     leased_quotas += 1
                     model, offset, size = descriptors.pop(0)
-                    chunk = inputs[offset : offset + size]
+                    quota = _Quota(
+                        model, offset, [None] * size, inputs[offset : offset + size]
+                    )
+                    quotas.append(quota)
                     future = self._preparation_executor.submit(
-                        lambda chunk=chunk, model=model, offset=offset: (
-                            self._prepare_job(chunk, model, offset, call, conservative)
+                        lambda quota=quota, model=model, offset=offset: (
+                            self._prepare_job(quota, model, offset, call, conservative)
                         )
                     )
-                    preparations[future] = (offset, size)
+                    preparations[future] = quota
+                    future.add_done_callback(lambda _future: call.wake.set())
+                # Preparation failures are inspected before scheduling more HTTP.
                 for future in tuple(preparations):
                     if not future.done():
                         continue
-                    preparations.pop(future)
-                    quota = future.result()
+                    quota = preparations.pop(future)
+                    future.result()
                     if operation == "prepare":
                         records = [
                             issue_preparation(self._preparation_key, **asdict(record))
                             for record in quota.records
                         ]
                         outputs[quota.offset : quota.offset + len(records)] = records
+                        quotas.remove(quota)
                         self._preparation_permits.release()
                         leased_quotas -= 1
-                    else:
-                        ready.append(quota)
-                attempts = len(ready)
-                while ready and attempts and len(requests) < pending_limit:
-                    attempts -= 1
-                    quota = ready.pop(0)
-                    replica = self._replicas[quota.model]
-                    start = quota.next_index
-                    maximum = self._current_batch_size(
-                        len(quota.records) - start, replica
-                    )
-                    stop, tokens = start, 0
-                    while stop < start + maximum:
-                        count = quota.records[stop].token_count
-                        limit = quota.observation.batch_token_limit
-                        if (
-                            stop > start
-                            and limit is not None
-                            and tokens + count > limit
-                        ):
+                if operation != "prepare":
+                    # Every quota gets one opportunity before a peer gets a
+                    # second; a busy alias never blocks another alias's ready work.
+                    for quota in tuple(quotas):
+                        if len(requests) >= pending_limit:
                             break
-                        tokens += count
-                        stop += 1
-                    future = self._scheduler.try_submit(
-                        lambda _alias, quota=quota, start=start, stop=stop: (
-                            self._run_ready_batch(quota, start, stop, call)
-                        ),
-                        call.check,
-                        model=quota.model,
-                    )
-                    if future is None:
-                        ready.append(quota)
-                        continue
-                    requests[future] = (quota.offset + start, stop - start, quota)
-                    quota.pending_requests += 1
-                    quota.next_index = stop
-                    # Rotate ready quotas so a large quota does not starve peers.
-                    if stop < len(quota.records):
-                        ready.append(quota)
-                        attempts += 1
-                pending = set(preparations) | set(requests)
-                if pending:
-                    finished, _ = wait(
-                        pending, timeout=0.05, return_when=FIRST_COMPLETED
-                    )
-                    for future in finished:
-                        if future not in requests:
-                            continue
-                        offset, size, quota = requests.pop(future)
-                        result = future.result()
-                        if len(result) != size:
-                            raise LLMBackendError(
-                                "llamacpp_embedding_count_or_response_mismatch"
+                        replica = self._replicas[quota.model]
+                        with quota.lock:
+                            indices = self._ready_indices(quota, replica)
+                            if indices is None:
+                                continue
+                            future = self._scheduler.try_submit(
+                                lambda _alias, quota=quota, indices=indices: (
+                                    self._run_ready_batch(quota, indices, call)
+                                ),
+                                call.check,
+                                model=quota.model,
                             )
-                        outputs[offset : offset + size] = result
+                            if future is None:
+                                continue
+                            quota.dispatched.update(indices)
+                            for index in indices:
+                                quota.ready_at.pop(index)
+                            quota.pending_requests += 1
+                            requests[future] = (quota, indices)
+                            future.add_done_callback(lambda _future: call.wake.set())
+                for future in tuple(requests):
+                    if not future.done():
+                        continue
+                    quota, indices = requests.pop(future)
+                    result = future.result()
+                    if len(result) != len(indices):
+                        raise LLMBackendError(
+                            "llamacpp_embedding_count_or_response_mismatch"
+                        )
+                    for index, vector in zip(indices, result):
+                        outputs[quota.offset + index] = vector
+                    with quota.lock:
                         quota.pending_requests -= 1
-                        if (
-                            quota.next_index == len(quota.records)
-                            and quota.pending_requests == 0
-                        ):
+                if operation != "prepare":
+                    for quota in tuple(quotas):
+                        with quota.lock:
+                            drained = (
+                                quota.preparation_done
+                                and quota.pending_requests == 0
+                                and len(quota.dispatched) == len(quota.inputs)
+                            )
+                        # Keep the producer future tracked until it was joined.
+                        if drained and quota not in preparations.values():
+                            quotas.remove(quota)
                             self._preparation_permits.release()
                             leased_quotas -= 1
-                else:
-                    # Another caller owns lookahead or HTTP admission capacity.
-                    call.stop.wait(min(0.01, call.remaining()))
+                if quotas or descriptors or window_start < len(inputs):
+                    # Record publication and request completion both wake this
+                    # coordinator; a bounded poll also notices other callers'
+                    # released global scheduler/preparation admission.
+                    delay = min(0.01, call.remaining())
+                    now = self._batch_now()
+                    for quota in quotas:
+                        with quota.lock:
+                            if quota.ready_at:
+                                due = (
+                                    min(quota.ready_at.values())
+                                    + self.embedding_batch_wait_sec
+                                )
+                                if due > now:
+                                    delay = min(delay, due - now)
+                    call.wake.wait(delay)
             call.check()
             if any(output is None for output in outputs):
                 raise LLMBackendError("llamacpp_embedding_count_or_response_mismatch")
@@ -1591,6 +1755,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                     "observed_native_batch_tokens": replica.loaded_batch_token_limit,
                     "observed_native_microbatch_tokens": replica.native_microbatch_tokens,
                     "tokenizer_build": replica.tokenizer_build,
+                    "observed_vocab_size": replica.vocab_size,
                     "max_input_tokens": self._input_limit(replica=replica),
                     "loaded_context_length": replica.context_length,
                     "observed_total_slots": replica.total_slots,
@@ -1607,6 +1772,11 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             "server_healthy": readiness["server_healthy"],
             "model_ready": readiness["model_ready"],
             "batch_size": self.batch_size,
+            "embedding_batch_wait_sec": self.embedding_batch_wait_sec,
+            "embedding_input_format": self.embedding_input_format,
+            "embedding_token_ids_supported": (
+                getattr(self._client, "supports_embedding_token_ids", None) is True
+            ),
             "effective_batch_size": primary["effective_batch_size"],
             "batch_recovery": primary["batch_recovery"],
             "batch_token_limit": self.batch_token_limit,
