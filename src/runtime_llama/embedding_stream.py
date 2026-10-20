@@ -9,16 +9,13 @@ from contextvars import copy_context
 from dataclasses import dataclass
 import math
 from threading import Event
-from typing import TYPE_CHECKING, Any, AsyncIterable, Literal, Sequence
+from typing import Any, AsyncIterable, Callable, Literal, Sequence
 
 from runtime_llama.embedding_preparation import PreparedEmbeddingInput
 from runtime_llama.errors import LLMBackendError
 
-if TYPE_CHECKING:
-    from runtime_llama.contracts import CancellationProbe
 
-
-async def _drain(awaitable):
+async def _drain(awaitable, *, primary: BaseException | None = None):
     """Do not abandon owned cleanup when its waiter is cancelled repeatedly."""
     task = asyncio.ensure_future(awaitable)
     cancelled = False
@@ -26,16 +23,36 @@ async def _drain(awaitable):
         try:
             result = await asyncio.shield(task)
             break
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             if task.done() and task.cancelled():
+                if cancelled:
+                    outgoing = (
+                        primary
+                        if isinstance(primary, asyncio.CancelledError)
+                        else asyncio.CancelledError()
+                    )
+                    raise outgoing from exc
+                if primary is not None:
+                    raise primary from exc
                 raise
             cancelled = True
-        except BaseException:
+        except BaseException as exc:
             if cancelled:
-                raise asyncio.CancelledError from None
+                outgoing = (
+                    primary
+                    if isinstance(primary, asyncio.CancelledError)
+                    else asyncio.CancelledError()
+                )
+                raise outgoing from exc
+            if primary is not None:
+                raise primary from exc
             raise
     if cancelled:
+        if isinstance(primary, asyncio.CancelledError):
+            raise primary
         raise asyncio.CancelledError
+    if primary is not None:
+        raise primary
     return result
 
 
@@ -165,7 +182,7 @@ class EmbeddingWindowStream:
         input_type: Literal["document", "query", "raw"] = "document",
         max_pending_windows: int = 2,
         timeout: float | None = None,
-        cancel: CancellationProbe | None = None,
+        cancel: Callable[[], bool] | None = None,
         close_source: bool = False,
     ):
         if (
@@ -378,8 +395,7 @@ class EmbeddingWindowStream:
                 changed = self._changed
                 if self._failure is not None and not self._error_reported:
                     self._error_reported = True
-                    await _drain(self._ensure_cleanup())
-                    raise self._failure
+                    await _drain(self._ensure_cleanup(), primary=self._failure)
                 if self._closed or self._stop.is_set():
                     task = self._ensure_cleanup()
                     if task is not None:
@@ -400,11 +416,11 @@ class EmbeddingWindowStream:
                     await _drain(self._ensure_cleanup())
                     raise StopAsyncIteration
                 await changed.wait()
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             self._request_stop()
             task = self._ensure_cleanup()
             if task is not None:
-                await _drain(task)
+                await _drain(task, primary=exc)
             raise
         finally:
             self._next_active = False
@@ -414,6 +430,9 @@ class EmbeddingWindowStream:
         return self
 
     async def __aexit__(self, exc_type, exc, traceback):
+        if exc is not None and self._loop is not None:
+            self._request_stop()
+            await _drain(self._ensure_cleanup(), primary=exc)
         await self.aclose()
 
     async def aclose(self) -> None:
