@@ -13,7 +13,7 @@ from typing import Any, AsyncIterable, Literal, Sequence
 
 from runtime_llama.client import ClientHTTPError, LlamaCppClient
 from runtime_llama._proxy import assert_client_proxy
-from runtime_llama.configuration import AdapterProfile, EmbeddingPrefixes
+from runtime_llama.configuration import AdapterProfile, EmbeddingPrefixes, _finite
 from runtime_llama.contracts import CancellationProbe, EmbeddingAdapter
 from runtime_llama.errors import LLMBackendError, LLMCancelledError, LLMTimeoutError
 from runtime_llama.replica_discovery import (
@@ -202,8 +202,14 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         self.model_name = profile.model
         self.base_url = profile.base_url
         self.batch_size = profile.batch_size or 32
-        self.embedding_batch_wait_sec = profile.embedding_batch_wait_sec
-        self.embedding_input_format = profile.embedding_input_format
+        self.embedding_batch_wait_sec = _finite(
+            getattr(profile, "embedding_batch_wait_sec", 0.5),
+            "embedding_batch_wait_sec",
+            positive=True,
+        )
+        self.embedding_input_format = getattr(profile, "embedding_input_format", "auto")
+        if self.embedding_input_format not in ("auto", "text", "tokens"):
+            raise ValueError("embedding_input_format must be auto, text or tokens")
         self.batch_token_limit = profile.batch_token_limit
         self.token_count_parallelism = int(profile.token_count_parallelism or 1)
         self.normalize = bool(profile.normalize)
@@ -236,6 +242,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         self._closing = Event()
         self._close_lock = Lock()
         self._calls_lock = Lock()
+        self._capacity_lock = Lock()
         self._calls_condition = Condition(self._calls_lock)
         self._calls: set[_Call] = set()
         self._async_window_bridge = None
@@ -584,10 +591,14 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         capacity = min(
             self.embedding_request_parallelism, configured, native.total_slots or 1
         )
-        replica.max_in_flight = capacity
-        self._scheduler.update_limits(
-            {name: item.max_in_flight for name, item in self._replicas.items()}
-        )
+        # Assignment and the full scheduler snapshot form one publication. A
+        # slower observer must not restore a peer's already reduced capacity.
+        # No network request is made while holding this lock.
+        with self._capacity_lock:
+            replica.max_in_flight = capacity
+            self._scheduler.update_limits(
+                {name: item.max_in_flight for name, item in self._replicas.items()}
+            )
         return _Observation(
             loaded_context_length,
             context_limit,
