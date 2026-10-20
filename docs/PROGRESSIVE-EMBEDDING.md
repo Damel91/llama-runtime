@@ -106,3 +106,12 @@ The existing `embed_texts`/`embed_prepared` and
 [`astream_texts`/`astream_prepared`](ASYNC-EMBEDDING-WINDOWS.md) interfaces share
 these settings. Configure model-specific prefixes and limits as described in
 the [embedding contract](EMBEDDING-CONTRACTS.md).
+
+For sustained ingestion, coalescing should be measured for the selected model
+and workload. On the qualified two-replica Nomic Q8_0 profile, setting
+`embedding_batch_wait_sec=1.0` reduced embedding POSTs from 14 to 8 for the same
+511 documents while preserving partial dispatch during preparation and use of
+both replicas. The total-wall difference was small; a longer wait trades later
+first dispatch for fuller batches. This is a profile-specific recommendation,
+and the default remains 0.5 seconds. See the
+[bounded comparison and consumer configuration](verification/COALESCING-TUNING-0.9.0.md).
