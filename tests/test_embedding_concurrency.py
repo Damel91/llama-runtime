@@ -237,11 +237,18 @@ def test_replica_specific_context_and_token_packing_use_the_selected_alias():
             adapter.close()
 
 
-def test_capacity_split_is_local_to_replica_and_does_not_replay_successful_batch():
+@pytest.mark.parametrize("sibling_state", ["completed", "draining"])
+def test_native_context_failure_never_replays_and_drains_sibling_work(
+    monkeypatch, sibling_state
+):
     with server() as (state, url):
+        sibling_parsed, release_parse = Event(), Event()
+        if sibling_state == "completed":
+            release_parse.set()
 
         def action(body):
             if body["model"] == "embed" and len(body["input"]) > 2:
+                assert sibling_parsed.wait(2)
                 return 400, {"error": {"type": "exceed_context_size_error"}}
             return 200, response(body["input"])
 
@@ -249,18 +256,45 @@ def test_capacity_split_is_local_to_replica_and_does_not_replay_successful_batch
         # Total budget eight produces one four-text quota on each alias.
         adapter = LlamaCppEmbeddingAdapter(configured(url, batch_size=8))
         texts = [f"item-{index}" for index in range(8)]
+        original_parse = adapter._parse_batch_response
+
+        def parse(payload, **kwargs):
+            result = original_parse(payload, **kwargs)
+            if result == vectors(texts[4:]):
+                sibling_parsed.set()
+                assert release_parse.wait(3)
+            return result
+
+        monkeypatch.setattr(adapter, "_parse_batch_response", parse)
         try:
-            assert adapter.embed_texts(texts) == vectors(texts)
+            with ThreadPoolExecutor(1) as callers:
+                pending = callers.submit(adapter.embed_texts, texts)
+                assert sibling_parsed.wait(2)
+                if sibling_state == "draining":
+                    eventually(
+                        lambda: any(
+                            isinstance(call.failure, ClientHTTPError)
+                            for call in tuple(adapter._calls)
+                        )
+                    )
+                    assert not pending.done()
+                    release_parse.set()
+                with pytest.raises(ClientHTTPError) as observed:
+                    pending.result(timeout=3)
+            assert observed.value.error_type == "exceed_context_size_error"
             assert Counter(state.calls) == {
                 ("embed", tuple(texts[:4])): 1,
-                ("embed", tuple(texts[:2])): 1,
-                ("embed", tuple(texts[2:4])): 1,
                 ("embed_1", tuple(texts[4:])): 1,
             }
+            assert not adapter._calls
+            assert adapter.embedding_dim == 0
             status = adapter.health_status()
-            assert status["replicas"]["embed"]["effective_batch_size"] == 2
+            assert status["scheduler"]["queued"] == 0
+            assert status["scheduler"]["in_flight"] == 0
+            assert status["replicas"]["embed"]["effective_batch_size"] == 8
             assert status["replicas"]["embed_1"]["effective_batch_size"] == 8
         finally:
+            release_parse.set()
             adapter.close()
 
 

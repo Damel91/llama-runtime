@@ -5,7 +5,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, asdict, replace
-from threading import Event, Lock
+from threading import Event, Lock, current_thread
 
 import pytest
 
@@ -950,3 +950,103 @@ def test_paused_consumer_retains_native_windows_without_speculative_source_reads
             await adapter.aclose()
 
     run(scenario)
+
+
+def test_concurrent_capacity_observations_cannot_restore_another_replicas_old_limit(
+    monkeypatch,
+):
+    client = ContractClient(2)
+    slots = {"embed_0": 2, "embed_1": 2}
+    props = client.props
+
+    def observed_props(model=None, **kwargs):
+        return {**props(model=model, **kwargs), "total_slots": slots[model]}
+
+    client.props = observed_props
+    adapter = adapter_for(client)
+    old_snapshot_captured, release_old_snapshot = Event(), Event()
+    newer_progress = Event()
+
+    class ObservedLock:
+        """Announce a newer observer before blocking on the corrected lock."""
+
+        def __init__(self, lock):
+            self.lock = lock
+
+        def acquire(self, *args, **kwargs):
+            if current_thread().name.startswith("newer-observer"):
+                newer_progress.set()
+            return self.lock.acquire(*args, **kwargs)
+
+        def release(self):
+            self.lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self.release()
+
+    try:
+        assert adapter.embed_query("warmup") == vector("warmup")
+        before = adapter._scheduler.snapshot()["replicas"]
+        assert {name: entry["max_in_flight"] for name, entry in before.items()} == {
+            "embed_0": 2,
+            "embed_1": 2,
+        }
+        slots.update(embed_0=1, embed_1=1)
+        monkeypatch.setattr(
+            adapter,
+            "_capacity_lock",
+            ObservedLock(getattr(adapter, "_capacity_lock", Lock())),
+            raising=False,
+        )
+        original_update = adapter._scheduler.update_limits
+
+        def update(limits):
+            name = current_thread().name
+            if name.startswith("older-observer"):
+                old_snapshot_captured.set()
+                assert release_old_snapshot.wait(3)
+            original_update(limits)
+            if name.startswith("newer-observer"):
+                # On the previous unlocked source, this signals only after the
+                # newer reduction is applied. Releasing the older update then
+                # deterministically reproduced its stale overwrite. With the
+                # fix, acquire above signals instead, avoiding lock deadlock.
+                newer_progress.set()
+
+        monkeypatch.setattr(adapter._scheduler, "update_limits", update)
+        with (
+            ThreadPoolExecutor(1, thread_name_prefix="older-observer") as older,
+            ThreadPoolExecutor(1, thread_name_prefix="newer-observer") as newer,
+        ):
+            first = older.submit(
+                adapter._observe_replica,
+                replica=adapter._replicas["embed_0"],
+                timeout=3,
+            )
+            try:
+                assert old_snapshot_captured.wait(2)
+                second = newer.submit(
+                    adapter._observe_replica,
+                    replica=adapter._replicas["embed_1"],
+                    timeout=3,
+                )
+                assert newer_progress.wait(2)
+            finally:
+                release_old_snapshot.set()
+            first.result(3)
+            second.result(3)
+        latest = {
+            name: replica.max_in_flight for name, replica in adapter._replicas.items()
+        }
+        scheduled = {
+            name: entry["max_in_flight"]
+            for name, entry in adapter._scheduler.snapshot()["replicas"].items()
+        }
+        assert latest == scheduled == {"embed_0": 1, "embed_1": 1}
+    finally:
+        release_old_snapshot.set()
+        adapter.close()
