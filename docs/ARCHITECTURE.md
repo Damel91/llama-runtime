@@ -188,3 +188,189 @@ Riferimenti versionati del mapping:
 [function calling v0.6.0](https://github.com/ggml-org/llama.cpp/blob/v0.6.0/docs/function-calling.md).
 Provenienza e differenze dalla baseline sono descritte in
 [PROVENANCE.md](PROVENANCE.md) e [FUNCTIONAL-PARITY.md](FUNCTIONAL-PARITY.md).
+
+## Indagine HTTP nativo e throughput embedding — 20 ottobre 2026
+
+Questa sezione descrive una diagnosi e un progetto di ottimizzazione della
+baseline `8ffb7ca` (`0.6.0`). Le proposte sotto non sono configurazioni già
+disponibili né una nuova qualifica prestazionale. Requisiti, piano, esiti e
+continuazioni restano nel progetto Flower `llama-runtime`.
+
+### Supporto nativo e indipendenza dalla patch
+
+Keep-alive è una funzionalità nativa di cpp-httplib. Il suo contratto distingue
+la fine normale del body, `sink.done()`, dalla cancellazione indicata da un
+ritorno `false` del content provider. La patch storica corregge questa
+distinzione nel callback del server; non introduce il batching o la concorrenza.
+Vedere il [contratto upstream](https://github.com/yhirose/cpp-httplib#chunked-transfer-encoding).
+
+Il file `tools/server/server-http.cpp` della build `b11548`
+(`781dbc5ac98921dbdb5e5b2ec5b7a50960e937d4`) e quello della release esaminata
+[`b11750`](https://github.com/ggml-org/llama.cpp/releases/tag/b11750)
+(`dd002b91f583af0b80140f9a140dc04856bfc2e0`) hanno lo stesso Git blob
+`33cbb156c55938ffa74e3c693bd16863655d4f33`: il callback conserva
+`return has_next` dopo `sink.done()`. L'aggiornamento non assorbe quel fix.
+
+Esiste un percorso standard indipendente dalla patch: il client invia
+`Connection: close` e usa connessioni separate per richieste concorrenti. Il
+[vendor originale](https://github.com/ggml-org/llama.cpp/blob/781dbc5ac98921dbdb5e5b2ec5b7a50960e937d4/vendor/cpp-httplib/httplib.cpp)
+riconosce la richiesta di chiusura e la dichiara nella risposta. Il body,
+incluso uno stream, viene consumato prima della chiusura normale. Questo evita
+il riuso del socket difettoso senza introdurre retry o replay. Non riduce il
+numero delle richieste e comporta nuove aperture TCP e, con HTTPS, handshake
+TLS; il vantaggio rispetto a connessioni persistenti sane richiede misure.
+
+Una futura policy esplicita del client può applicare questa scelta a tutte le
+sessioni possedute, mantenendo un solo percorso di lettura, cancellazione e
+drain. Non richiede una sessione esterna condivisa: nel contratto attuale una
+sessione borrowed protegge il dispatch, quindi non va usata come scorciatoia
+per configurare la concorrenza. Nessun cambiamento di default è applicato da
+questa indagine. Anche le garanzie del proxy opzionale restano invariate.
+
+La prova locale ha compilato soltanto un harness che include il vero handler
+HTTP originale e il suo vendor, senza modelli o inferenza:
+
+| Caso | Esito osservato |
+| --- | --- |
+| Quattro casi del callback originale | Comportamento originale riprodotto, incluso errore di scrittura |
+| Tre controlli negativi keep-alive | EOF del peer e `RemoteDisconnected` alla richiesta successiva |
+| 60 GET con chiusura esplicita | 30 body sintetici streaming e 30 health: HTTP 200, body completi, chiusura dichiarata |
+| Due GET concorrenti con chiusura esplicita | Socket distinti e picco nativo 2; zero richieste attive alla fine |
+
+Ogni richiesta del caso close apre una sola connessione esplicita, senza
+riconnessione implicita. Il caso concorrente usa una barriera e un ritardo
+sintetico dichiarato di 20 ms. Non sono prove di POST embedding, SSE LLM,
+TLS/VPN o throughput GPU. Non è stato compilato o selezionato un nuovo runtime.
+
+Il rapporto dei risultati ha SHA-256
+`dc1d066097dfc5ac4ae4250dfab8ae8eeed15c47bde6ab74dfaa7dd44fafa41e`;
+il binario harness
+`b713151166ee3e7572bffa507e70399e278ce356b83f77dd288c433a4cae6641`.
+I 3765 file tracciati corrispondono all'indice Git conservato, identici prima
+e dopo la prova; i quattro file HTTP critici corrispondono al controllo
+originale storico. L'oggetto HEAD del vecchio checkout non è più disponibile:
+non si dichiara una nuova attestazione Git dell'intero commit. Il blob HTTP
+coincide invece con il pin upstream sopra. Evidenze e locator completi sono
+conservati con gli esiti Flower.
+
+Un secondo difetto, distinto dal callback EOF, riguarda connessioni persistenti
+accodate oltre i thread HTTP di base: [llama.cpp #30675](https://github.com/ggml-org/llama.cpp/issues/30675)
+e [cpp-httplib #2633](https://github.com/yhirose/cpp-httplib/issues/2633).
+L'aggiornamento vendor a `0.62.0`, [PR #30785](https://github.com/ggml-org/llama.cpp/pull/30785),
+è entrato il 19 ottobre; la discussione riporta prove favorevoli su `b11750`.
+Sono evidenze upstream di quel caso, non una qualifica del runtime del consumer.
+`--threads-http` controlla il pool HTTP; non modifica il callback EOF, gli slot
+di inferenza o il budget token degli embedding.
+
+### Dove intervenire sulla pipeline
+
+La baseline invia liste di testi nella stessa POST. La precedente qualifica
+host di una finestra da 256 testi registrò due quote da 128: ogni replica
+ricevette 66 e poi 62 testi, in quattro POST complessive, con budget aggregati
+di 2046 e 1922 token per richiesta. Il picco osservato fu due POST embedding,
+una per alias. Queste misure attestano packing e concorrenza fra repliche;
+non attestano saturazione GPU o ottimalità del throughput.
+
+Va corretta anche la distinzione fra batch HTTP e batch nativo. Nel
+[`server-context.cpp` b11548](https://github.com/ggml-org/llama.cpp/blob/781dbc5ac98921dbdb5e5b2ec5b7a50960e937d4/tools/server/server-context.cpp#L6083)
+(Git blob `9a9c0c90d5a59b05b001f1772a82c29be9fbdd80`), il percorso embedding
+crea un task per input e assegna ciascun task a uno slot. `n_parallel=1`
+consente un input attivo alla volta: una POST con 66 testi risparmia round trip,
+ma non dimostra un batch GPU di 66 sequenze. Più POST contemporanee non
+aggirano questo limite del server. I token di un singolo input possono invece
+essere elaborati in batch nativi.
+
+La verifica su `b11750` conferma lo stesso handler embedding, byte-identico;
+il file completo ha blob `b2116b1740a39be2412a33caf52adb9e322e95ee`.
+Il [ciclo dei task](https://github.com/ggml-org/llama.cpp/blob/dd002b91f583af0b80140f9a140dc04856bfc2e0/tools/server/server-context.cpp#L6208)
+e il batching degli slot attivi mantengono questa distinzione.
+
+In quella revisione `n_batch` limita il passo di elaborazione del server,
+mentre gli input non suddivisibili sono verificati individualmente rispetto a
+`n_ubatch` e al contesto dello slot. L'handler non impone la somma dei token
+dell'intero array HTTP come limite `n_batch`; i task che non entrano nel passo
+corrente aspettano. Pertanto la derivazione automatica del budget HTTP da
+`n_batch` nella libreria è conservativa e non giustificata da quel contratto.
+Le quattro POST della prova storica sono il risultato del packing del client,
+non un minimo imposto dal backend. Un limite aggregato HTTP esplicito del
+consumer o del servizio resta una policy distinta e legittima.
+
+Prima di correggere la derivazione occorre qualificare array con somma token
+superiore a `n_batch`, input singolarmente validi, limiti di dimensione del
+payload e soglie numeriche invariate. La prova HTTP model-free sopra non
+esegue questa verifica di inferenza e non la sostituisce.
+
+Il pool automatico fissa invece il limite per replica a `1`, anche se gli slot
+sono osservati e conservati nella diagnostica. Inoltre un job trattiene il
+permesso durante preparazione, osservazioni e tutti i batch della quota;
+una singola finestra assegna una quota per alias distinto. Aumentare soltanto
+il limite per replica non rende paralleli i batch di quella stessa quota.
+
+L'ordine tecnico proposto, integrando la review fornita il 19 ottobre, è:
+
+1. **Contratto nativo dei batch e misure.** Qualificare e separare contesto e
+   microbatch per input, passo nativo `n_batch`, budget totale di testi e
+   tetti espliciti della richiesta HTTP. Rimuovere la derivazione automatica
+   del tetto aggregato da `n_batch` solo con prove del contratto nativo;
+   mantenere le policy esplicite. Il server deve poter accodare i task di un
+   array più grande senza costringere il client a ulteriori round trip.
+   Con M01 e la nuova analisi capacità, conservare timing
+   nativi e wall time separati. Contare richieste, byte, connessioni, testi e
+   token per POST, attese e intervalli fra POST. Gli slot dichiarano una
+   capacità configurata, non slot liberi o un guadagno di velocità.
+2. **Lavoro locale (E03, E04, E05).** Separare i record interni dalle
+   preparazioni pubbliche sigillate; non calcolare sigilli che non vengono
+   consegnati. Validare la quota una volta a limiti stabili, invalidando la
+   parte pendente quando cambiano. Mantenere il rifiuto degli oversize già
+   noti prima di inferenza evitabile e la normalizzazione numerica stabile.
+3. **Osservazioni e preparazione (E01, E02).** Acquisire uno snapshot immutabile
+   con identità, alias loaded, build tokenizer, limiti e provenienza; passarlo
+   ai validatori dello stesso confine invece di ripetere GET annidati. Nel caso
+   semplice analizzato l'obiettivo è passare da quattro a tre letture catalogo,
+   senza sopprimere le verifiche dopo attese e prima dell'invio. Riutilizzare un
+   executor tokenizer separato, con ammissione globale e lavoro pendente
+   limitati. Nessuna cache TTL equivale a un permesso permanente.
+4. **Preparazione anticipata e capacità.** Preparare un numero limitato di
+   quote successive mentre sono in corso richieste precedenti. Le quote
+   restano interamente validate prima del proprio primo invio. Lo stesso
+   scheduler deve ammettere i batch già preparati e impacchettati, mantenendo
+   alias, offset e ordine; niente secondo scheduler. Un tetto effettivo può
+   combinare slot verificati, limite globale ed eventuale limite operatore;
+   capacità ignota e provenienza restano esplicite. I profili con più richieste
+   per replica richiedono qualifica numerica: identità dei pesi da sola non
+   certifica build e configurazione di esecuzione. Non frammentare batch pieni
+   per gonfiare il numero di richieste contemporanee.
+5. **Trasporto (T01, T02).** Separare la lettura JSON dal fallback SSE
+   byte-per-byte nelle combinazioni che lo selezionano. Qualificare la policy
+   nativa di connessione con lo stesso lifecycle. La rimozione della coda SSE
+   richiede un progetto distinto di interruzione e deadline, non è necessaria
+   per i risparmi precedenti. Ridurre cleanup superflui soltanto dopo drain.
+
+G01/G02/G03 (stato runaway, reasoning e assemblaggio tool) e C01 rimangono
+ottimizzazioni indipendenti della review. Non devono ritardare gli interventi
+embedding né essere presentate come un miglioramento del tempo GPU. Per G01
+il confronto differenziale fornito copre due modifiche ristrette, non tutta
+l'integrazione dell'adapter.
+
+### Matrice di qualifica
+
+Confrontare separatamente: upstream originale con chiusura esplicita;
+connessioni persistenti corrette; baseline e riduzione dell'I/O accessorio;
+un tetto di una richiesta e capacità superiore realmente disponibile. A ogni
+confronto mantenere corpus, prefissi, token speciali, identità, build, batch
+token e impostazioni del server uguali, dichiarando ogni variabile cambiata.
+
+Misurare conteggi HTTP per endpoint, testi/token e pienezza di ogni POST,
+aperture TCP/TLS, byte, tempo di preparazione, metadati, coda, HTTP e totale,
+intervalli fra batch, picchi in-flight, throughput end-to-end e distribuzione
+delle latenze. Le somme HTTP possono sovrapporsi. Tempi e utilizzo GPU
+richiedono una misura separata; saturare la banda non è una metrica sostitutiva
+del throughput degli embedding.
+
+I test devono conservare ordine, cardinalità, soglie numeriche, conteggi
+esatti, prefissi una sola volta, nessun replay dei successi, errori parziali,
+cancellazione per chiamata e chiusura drenata. Connessione, JSON, discovery ed
+embedding mantengono timeout finiti; resta valido l'opt-in SSE senza idle.
+Coprire attese, limiti ridotti, topologia e identità cambiate, resti e più
+caller. Il confronto live di prestazioni e le modifiche al runtime restano da eseguire nel proprio
+ambito; questa indagine non modifica consumer, modelli o servizi.
