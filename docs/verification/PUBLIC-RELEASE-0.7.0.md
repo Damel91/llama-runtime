@@ -9,8 +9,8 @@ the earlier failed results remain historical evidence.
 
 Native llama.cpp works through independent HTTP connections by default, without
 requiring the historical keep-alive patch. Connection reuse is explicit. The
-client separates the total number of texts, per-input context/microbatch limits,
-native computation batches and explicitly configured aggregate HTTP budgets.
+client separates the total number of texts, per-input context limits, native
+batch/microbatch sizes and explicitly configured aggregate HTTP budgets.
 
 `batch_size=256` is a total-text window. With two verified usable replicas the
 quotas are 128 each; with four they are 64 each. Neither count is hardcoded.

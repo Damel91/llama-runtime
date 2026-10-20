@@ -250,8 +250,9 @@ its imports and distribution metadata. Reusable [live probes](probes/README.txt)
 require explicit opt-in and your own endpoint, model and build identifiers.
 They describe reproducible checks rather than a certification of your setup.
 
-This public release makes no new live qualification or consumer acceptance
-claim. Local tests, a particular server/model qualification and application
+This release includes bounded live qualification of the profile described in
+the release report, without claiming consumer acceptance. Local tests, a
+particular server/model qualification and application
 acceptance are separate. Closing a client stream does not by itself prove
 that remote inference stopped. Missing usage values remain missing.
 
