@@ -28,8 +28,9 @@ def vector(text):
 
 
 class RecordingClient:
-    def __init__(self, *, context=4096, counts=None, responses=()):
+    def __init__(self, *, context=4096, counts=None, responses=(), total_slots=1):
         self.context = context
+        self.total_slots = total_slots
         self.counts = counts or {}
         self.responses = list(responses)
         self.props_calls = []
@@ -40,7 +41,10 @@ class RecordingClient:
     def props(self, model=None, **kwargs):
         with self.lock:
             self.props_calls.append((model, kwargs))
-        return {"default_generation_settings": {"n_ctx": self.context}}
+        return {
+            "default_generation_settings": {"n_ctx": self.context},
+            "total_slots": self.total_slots,
+        }
 
     def tokenize(self, content, **kwargs):
         with self.lock:
@@ -317,7 +321,7 @@ def test_prefixes_are_shared_by_replicas_with_stable_result_order(make_adapter):
 def test_concurrent_query_cancellation_does_not_change_document_task(make_adapter):
     class ControlledClient(RecordingClient):
         def __init__(self):
-            super().__init__()
+            super().__init__(total_slots=2)
             self.query_started, self.release_query = Event(), Event()
 
         def embeddings(self, input, model=None, **kwargs):

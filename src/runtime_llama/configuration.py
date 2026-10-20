@@ -86,6 +86,7 @@ class LlamaServerConfig:
     verify_ssl: bool = True
     runtime_identity: str | None = None
     proxy_url: str | None = field(default=None, repr=False)
+    http_connection_policy: str = "close"
 
     def __post_init__(self) -> None:
         model = str(self.model or "").strip()
@@ -94,6 +95,13 @@ class LlamaServerConfig:
         _positive_int(self.context_length, "context_length")
         if not isinstance(self.verify_ssl, bool):
             raise ValueError("verify_ssl must be boolean")
+        if not isinstance(
+            self.http_connection_policy, str
+        ) or self.http_connection_policy not in {
+            "close",
+            "reuse",
+        }:
+            raise ValueError("http_connection_policy must be close or reuse")
         object.__setattr__(self, "model", model)
         object.__setattr__(self, "base_url", normalize_rest_root(self.base_url))
         object.__setattr__(self, "proxy_url", normalize_proxy_url(self.proxy_url))
@@ -370,6 +378,7 @@ class AdapterProfile:
             verify_ssl=merged.get("verify_ssl", True),
             runtime_identity=merged.get("runtime_identity"),
             proxy_url=merged.get("proxy_url"),
+            http_connection_policy=merged.get("http_connection_policy", "close"),
         )
         role_fields = {
             name: merged[name]

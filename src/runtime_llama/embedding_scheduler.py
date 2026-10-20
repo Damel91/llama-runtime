@@ -20,7 +20,7 @@ class _Job:
 
 
 class EmbeddingScheduler:
-    """Plan balanced alias quotas and admit them on one bounded shared queue."""
+    """Plan text quotas and admit ready affine jobs on one bounded queue."""
 
     def __init__(self, parallelism: int, queue_size: int, replicas: dict[str, int]):
         self.parallelism, self.queue_size = parallelism, queue_size
@@ -74,6 +74,28 @@ class EmbeddingScheduler:
             and self._replica_active[model] < self._limits[model]
         )
 
+    def update_limits(self, replicas: dict[str, int]) -> None:
+        """Apply observed capacities without replaying or aborting active jobs.
+
+        Topology belongs to the adapter's drained replacement boundary. A
+        reduction can leave already active work above the new limit; subsequent
+        admission waits for it to drain. Increasing a limit wakes eligible jobs.
+        """
+        if any(
+            not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0
+            for limit in replicas.values()
+        ):
+            raise ValueError("replica limits must be positive integers")
+        limits = dict(replicas)
+        with self._condition:
+            if self._closed:
+                raise LLMBackendError("llamacpp_embedding_adapter_closed")
+            if limits.keys() != self._limits.keys():
+                raise LLMBackendError("llamacpp_embedding_scheduler_topology_changed")
+            self._limits = limits
+            self._pump()
+            self._condition.notify_all()
+
     @staticmethod
     def _fail(job: _Job, exc: BaseException) -> None:
         try:
@@ -109,7 +131,7 @@ class EmbeddingScheduler:
                 self._replica_active[job.model] -= 1
                 self._pump()
                 self._condition.notify_all()
-        # Completion is the drain boundary: the quota's transport has returned
+        # Completion is the drain boundary: the job's transport has returned
         # and its scheduler permits have been released before callers wake.
         if running:
             if failure is not None:
@@ -146,25 +168,48 @@ class EmbeddingScheduler:
         *,
         model: str,
     ) -> Future:
-        """Admit an affine quota; blocked submitters stay outside the queue."""
+        """Admit a ready affine job; blocked submitters stay outside the queue."""
         job = _Job(run, check, Future(), model)
         with self._condition:
             while True:
-                check()
-                if self._closed:
-                    raise LLMBackendError("llamacpp_embedding_adapter_closed")
-                if model not in self._limits:
-                    raise LLMBackendError("llamacpp_embedding_unknown_replica")
-                self._pump()
-                same_alias_queued = any(queued.model == model for queued in self._queue)
-                if self._can_dispatch(model) and not same_alias_queued:
-                    self._dispatch(job)
-                    return job.future
-                if len(self._queue) < self.queue_size:
-                    self._queue.append(job)
-                    self._peak_queued = max(self._peak_queued, len(self._queue))
+                if self._try_admit(job):
                     return job.future
                 self._condition.wait(0.05)
+
+    def try_submit(
+        self,
+        run: Callable[[str], Any],
+        check: Callable[[], None],
+        *,
+        model: str,
+    ) -> Future | None:
+        """Admit a ready job or return immediately when bounded capacity is full.
+
+        An unadmitted job has no queue position or execution side effect. The
+        coordinator can therefore try a different alias without head-of-line
+        blocking, using the same admission and fairness policy as ``submit``.
+        """
+        job = _Job(run, check, Future(), model)
+        with self._condition:
+            return job.future if self._try_admit(job) else None
+
+    def _try_admit(self, job: _Job) -> bool:
+        """Shared admission while holding the scheduler condition lock."""
+        job.check()
+        if self._closed:
+            raise LLMBackendError("llamacpp_embedding_adapter_closed")
+        if job.model not in self._limits:
+            raise LLMBackendError("llamacpp_embedding_unknown_replica")
+        self._pump()
+        same_alias_queued = any(queued.model == job.model for queued in self._queue)
+        if self._can_dispatch(job.model) and not same_alias_queued:
+            self._dispatch(job)
+            return True
+        if len(self._queue) < self.queue_size:
+            self._queue.append(job)
+            self._peak_queued = max(self._peak_queued, len(self._queue))
+            return True
+        return False
 
     def snapshot(self) -> dict[str, Any]:
         with self._condition:

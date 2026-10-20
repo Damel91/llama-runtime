@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections import deque
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 import os
 import math
 import time
@@ -35,6 +35,7 @@ from runtime_llama.errors import (
 from runtime_llama.usage import (
     LLMCallResult,
     LLMStreamEvent,
+    LLMServerTimings,
     LLMTransportAttempt,
     LLMUsageStats,
 )
@@ -48,6 +49,8 @@ _RESERVED_REQUEST_FIELDS = {
     "max_tokens",
     "n_predict",
     "timeout",
+    "http_connection_policy",
+    "connection_policy",
     "idle_timeout",
     "stream_idle_timeout_sec",
     "cancel_wait",
@@ -79,6 +82,26 @@ _MESSAGE_FIELDS = (
     "function_call",
     "reasoning_content",
 )
+
+
+@dataclass
+class _ToolCallBuilder:
+    """Retain fragments once; materialize the public call only at completion."""
+
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    function_metadata: Dict[str, Any] = field(default_factory=dict)
+    name_parts: List[str] = field(default_factory=list)
+    argument_parts: List[str] = field(default_factory=list)
+
+    def materialize(self) -> Dict[str, Any]:
+        return {
+            "function": {
+                "name": "".join(self.name_parts),
+                "arguments": "".join(self.argument_parts),
+                **deepcopy(self.function_metadata),
+            },
+            **deepcopy(self.metadata),
+        }
 
 
 class LlamaCppAdapter(LLMAdapter):
@@ -116,6 +139,7 @@ class LlamaCppAdapter(LLMAdapter):
         client: Optional[LlamaCppClient] = None,
         thinking_diagnostics: Optional[ThinkingDiagnosticsConfig] = None,
         proxy_url: str | None = None,
+        http_connection_policy: str | None = None,
     ) -> None:
         if (
             model_config is not None
@@ -126,10 +150,20 @@ class LlamaCppAdapter(LLMAdapter):
             raise ValueError(
                 "explicit proxy conflicts with the model_config proxy route"
             )
+        if (
+            model_config is not None
+            and http_connection_policy is not None
+            and getattr(model_config, "http_connection_policy", "close")
+            != http_connection_policy
+        ):
+            raise ValueError("explicit connection policy conflicts with model_config")
         self._model_config = model_config or LlamaServerConfig(
             model=model,
             base_url=base_url,
             proxy_url=proxy_url,
+            http_connection_policy=(
+                "close" if http_connection_policy is None else http_connection_policy
+            ),
         )
         self._role_config = role_config or LlamaRoleConfig(
             role_id=role_id,
@@ -184,6 +218,9 @@ class LlamaCppAdapter(LLMAdapter):
             ),
             verify_ssl=self._model_config.verify_ssl,
             proxy_url=self._model_config.proxy_url,
+            connection_policy=getattr(
+                self._model_config, "http_connection_policy", "close"
+            ),
         )
 
     @classmethod
@@ -440,7 +477,7 @@ class LlamaCppAdapter(LLMAdapter):
 
     @staticmethod
     def _merge_tool_deltas(
-        accumulated: Dict[int, Dict[str, Any]],
+        accumulated: Dict[int, _ToolCallBuilder],
         deltas: Any,
     ) -> None:
         if not isinstance(deltas, list):
@@ -451,15 +488,20 @@ class LlamaCppAdapter(LLMAdapter):
             index = delta.get("index")
             if isinstance(index, bool) or not isinstance(index, int) or index < 0:
                 raise LLMBackendError("llama_missing_tool_call_index")
-            call = accumulated.setdefault(
-                index, {"function": {"name": "", "arguments": ""}}
-            )
+            call = accumulated.get(index)
+            if call is None:
+                call = _ToolCallBuilder()
+                accumulated[index] = call
             for key, value in delta.items():
                 if key in {"index", "function"}:
                     continue
-                if key in {"id", "type"} and key in call and call[key] != value:
+                if (
+                    key in {"id", "type"}
+                    and key in call.metadata
+                    and call.metadata[key] != value
+                ):
                     raise LLMBackendError("llama_conflicting_tool_call_identity")
-                call[key] = deepcopy(value)
+                call.metadata[key] = deepcopy(value)
             function = delta.get("function", {})
             if not isinstance(function, Mapping):
                 raise LLMBackendError("llama_malformed_tool_call_function")
@@ -467,15 +509,16 @@ class LlamaCppAdapter(LLMAdapter):
                 if key in {"name", "arguments"}:
                     if not isinstance(value, str):
                         raise LLMBackendError("llama_malformed_tool_call_function")
-                    call["function"][key] += value
+                    parts = call.name_parts if key == "name" else call.argument_parts
+                    parts.append(value)
                 else:
-                    call["function"][key] = deepcopy(value)
+                    call.function_metadata[key] = deepcopy(value)
 
     @staticmethod
     def _completed_tools(
-        accumulated: Dict[int, Dict[str, Any]],
+        accumulated: Dict[int, _ToolCallBuilder],
     ) -> List[Dict[str, Any]]:
-        calls = [deepcopy(accumulated[index]) for index in sorted(accumulated)]
+        calls = [accumulated[index].materialize() for index in sorted(accumulated)]
         for call in calls:
             if not isinstance(call.get("id"), str) or not call["id"]:
                 raise LLMBackendError("llama_missing_tool_call_identity")
@@ -515,7 +558,8 @@ class LlamaCppAdapter(LLMAdapter):
         event_kinds: deque[str] = deque(maxlen=24)
         finish_reason: Optional[str] = None
         usage: Optional[LLMUsageStats] = None
-        tool_calls: Dict[int, Dict[str, Any]] = {}
+        server_timings: Optional[LLMServerTimings] = None
+        tool_calls: Dict[int, _ToolCallBuilder] = {}
         stream = None
 
         def evidence(reason: str) -> LLMTransportAttempt:
@@ -551,41 +595,37 @@ class LlamaCppAdapter(LLMAdapter):
                     raise LLMBackendError("llama_malformed_chat_chunk")
                 if payload.get("error") is not None:
                     raise LLMBackendError("llama_server_error")
-                raw_choices = payload.get("choices")
-                new_tools = (
-                    any(
-                        isinstance(choice, Mapping)
-                        and isinstance(choice.get("delta"), Mapping)
-                        and bool(choice["delta"].get("tool_calls"))
-                        for choice in raw_choices
-                    )
-                    if isinstance(raw_choices, list)
-                    else False
-                )
+                choices = payload.get("choices")
+                if not isinstance(choices, list) or len(choices) > 1:
+                    raise LLMBackendError("llama_malformed_chat_choices")
+                choice = choices[0] if choices else None
+                delta = None
+                if choices:
+                    if (
+                        not isinstance(choice, Mapping)
+                        or type(choice.get("index", 0)) is not int
+                        or choice.get("index", 0) != 0
+                    ):
+                        raise LLMBackendError("llama_unsupported_chat_choice")
+                    delta = choice.get("delta")
+                    if not isinstance(delta, Mapping):
+                        raise LLMBackendError("llama_malformed_chat_delta")
                 observed_usage = self._usage_from_payload(
                     payload,
-                    has_tool_calls=bool(tool_calls) or new_tools,
+                    has_tool_calls=bool(tool_calls)
+                    or bool(delta and delta.get("tool_calls")),
                 )
                 if observed_usage is not None:
                     usage = observed_usage
                     yield LLMStreamEvent(kind="usage", usage=usage)
-                choices = payload.get("choices")
-                if not isinstance(choices, list) or len(choices) > 1:
-                    raise LLMBackendError("llama_malformed_chat_choices")
+                observed_timings = LLMServerTimings.from_native(payload.get("timings"))
+                if observed_timings is not None:
+                    server_timings = observed_timings
+                    yield LLMStreamEvent(kind="timings", server_timings=server_timings)
                 if not choices:
-                    if "usage" not in payload:
+                    if "usage" not in payload and "timings" not in payload:
                         raise LLMBackendError("llama_empty_chat_chunk")
                     continue
-                choice = choices[0]
-                if (
-                    not isinstance(choice, Mapping)
-                    or type(choice.get("index", 0)) is not int
-                    or choice.get("index", 0) != 0
-                ):
-                    raise LLMBackendError("llama_unsupported_chat_choice")
-                delta = choice.get("delta")
-                if not isinstance(delta, Mapping):
-                    raise LLMBackendError("llama_malformed_chat_delta")
                 if finish_reason is not None and delta:
                     raise LLMBackendError("llama_delta_after_finish_reason")
                 if "function_call" in delta:
@@ -640,6 +680,7 @@ class LlamaCppAdapter(LLMAdapter):
                 terminal_reason=terminal,
                 transport=evidence(terminal),
                 data={"tool_calls": calls, "finish_reason": finish_reason},
+                server_timings=server_timings,
             )
         except (LLMBackendError, LLMCancelledError, LLMTimeoutError) as exc:
             if exc.diagnostics is None:
@@ -698,6 +739,7 @@ class LlamaCppAdapter(LLMAdapter):
         thinking_sink: Optional[ThinkingDiagnosticSink] = None,
     ) -> Iterator[LLMStreamEvent]:
         self._set_last_usage(None)
+        self._set_last_server_timings(None)
         self._set_last_terminal_reason("")
         events = self._iter_stream_events_with_ctx(
             messages,
@@ -713,19 +755,24 @@ class LlamaCppAdapter(LLMAdapter):
             visible_output_token_limit=num_predict,
             thinking_diagnostics=thinking_diagnostics,
             thinking_sink=thinking_sink,
+            collect_reasoning=False,
         )
         terminal: Optional[LLMStreamEvent] = None
         try:
             for event in events:
                 self._raise_if_cancelled(cancellation_probe, timeout=timeout)
-                projected = list(accumulator.consume(event))
                 if event.kind == "content":
-                    for chunk in projected:
-                        yield replace(event, text=chunk)
-                elif event.kind == "terminal":
-                    terminal = event
+                    for chunk in accumulator.consume(event):
+                        yield (
+                            event if chunk == event.text else replace(event, text=chunk)
+                        )
                 else:
-                    yield event
+                    for _ in accumulator.consume(event):
+                        pass
+                    if event.kind == "terminal":
+                        terminal = event
+                    else:
+                        yield event
                 if accumulator.visible_limit_reached:
                     break
             self._raise_if_cancelled(cancellation_probe, timeout=timeout)
@@ -755,6 +802,7 @@ class LlamaCppAdapter(LLMAdapter):
                     ),
                 },
                 thinking_diagnostic=result.thinking_diagnostic,
+                server_timings=result.server_timings,
             )
         except (
             LLMBackendError,

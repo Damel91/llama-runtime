@@ -383,7 +383,9 @@ def test_completed_error_watchdog_and_stale_stream_cannot_hit_next_keepalive_lea
             handler.wfile.flush()
 
     base_url, observed = endpoint(respond, keepalive=True)
-    with LlamaCppClient(base_url, timeout=0.12, trust_env=False) as api:
+    with LlamaCppClient(
+        base_url, timeout=0.12, trust_env=False, connection_policy="reuse"
+    ) as api:
         old = api.complete("error", stream=True, idle_timeout=None)
         wait_for(lambda: not api._streams)
         assert not watchdogs()

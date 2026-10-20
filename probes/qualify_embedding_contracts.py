@@ -143,7 +143,7 @@ def profile_snapshot(catalog, props, aliases):
         )
         require(
             result[alias]["native_batch"] == 2048,
-            "native HTTP batch differs from planned profile2048",
+            "native computation batch differs from planned profile2048",
         )
         require(
             result[alias]["total_slots"] == 1,
@@ -240,7 +240,6 @@ class ObservedClient:
                     "embedding lacks exact in-context preparation",
                 )
                 total = sum(counts)
-                require(total <= 2048, "embedding HTTP aggregate token budget exceeded")
                 prompt_tokens = payload.get("usage", {}).get("prompt_tokens")
                 if prompt_tokens is not None:
                     require(
@@ -467,10 +466,8 @@ def main():
             )
             require(
                 all(
-                    item.context_token_limit
-                    == item.batch_token_limit
-                    == item.max_input_tokens
-                    == 2048
+                    item.context_token_limit == item.max_input_tokens == 2048
+                    and item.batch_token_limit is None
                     for item in prepared
                 ),
                 "public effective limits differ from loaded profile",
@@ -499,8 +496,12 @@ def main():
                 "prepare did not count each corpus item exactly once",
             )
             require(
-                stats["http_requests_by_kind"].get("embedding", 0) < 32,
-                "total budget still behaves as32 item8 requests",
+                stats["http_requests_by_kind"].get("embedding", 0) == 2,
+                "native computation budget incorrectly split the two HTTP quotas",
+            )
+            require(
+                max(stats["embedding_request_aggregate_tokens"]) > 2048,
+                "fixture did not exercise aggregate HTTP tokens above native n_batch",
             )
             report["phases"].append(
                 {

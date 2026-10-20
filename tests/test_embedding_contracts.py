@@ -251,23 +251,23 @@ def test_multiple_total_budget_windows_preserve_every_original_offset():
         adapter.close()
 
 
-def test_replica_quota_is_split_by_native_aggregate_tokens_not_microbatch():
+def test_native_step_budget_does_not_split_http_arrays():
     client = ContractClient(context=2048, native_batch=2048)
     incoming = texts(256)
     client.counts = dict.fromkeys(incoming, 32)
     for entry in client.catalog:
-        entry["status"]["args"] += ["--ubatch-size", "16"]
+        entry["status"]["args"] += ["--ubatch-size", "64"]
     adapter = configured(client)
     try:
         assert adapter.embed_texts(incoming) == [vector(text) for text in incoming]
-        assert len(client.embedding_calls) == 4
+        assert len(client.embedding_calls) == 2
         assert Counter(alias for alias, _ in client.embedding_calls) == {
-            "embed_0": 2,
-            "embed_1": 2,
+            "embed_0": 1,
+            "embed_1": 1,
         }
-        assert all(len(batch) == 64 for _, batch in client.embedding_calls)
+        assert all(len(batch) == 128 for _, batch in client.embedding_calls)
         assert all(
-            sum(client.counts[t] for t in batch) <= 2048
+            sum(client.counts[t] for t in batch) == 4096
             for _, batch in client.embedding_calls
         )
         assert len(client.token_calls) == 256
@@ -277,7 +277,7 @@ def test_replica_quota_is_split_by_native_aggregate_tokens_not_microbatch():
 
 
 @pytest.mark.parametrize("native,configured_limit", [(2048, 96), (96, 2048)])
-def test_http_aggregate_budget_is_minimum_of_native_and_configured(
+def test_http_aggregate_budget_uses_explicit_policy_independently_of_native(
     native, configured_limit
 ):
     client = ContractClient(context=4096, native_batch=native)
@@ -286,7 +286,10 @@ def test_http_aggregate_budget_is_minimum_of_native_and_configured(
     adapter = configured(client, batch_token_limit=configured_limit)
     try:
         assert adapter.embed_texts(incoming) == [vector(text) for text in incoming]
-        assert all(len(batch) <= 3 for _, batch in client.embedding_calls)
+        assert all(
+            sum(client.counts[t] for t in batch) <= configured_limit
+            for _, batch in client.embedding_calls
+        )
         assert_once(client, incoming)
     finally:
         adapter.close()
@@ -306,9 +309,11 @@ def test_public_preparation_measures_boundary_oversize_and_reuses_exact_count():
             exact.token_count,
             exact.context_token_limit,
             exact.batch_token_limit,
-        ) == ("D: exact", 2048, 2048, 2048)
-        assert exact.fits_context and exact.fits_request and exact.fits_input
-        assert not over.fits_context and not over.fits_request and not over.fits_input
+        ) == ("D: exact", 2048, 2048, None)
+        assert exact.fits_context and exact.fits_input
+        assert exact.fits_request is None
+        assert not over.fits_context and not over.fits_input
+        assert over.fits_request is None
         assert over.token_count == 2049 and over.max_input_tokens == 2048
         assert exact.identity_verified and exact.content_sha256 == CONTENT
         assert exact.embedding_sha256 == SEMANTIC
@@ -462,7 +467,7 @@ def test_prepared_identity_change_is_rejected_before_inference():
 def test_context_valid_but_aggregate_invalid_input_is_measurable_never_sent():
     client = ContractClient(context=4096, native_batch=64)
     client.counts["over request"] = 65
-    adapter = configured(client)
+    adapter = configured(client, batch_token_limit=64)
     try:
         measured = adapter.prepare_texts(["over request"])[0]
         assert measured.fits_context and not measured.fits_request
@@ -502,13 +507,14 @@ def test_invalid_or_ambiguous_native_batch_metadata_fails_closed(argv):
     "argv",
     [["--batch-size=64"], ["-b", "64"], ["--batch-size", "64", "--ubatch-size", "2"]],
 )
-def test_supported_native_batch_argv_forms_use_same_effective_limit(argv):
+def test_supported_native_batch_argv_forms_are_diagnostic_not_http_limits(argv):
     client = ContractClient()
     for entry in client.catalog:
         entry["status"]["args"] = ["llama-server", *argv]
     adapter = configured(client)
     try:
-        assert adapter.prepare_query("test").batch_token_limit == 64
+        assert adapter.prepare_query("test").batch_token_limit is None
+        assert adapter._primary.loaded_batch_token_limit == 64
     finally:
         adapter.close()
 
@@ -795,7 +801,7 @@ def test_probe_rejects_numerical_instability_without_relaxing_thresholds():
     ) == (1e-5, 0.999999, 1e-6, 1e-12)
 
 
-def test_fresh_native_http_budget_can_reject_previously_measured_input():
+def test_fresh_explicit_http_budget_can_reject_previously_measured_input():
     client = ContractClient()
     client.counts["original"] = 65
     adapter = configured(client)
@@ -803,8 +809,7 @@ def test_fresh_native_http_budget_can_reject_previously_measured_input():
         prepared = adapter.prepare_texts(["original"])
         calls = len(client.token_calls)
         assert prepared[0].fits_input is True
-        for entry in client.catalog:
-            entry["status"]["args"] = ["llama-server", "--batch-size", "64"]
+        adapter.batch_token_limit = 64
         with pytest.raises(LLMBackendError, match="exceeds_batch"):
             adapter.embed_prepared(prepared)
         assert len(client.token_calls) == calls
@@ -852,7 +857,8 @@ def test_option_looking_model_value_is_not_a_batch_declaration():
         ]
     adapter = configured(client)
     try:
-        assert adapter.prepare_query("test").batch_token_limit == 64
+        assert adapter.prepare_query("test").batch_token_limit is None
+        assert adapter._primary.loaded_batch_token_limit == 64
     finally:
         adapter.close()
 

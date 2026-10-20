@@ -51,9 +51,10 @@ def payload(vectors, indexes=None):
 
 
 class Client:
-    def __init__(self, *, responses=None, context=32, counts=None):
+    def __init__(self, *, responses=None, context=32, counts=None, total_slots=1):
         self.responses = list(responses or [])
         self.context = context
+        self.total_slots = total_slots
         self.counts = counts or {}
         self.embedding_calls = []
         self.tokenize_calls = []
@@ -71,6 +72,7 @@ class Client:
         return {
             "default_generation_settings": {"n_ctx": self.context},
             "n_ctx_train": 99999,
+            "total_slots": self.total_slots,
         }
 
     def tokenize(self, content, **kwargs):
@@ -148,15 +150,56 @@ def test_empty_inputs_do_not_contact_server():
 
 def test_preflight_and_embedding_are_progressive_by_item_batch():
     client = Client()
-    adapter = LlamaCppEmbeddingAdapter(profile(batch_size=2), client=client)
-    assert len(adapter.embed_texts(["one", "two", "three"])) == 3
-    assert client.events == [
-        ("tokenize", "one"),
-        ("tokenize", "two"),
-        ("embedding", ["one", "two"]),
-        ("tokenize", "three"),
-        ("embedding", ["three"]),
-    ]
+    adapter = LlamaCppEmbeddingAdapter(
+        profile(batch_size=2, embedding_queue_size=1), client=client
+    )
+    incoming = ["one", "two", "three", "four", "five", "six"]
+    first_started, second_prepared, release_first = Event(), Event(), Event()
+    tokenize, embeddings = client.tokenize, client.embeddings
+
+    def count(content, **kwargs):
+        if content == "four":
+            second_prepared.set()
+        if content == "five":
+            # One active quota plus one lookahead quota holds the entire
+            # preparation budget until the first HTTP request drains.
+            assert release_first.is_set(), "preparation exceeded bounded lookahead"
+        return tokenize(content, **kwargs)
+
+    def request(input, **kwargs):
+        if input == incoming[:2]:
+            first_started.set()
+            assert release_first.wait(3)
+        return embeddings(input, **kwargs)
+
+    client.tokenize, client.embeddings = count, request
+    try:
+        with ThreadPoolExecutor(max_workers=1) as callers:
+            pending = callers.submit(adapter.embed_texts, incoming)
+            try:
+                assert first_started.wait(2)
+                assert second_prepared.wait(2)
+                assert not pending.done()
+                assert {text for text, _ in client.tokenize_calls} <= set(incoming[:4])
+            finally:
+                release_first.set()
+            assert pending.result(timeout=3) == [
+                [float(len(text)), 1.0] for text in incoming
+            ]
+        assert [call[0] for call in client.embedding_calls] == [
+            incoming[:2],
+            incoming[2:4],
+            incoming[4:],
+        ]
+        assert sorted(text for text, _ in client.tokenize_calls) == sorted(incoming)
+        for position, (kind, batch) in enumerate(client.events):
+            if kind == "embedding":
+                assert all(
+                    ("tokenize", text) in client.events[:position] for text in batch
+                )
+    finally:
+        release_first.set()
+        adapter.close()
 
 
 def test_exact_counts_pack_http_requests_and_reject_indivisible_overbudget():
@@ -435,7 +478,8 @@ def test_flapping_capacity_requires_longer_stability_before_each_recovery():
 
 def test_success_started_before_capacity_reduction_cannot_restore_capacity_early():
     client = Client(
-        responses=[ClientHTTPError(400, error_type="exceed_context_size_error")]
+        responses=[ClientHTTPError(400, error_type="exceed_context_size_error")],
+        total_slots=2,
     )
     adapter = LlamaCppEmbeddingAdapter(
         profile(batch_size=8, embedding_request_parallelism=2), client=client

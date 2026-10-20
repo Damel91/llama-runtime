@@ -9,6 +9,7 @@ from threading import Event, Lock, Thread, enumerate as threads
 import time
 
 import pytest
+import requests
 
 from runtime_llama.adapters.embedding import LlamaCppEmbeddingAdapter
 from runtime_llama.client import ClientHTTPError, LlamaCppClient
@@ -326,7 +327,7 @@ def test_cancellation_drains_one_call_without_cancelling_another_borrowed_client
             client.close()
 
 
-def test_cancelled_preheader_request_keeps_its_slot_and_zero_queue_backpressures():
+def test_borrowed_preheader_request_keeps_its_slot_until_transport_drains():
     with server() as (state, url):
 
         def action(body):
@@ -335,6 +336,8 @@ def test_cancelled_preheader_request_keeps_its_slot_and_zero_queue_backpressures
             return 200, response(body["input"])
 
         state.action = action
+        session = requests.Session()
+        client = LlamaCppClient(url, session=session, timeout=2)
         adapter = LlamaCppEmbeddingAdapter(
             configured(
                 url,
@@ -342,7 +345,8 @@ def test_cancelled_preheader_request_keeps_its_slot_and_zero_queue_backpressures
                 embedding_request_parallelism=1,
                 embedding_queue_size=0,
                 embedding_replicas=[],
-            )
+            ),
+            client=client,
         )
         cancel = Event()
         try:
@@ -367,6 +371,8 @@ def test_cancelled_preheader_request_keeps_its_slot_and_zero_queue_backpressures
         finally:
             state.release.set()
             adapter.close()
+            client.close()
+            session.close()
 
 
 def test_observed_replica_context_rejects_input_before_embedding_request():

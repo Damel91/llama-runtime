@@ -71,6 +71,7 @@ class RunawayDetector:
         self._block_chars = block_chars
         self._repeat_threshold = repeat_threshold
         self._ngram_chars = ngram_chars
+        self._cycle_chars = ngram_chars * repeat_threshold
         self._max_delta_chars = min(window_chars, 4096)
         self._channels: Dict[str, _ChannelState] = {}
 
@@ -96,7 +97,11 @@ class RunawayDetector:
         ).digest()
 
     def observe(self, channel: str, text: str) -> Optional[RunawayDiagnostics]:
-        state = self._channels.setdefault(str(channel or "content"), _ChannelState())
+        key = str(channel or "content")
+        state = self._channels.get(key)
+        if state is None:
+            state = _ChannelState()
+            self._channels[key] = state
         normalized = self._normalize_delta(state, text)
         if not normalized:
             return None
@@ -147,13 +152,13 @@ class RunawayDetector:
 
         tail_size = max(0, self._block_chars - 1)
         state.rolling_tail = scan[-tail_size:] if tail_size else ""
-        state.trailing = (state.trailing + normalized)[-self._window_chars :]
+        state.trailing = (state.trailing + normalized)[-self._cycle_chars :]
 
         if state.total_chars < self._min_chars:
             return None
 
         ngram_size = self._ngram_chars
-        required = ngram_size * self._repeat_threshold
+        required = self._cycle_chars
         if len(state.trailing) >= required:
             ngram = state.trailing[-ngram_size:]
             if ngram and state.trailing.endswith(ngram * self._repeat_threshold):

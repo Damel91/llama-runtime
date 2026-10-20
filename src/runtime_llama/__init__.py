@@ -31,6 +31,7 @@ from runtime_llama.usage import (
     LLMStreamEvent,
     LLMTransportAttempt,
     LLMUsageStats,
+    LLMServerTimings,
 )
 from runtime_llama.mcp import (
     MCPCallResult,
@@ -59,7 +60,7 @@ from runtime_llama.adapters.embedding import LlamaCppEmbeddingAdapter
 from runtime_llama.factory import build_adapter, build_embedding_adapter
 from runtime_llama.tailnet import TailnetConfig, TailnetError, TailnetHelper
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 __all__ = [
     "TailnetConfig",
@@ -88,6 +89,7 @@ __all__ = [
     "LLMStreamEvent",
     "LLMTransportAttempt",
     "LLMUsageStats",
+    "LLMServerTimings",
     "MCPCallResult",
     "MCPEphemeralIntegration",
     "MCPIntegration",

@@ -576,6 +576,7 @@ def test_real_http_discovers_copies_with_one_request_per_alias(replica_count):
         aliases = [f"embed_{index}" for index in range(replica_count)]
         state.contexts = dict.fromkeys(aliases, 4096)
         state.catalog = [entry(alias) for alias in aliases]
+        state.props_overrides = {alias: {"total_slots": 1} for alias in aliases}
 
         def action(body):
             assert state.release.wait(3)

@@ -272,7 +272,9 @@ def test_keepalive_reuse_and_stale_close_cannot_abort_new_lease(endpoint):
         handler.wfile.flush()
 
     base_url, observed = endpoint(respond, keepalive=True)
-    with LlamaCppClient(base_url, timeout=0.2, trust_env=False) as api:
+    with LlamaCppClient(
+        base_url, timeout=0.2, trust_env=False, connection_policy="reuse"
+    ) as api:
         old = api.complete("old", stream=True, idle_timeout=None)
         assert next(old) == {"part": 2}
         wait_for(lambda: not api._streams)
@@ -498,7 +500,9 @@ def test_reused_keepalive_socket_is_interruptible_before_new_headers(endpoint):
         handler.wfile.flush()
 
     base_url, observed = endpoint(respond, keepalive=True)
-    with LlamaCppClient(base_url, timeout=0.2, trust_env=False) as api:
+    with LlamaCppClient(
+        base_url, timeout=0.2, trust_env=False, connection_policy="reuse"
+    ) as api:
         assert list(api.complete("old", stream=True, idle_timeout=None)) == [
             {"part": 2}
         ]

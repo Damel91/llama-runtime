@@ -29,6 +29,7 @@ from runtime_llama.runaway import RunawayDetector
 from runtime_llama.usage import (
     LLMCallResult,
     LLMStreamEvent,
+    LLMServerTimings,
     LLMTransportAttempt,
     LLMUsageStats,
 )
@@ -136,22 +137,27 @@ class _StreamAccumulator:
         visible_output_token_limit: Optional[int] = None,
         thinking_diagnostics: Optional[ThinkingDiagnosticsConfig] = None,
         thinking_sink: Optional[ThinkingDiagnosticSink] = None,
+        collect_reasoning: bool = True,
     ) -> None:
         self._adapter = adapter
         configured = getattr(
             getattr(adapter, "_generation_config", None), "thinking_diagnostics", None
         )
+        capture_config = ThinkingDiagnosticsConfig.from_value(
+            configured if thinking_diagnostics is None else thinking_diagnostics
+        )
+        self._capture_enabled = capture_config.enabled
         self._capture = _ThinkingCapture(
-            ThinkingDiagnosticsConfig.from_value(
-                configured if thinking_diagnostics is None else thinking_diagnostics
-            ),
+            capture_config,
             role_id=adapter.role_id,
             model=adapter.model_name,
             sink=thinking_sink,
             secrets=getattr(adapter, "_diagnostic_secrets", ()),
         )
         self._stripper = adapter._new_thinking_stream_stripper(
-            lambda text: self._capture.observe("inline", text)
+            (lambda text: self._capture.observe("inline", text))
+            if self._capture_enabled
+            else None
         )
         self._detector = adapter._new_runaway_detector()
         self._visible_char_limit = adapter._visible_output_char_limit(
@@ -160,8 +166,11 @@ class _StreamAccumulator:
         self._visible_chars = 0
         self._visible_limit_reached = False
         self._reasoning_parts: List[str] = []
+        self._collect_reasoning = collect_reasoning
+        self._reasoning_chars = 0
         self._usage: Optional[LLMUsageStats] = None
         self._transport = None
+        self._server_timings: Optional[LLMServerTimings] = None
         self._terminal_reason = "completed"
         self._tool_calls: tuple[Dict[str, Any], ...] = ()
 
@@ -171,22 +180,30 @@ class _StreamAccumulator:
             self._usage = event.usage
         if event.transport is not None:
             self._transport = event.transport
+        if event.server_timings is not None:
+            self._server_timings = event.server_timings
 
         if kind in {"content", "reasoning"}:
             text = str(event.text or "")
             # Capture the received delta before runaway rejection, without
             # projecting rejected content into the visible response.
             if kind == "reasoning":
-                self._capture.observe("separated", text)
+                if self._capture_enabled:
+                    self._capture.observe("separated", text)
                 projected = []
             else:
+                # Resolve the complete delta before the guard: opted-in inline
+                # diagnostics also observe rejected text, but none of its
+                # visible fragments may escape a runaway decision.
                 projected = list(self._stripper.feed(text))
             diagnostics = self._detector.observe(kind, text)
             if diagnostics is not None:
                 raise LLMRunawayError(diagnostics=diagnostics.to_dict())
             if kind == "reasoning":
                 if text:
-                    self._reasoning_parts.append(text)
+                    self._reasoning_chars += len(text)
+                    if self._collect_reasoning:
+                        self._reasoning_parts.append(text)
                 return
             if text:
                 yield from self._apply_visible_limit(iter(projected))
@@ -202,8 +219,8 @@ class _StreamAccumulator:
     def finish(self) -> Iterator[str]:
         if not self._visible_limit_reached:
             yield from self._apply_visible_limit(self._stripper.flush())
-        if self._reasoning_parts:
-            self._adapter._log_thinking_chars(sum(map(len, self._reasoning_parts)))
+        if self._reasoning_chars:
+            self._adapter._log_thinking_chars(self._reasoning_chars)
 
     def finish_diagnostic(
         self, reason: str = "interrupted"
@@ -251,6 +268,7 @@ class _StreamAccumulator:
     def result(self) -> LLMCallResult:
         if self._usage is not None:
             self._adapter._set_last_usage(self._usage)
+        self._adapter._set_last_server_timings(self._server_timings)
         terminal_reason = (
             "visible_output_cap"
             if self._visible_limit_reached
@@ -267,6 +285,7 @@ class _StreamAccumulator:
             transport=self._transport,
             tool_calls=self._tool_calls,
             thinking_diagnostic=self.finish_diagnostic(terminal_reason),
+            server_timings=self._server_timings,
         )
 
 
@@ -300,12 +319,14 @@ class BaseLLMAdapter(ABC):
         thinking_sink: Optional[ThinkingDiagnosticSink] = None,
     ) -> Iterator[str]:
         self._set_last_usage(None)
+        self._set_last_server_timings(None)
         self._set_last_terminal_reason("")
         accumulator = _StreamAccumulator(
             self,
             visible_output_token_limit=num_predict,
             thinking_diagnostics=thinking_diagnostics,
             thinking_sink=thinking_sink,
+            collect_reasoning=False,
         )
         events = None
         try:
@@ -378,6 +399,7 @@ class BaseLLMAdapter(ABC):
         thinking_sink: Optional[ThinkingDiagnosticSink] = None,
     ) -> LLMCallResult:
         self._set_last_usage(None)
+        self._set_last_server_timings(None)
         self._set_last_terminal_reason("")
         accumulator = _StreamAccumulator(
             self,
@@ -427,6 +449,7 @@ class BaseLLMAdapter(ABC):
                 transport=result.transport,
                 tool_calls=result.tool_calls,
                 thinking_diagnostic=result.thinking_diagnostic,
+                server_timings=result.server_timings,
             )
         except (
             LLMBackendError,
@@ -506,11 +529,17 @@ class BaseLLMAdapter(ABC):
     def get_last_usage(self) -> Optional[LLMUsageStats]:
         return getattr(self, "_last_usage", None)
 
+    def get_last_server_timings(self) -> Optional[LLMServerTimings]:
+        return getattr(self, "_last_server_timings", None)
+
     def get_last_terminal_reason(self) -> str:
         return str(getattr(self, "_last_terminal_reason", "") or "")
 
     def _set_last_usage(self, usage: Optional[LLMUsageStats]) -> None:
         self._last_usage = usage
+
+    def _set_last_server_timings(self, timings: Optional[LLMServerTimings]) -> None:
+        self._last_server_timings = timings
 
     def _set_last_terminal_reason(self, reason: str) -> None:
         self._last_terminal_reason = str(reason or "")

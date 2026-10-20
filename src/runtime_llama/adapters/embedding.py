@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
+from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import asdict, dataclass, field
 import math
 import os
 import secrets
@@ -25,7 +25,7 @@ from runtime_llama.replica_discovery import (
 )
 
 from runtime_llama.embedding_scheduler import EmbeddingScheduler
-from runtime_llama.embedding_metadata import loaded_batch_limit
+from runtime_llama.embedding_metadata import loaded_execution_metadata
 from runtime_llama.embedding_preparation import (
     PreparedEmbeddingInput,
     issue_preparation,
@@ -48,6 +48,7 @@ class _Replica:
     context_length: int | None = None
     total_slots: int | None = None
     loaded_batch_token_limit: int | None = None
+    native_microbatch_tokens: int | None = None
     tokenizer_build: str | None = None
     props_checked: bool = False
     props_identity_verified: bool = False
@@ -65,6 +66,40 @@ class _Observation:
     context_token_limit: int | None
     batch_token_limit: int | None
     tokenizer_build: str | None
+    identity_key: tuple[str, str] | None = None
+    native_batch_tokens: int | None = None
+    native_microbatch_tokens: int | None = None
+    total_slots: int | None = None
+
+
+@dataclass(frozen=True)
+class _CountedInput:
+    """Internal exact count; only public preparations incur serialization/HMAC."""
+
+    text: str
+    input_type: str
+    token_count: int
+    context_token_limit: int | None
+    batch_token_limit: int | None
+    max_input_tokens: int | None
+    identity_verified: bool
+    content_sha256: str | None
+    embedding_sha256: str | None
+    _tokenizer_build: str | None
+    _policy: str
+
+
+@dataclass
+class _Quota:
+    model: str
+    offset: int
+    records: list[_CountedInput]
+    observation: _Observation
+    next_index: int = 0
+    pending_requests: int = 0
+    sent_indices: set[int] = field(default_factory=set)
+    admitted_limits: tuple[int | None, int | None] | None = None
+    lock: Any = field(default_factory=Lock)
 
 
 class _Call:
@@ -115,6 +150,10 @@ class _Call:
     def fail(self, exc: BaseException) -> None:
         with self.lock:
             if self.failure is None:
+                if self.adapter._closing.is_set() and (
+                    isinstance(exc, CancelledError) or type(exc) is RuntimeError
+                ):
+                    exc = LLMBackendError("llamacpp_embedding_adapter_closed")
                 self.failure = exc
             self.stop.set()
 
@@ -170,6 +209,9 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 timeout=profile.timeout,
                 verify_ssl=profile.model_config.verify_ssl,
                 proxy_url=proxy_url,
+                connection_policy=getattr(
+                    profile.model_config, "http_connection_policy", "close"
+                ),
             )
         )
         self._loaded_context_length: int | None = None
@@ -222,12 +264,30 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             )
         }
         self._primary = next(iter(self._replicas.values()))
+        self._configured_replica_limits = {
+            model: replica.max_in_flight for model, replica in self._replicas.items()
+        }
         for replica in self._replicas.values():
             replica.accepted_aliases.add(replica.model)
         self._scheduler = EmbeddingScheduler(
             self.embedding_request_parallelism,
             self.embedding_queue_size,
             {model: replica.max_in_flight for model, replica in self._replicas.items()},
+        )
+        # Preparation is bounded separately from ready HTTP admission. Keeping
+        # tokenizer workers separate avoids nested-pool starvation/deadlocks.
+        capacity = self.embedding_request_parallelism + self.embedding_queue_size
+        self._preparation_permits = BoundedSemaphore(max(1, capacity))
+        self._tokenizer_pending = BoundedSemaphore(
+            max(1, self.token_count_parallelism * 2)
+        )
+        self._preparation_executor = ThreadPoolExecutor(
+            max_workers=self.embedding_request_parallelism,
+            thread_name_prefix="runtime_llama_prepare",
+        )
+        self._tokenizer_executor = ThreadPoolExecutor(
+            max_workers=self.token_count_parallelism,
+            thread_name_prefix="runtime_llama_tokenizer",
         )
 
     def _join_pool(self, call: _Call, timeout: float) -> bool:
@@ -267,10 +327,22 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 if self._discovered_pool is None or (
                     pool.topology != self._discovered_pool.topology
                 ):
+                    waited = False
                     while self._pool_users:
                         check_wait()
                         self._pool_condition.wait(0.05)
+                        waited = True
                     call.check()
+                    if waited:
+                        catalog = self._discovery_catalog(
+                            timeout=call.remaining(), cancel=call.probe
+                        )
+                        pool = discover_embedding_pool(
+                            catalog,
+                            self.model_name,
+                            pinned=self._pinned_identity,
+                            fallback_alias=self._fallback_alias,
+                        )
                     replicas = {}
                     for observed in pool.replicas:
                         key = (
@@ -333,17 +405,20 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 self._pool_users -= 1
                 self._pool_condition.notify_all()
 
-    def _verify_discovered_replica(self, replica: _Replica, *, timeout, cancel):
+    def _verify_discovered_replica(
+        self, replica: _Replica, *, timeout, cancel, catalog=None
+    ):
         models = getattr(self._client, "models", None)
         if not callable(models):
             if self._discovery_enabled:
                 raise LLMBackendError("llamacpp_embedding_invalid_model_catalog")
             return None
-        catalog = (
-            self._discovery_catalog(timeout=timeout, cancel=cancel)
-            if self._discovery_enabled
-            else models(timeout=timeout, cancel=cancel, cancel_wait=True)
-        )
+        if catalog is None:
+            catalog = (
+                self._discovery_catalog(timeout=timeout, cancel=cancel)
+                if self._discovery_enabled
+                else models(timeout=timeout, cancel=cancel, cancel_wait=True)
+            )
         if self._discovery_enabled:
             verify_loaded_replica(catalog, replica.model, replica.identity)
         entries = catalog.get("data") if isinstance(catalog, dict) else None
@@ -407,12 +482,18 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         ).context_length
 
     def _observe_replica(
-        self, *, replica: _Replica | None = None, timeout=None, cancel=None, call=None
+        self,
+        *,
+        replica: _Replica | None = None,
+        timeout=None,
+        cancel=None,
+        call=None,
+        catalog=None,
     ) -> _Observation:
         replica = replica or self._primary
         remaining = call.remaining if call is not None else lambda: timeout
         entry = self._verify_discovered_replica(
-            replica, timeout=remaining(), cancel=cancel
+            replica, timeout=remaining(), cancel=cancel, catalog=catalog
         )
         loaded_context_length = None
         replica.props_checked = True
@@ -437,25 +518,13 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             if props.get("is_sleeping") is True:
                 self._invalidate_replica(replica)
                 raise LLMBackendError("llamacpp_embedding_model_sleeping")
+            if entry is not None:
+                replica.accepted_aliases.update(self._catalog_aliases(entry))
             if alias is not None and (
                 not isinstance(alias, str) or alias not in replica.accepted_aliases
             ):
-                try:
-                    catalog = self._client.models(
-                        timeout=remaining(), cancel=cancel, cancel_wait=True
-                    )
-                    entries = catalog.get("data") if isinstance(catalog, dict) else None
-                    matches = self._catalog_matches(replica.model, entries)
-                    if len(matches) == 1:
-                        replica.accepted_aliases.update(
-                            self._catalog_aliases(matches[0])
-                        )
-                except (LLMBackendError, LLMTimeoutError, LLMCancelledError):
-                    self._invalidate_replica(replica)
-                    raise
-                if not isinstance(alias, str) or alias not in replica.accepted_aliases:
-                    self._invalidate_replica(replica)
-                    raise LLMBackendError("llamacpp_embedding_model_metadata_mismatch")
+                self._invalidate_replica(replica)
+                raise LLMBackendError("llamacpp_embedding_model_metadata_mismatch")
             settings = props.get("default_generation_settings")
             if isinstance(settings, dict):
                 loaded_context_length = self._positive_int(settings.get("n_ctx"))
@@ -465,23 +534,45 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         else:
             alias, total_slots, build = None, None, None
         try:
-            native_batch = loaded_batch_limit(props, entry)
+            native = loaded_execution_metadata(props, entry)
         except LLMBackendError:
             self._invalidate_replica(replica)
             raise
         context_limit = self._input_limit(loaded_context_length, replica=replica)
-        batch_limit = self._minimum(
-            self.batch_token_limit, replica.batch_token_limit, native_batch
-        )
+        batch_limit = self._minimum(self.batch_token_limit, replica.batch_token_limit)
         with replica.lock:
             replica.context_length = loaded_context_length
             replica.total_slots = total_slots
             replica.props_identity_verified = isinstance(alias, str)
-            replica.loaded_batch_token_limit = native_batch
+            replica.loaded_batch_token_limit = native.n_batch
+            replica.native_microbatch_tokens = native.n_ubatch
             replica.tokenizer_build = build
             if replica is self._primary:
                 self._loaded_context_length = loaded_context_length
-        return _Observation(loaded_context_length, context_limit, batch_limit, build)
+        # A native slot bounds active sequences, not HTTP array length. Unknown
+        # capacity is explicit and conservative; no configuration is sent back.
+        configured = (
+            self.embedding_request_parallelism
+            if self._discovery_enabled
+            else self._configured_replica_limits[replica.model]
+        )
+        capacity = min(
+            self.embedding_request_parallelism, configured, native.total_slots or 1
+        )
+        replica.max_in_flight = capacity
+        self._scheduler.update_limits(
+            {name: item.max_in_flight for name, item in self._replicas.items()}
+        )
+        return _Observation(
+            loaded_context_length,
+            context_limit,
+            batch_limit,
+            build,
+            replica.identity.key if replica.identity else None,
+            native.n_batch,
+            native.n_ubatch,
+            native.total_slots,
+        )
 
     @staticmethod
     def _minimum(*values):
@@ -491,6 +582,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         replica.context_length = None
         replica.total_slots = None
         replica.loaded_batch_token_limit = None
+        replica.native_microbatch_tokens = None
         replica.tokenizer_build = None
         replica.props_identity_verified = False
         if replica is self._primary:
@@ -608,6 +700,19 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             and record._tokenizer_build == observation.tokenizer_build
         )
 
+    @staticmethod
+    def _submit_bounded(executor, permits, run, call):
+        while not permits.acquire(timeout=min(0.05, call.remaining())):
+            call.check()
+        try:
+            call.check()
+            future = executor.submit(run)
+        except BaseException:
+            permits.release()
+            raise
+        future.add_done_callback(lambda _: permits.release())
+        return future
+
     def _prepare_quota(self, inputs, replica, call, observation, conservative):
         context_limit = self._minimum(observation.context_token_limit, conservative[0])
         batch_limit = self._minimum(observation.batch_token_limit, conservative[1])
@@ -626,8 +731,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                     text, input_type = item
                     count = self._token_count(text, replica, call)
                 identity = replica.identity
-                return issue_preparation(
-                    self._preparation_key,
+                return _CountedInput(
                     text=text,
                     input_type=input_type,
                     token_count=count,
@@ -644,36 +748,56 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 call.fail(exc)
                 raise
 
-        workers = min(self.token_count_parallelism, len(inputs))
-        if workers <= 1:
-            return [prepare(item) for item in inputs]
-        results = [None] * len(inputs)
-        pending = {}
-        cursor = 0
-        with ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="runtime_llama_tokenizer"
-        ) as executor:
-            try:
-                while cursor < len(inputs) or pending:
-                    call.check()
-                    while cursor < len(inputs) and len(pending) < workers:
-                        call.check()
-                        pending[executor.submit(prepare, inputs[cursor])] = cursor
-                        cursor += 1
-                    finished, _ = wait(
-                        pending, timeout=0.05, return_when=FIRST_COMPLETED
+        results, pending, cursor = [None] * len(inputs), {}, 0
+        # Exact duplicates only share a count inside one pinned observation;
+        # no cross-call TTL or unverified-alias cache is introduced.
+        groups = []
+        keys = {}
+        can_deduplicate = (
+            observation.identity_key is not None
+            and observation.tokenizer_build is not None
+        )
+        for index, item in enumerate(inputs):
+            key = (
+                (item.text, item.input_type)
+                if isinstance(item, PreparedEmbeddingInput)
+                else item
+            )
+            if can_deduplicate and key in keys:
+                groups[keys[key]][1].append(index)
+            else:
+                keys[key] = len(groups)
+                groups.append((item, [index]))
+        try:
+            while cursor < len(groups) or pending:
+                call.check()
+                while (
+                    cursor < len(groups) and len(pending) < self.token_count_parallelism
+                ):
+                    item, positions = groups[cursor]
+                    future = self._submit_bounded(
+                        self._tokenizer_executor,
+                        self._tokenizer_pending,
+                        lambda item=item: prepare(item),
+                        call,
                     )
-                    for future in finished:
-                        results[pending.pop(future)] = future.result()
-            except BaseException as exc:
-                call.fail(exc)
-                for future in pending:
-                    try:
-                        future.result()
-                    except BaseException:
-                        pass
-                raise
-        return results
+                    pending[future] = positions
+                    cursor += 1
+                finished, _ = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
+                for future in finished:
+                    positions = pending.pop(future)
+                    record = future.result()
+                    for index in positions:
+                        results[index] = record
+            return results
+        except BaseException as exc:
+            call.fail(exc)
+            for future in pending:
+                try:
+                    future.result()
+                except BaseException:
+                    pass
+            raise
 
     @staticmethod
     def _admit(record, observation):
@@ -690,8 +814,8 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             )
 
     @staticmethod
-    def _normalize(vector: list[float]) -> list[float]:
-        scale = max(abs(value) for value in vector)
+    def _normalize(vector: list[float], scale: float | None = None) -> list[float]:
+        scale = max(abs(value) for value in vector) if scale is None else scale
         if scale == 0:
             return vector
         scaled = [value / scale for value in vector]
@@ -718,22 +842,26 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 or index in indexed
                 or not isinstance(raw, list)
                 or not raw
-                or any(
-                    isinstance(value, bool) or not isinstance(value, (int, float))
-                    for value in raw
-                )
             ):
                 raise LLMBackendError("llamacpp_embedding_invalid_response")
+            vector, scale = [], 0.0
             try:
-                vector = [float(value) for value in raw]
+                for value in raw:
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        raise ValueError("invalid vector member")
+                    number = float(value)
+                    if not math.isfinite(number):
+                        raise ValueError("nonfinite vector member")
+                    vector.append(number)
+                    scale = max(scale, abs(number))
             except (ValueError, TypeError, OverflowError) as exc:
                 raise LLMBackendError("llamacpp_embedding_invalid_response") from exc
-            if not all(math.isfinite(value) for value in vector):
-                raise LLMBackendError("llamacpp_embedding_invalid_response")
             if expected_dimension is not None and len(vector) != expected_dimension:
                 raise LLMBackendError("llamacpp_embedding_dimension_mismatch")
             expected_dimension = len(vector)
-            indexed[index] = self._normalize(vector) if self.normalize else vector
+            indexed[index] = (
+                self._normalize(vector, scale) if self.normalize else vector
+            )
         return [indexed[index] for index in range(expected_count)]
 
     def _tighten_adaptive_batch_size(self, value: int, *, replica: _Replica) -> None:
@@ -775,115 +903,184 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         cancel=None,
         recovery_child: bool = False,
         call: _Call | None = None,
+        observation: _Observation | None = None,
+        records: Sequence[_CountedInput] | None = None,
     ) -> list[list[float]]:
-        if call is not None:
-            self._verify_discovered_replica(
-                replica, timeout=call.remaining(), cancel=call.probe
-            )
-            timeout = call.remaining()
-        if cancel is not None and cancel():
-            raise LLMCancelledError()
-        with replica.lock:
-            generation = replica.generation
-        try:
-            result = self._client.embeddings(
-                texts,
-                model=replica.model,
-                timeout=timeout,
-                cancel=cancel,
-                cancel_wait=True,
-            )
-        except ClientHTTPError as exc:
-            if (
-                exc.status_code != 400
-                or getattr(exc, "error_type", None) != "exceed_context_size_error"
-                or len(texts) <= 1
-            ):
-                raise
-            midpoint = len(texts) // 2
-            self._tighten_adaptive_batch_size(
-                max(midpoint, len(texts) - midpoint), replica=replica
-            )
-            return self._request_batch_adaptive(
-                texts[:midpoint],
-                replica=replica,
-                timeout=timeout,
-                cancel=cancel,
-                recovery_child=True,
-                call=call,
-            ) + self._request_batch_adaptive(
-                texts[midpoint:],
-                replica=replica,
-                timeout=timeout,
-                cancel=cancel,
-                recovery_child=True,
-                call=call,
-            )
-        vectors = self._parse_batch_response(result, expected_count=len(texts))
-        if not recovery_child:
-            self._record_batch_success(len(texts), generation, replica)
-        return vectors
+        # Recovery shares one pending set. A newly observed constraint applies
+        # to unsent siblings before the first child has an avoidable effect.
+        pending = set(range(len(texts)))
+        admitted = None
+        context_limit = http_limit = None
 
-    def _run_job(self, inputs, model, call, operation, conservative):
+        def send(start, stop, recovering, observed=None):
+            nonlocal admitted, context_limit, http_limit
+            current_timeout = timeout
+            if call is not None:
+                call.check()
+                if observed is None:
+                    observed = self._observe_replica(
+                        replica=replica, cancel=call.probe, call=call
+                    )
+                current_timeout = call.remaining()
+                if records is not None:
+                    context_limit = self._minimum(
+                        context_limit,
+                        observed.context_token_limit,
+                        *(records[i].context_token_limit for i in pending),
+                    )
+                    http_limit = self._minimum(
+                        http_limit,
+                        observed.batch_token_limit,
+                        *(records[i].batch_token_limit for i in pending),
+                    )
+                    key = (observed.tokenizer_build, context_limit, http_limit)
+                    if key != admitted:
+                        for index in pending:
+                            record = records[index]
+                            if record._tokenizer_build != observed.tokenizer_build:
+                                raise LLMBackendError(
+                                    "llamacpp_embedding_tokenizer_policy_changed"
+                                )
+                            self._admit(
+                                record,
+                                _Observation(
+                                    observed.context_length,
+                                    context_limit,
+                                    http_limit,
+                                    observed.tokenizer_build,
+                                ),
+                            )
+                        admitted = key
+                    if (
+                        http_limit is not None
+                        and sum(item.token_count for item in records[start:stop])
+                        > http_limit
+                    ):
+                        vectors, cursor = [], start
+                        while cursor < stop:
+                            end, tokens = cursor, 0
+                            while end < stop:
+                                count = records[end].token_count
+                                if end > cursor and tokens + count > http_limit:
+                                    break
+                                tokens += count
+                                end += 1
+                            vectors.extend(send(cursor, end, True))
+                            cursor = end
+                        return vectors
+            if cancel is not None and cancel():
+                raise LLMCancelledError()
+            with replica.lock:
+                generation = replica.generation
+            try:
+                payload = self._client.embeddings(
+                    texts[start:stop],
+                    model=replica.model,
+                    timeout=current_timeout,
+                    cancel=cancel,
+                    cancel_wait=True,
+                )
+            except ClientHTTPError as exc:
+                size = stop - start
+                if (
+                    exc.status_code != 400
+                    or getattr(exc, "error_type", None) != "exceed_context_size_error"
+                    or size <= 1
+                ):
+                    raise
+                midpoint = start + size // 2
+                self._tighten_adaptive_batch_size(
+                    max(midpoint - start, stop - midpoint), replica=replica
+                )
+                return send(start, midpoint, True) + send(midpoint, stop, True)
+            vectors = self._parse_batch_response(payload, expected_count=stop - start)
+            pending.difference_update(range(start, stop))
+            if not recovering:
+                self._record_batch_success(stop - start, generation, replica)
+            return vectors
+
+        return send(0, len(texts), recovery_child, observation)
+
+    def _prepare_job(self, inputs, model, offset, call, conservative):
         replica = self._replicas[model]
         try:
             call.check()
             observation = self._observe_replica(
                 replica=replica, cancel=call.probe, call=call
             )
-            prepared = self._prepare_quota(
+            records = self._prepare_quota(
                 inputs, replica, call, observation, conservative
             )
-            if operation == "prepare":
+            return _Quota(model, offset, records, observation)
+        except BaseException as exc:
+            call.fail(exc)
+            raise
+
+    def _run_ready_batch(self, quota, start, stop, call):
+        replica = self._replicas[quota.model]
+        try:
+            result, cursor = [], start
+            while cursor < stop:
                 call.check()
-                return prepared
-            vectors: list[list[float]] = []
-            start = 0
-            while start < len(prepared):
-                call.check()
-                observation = self._observe_replica(
+                observed = self._observe_replica(
                     replica=replica, cancel=call.probe, call=call
                 )
-                if observation.tokenizer_build != prepared[0]._tokenizer_build:
+                if observed.tokenizer_build != quota.observation.tokenizer_build:
                     raise LLMBackendError("llamacpp_embedding_tokenizer_policy_changed")
-                # A later incomplete observation cannot erase a known bound
-                # under which this quota started preparing.
-                observation = _Observation(
-                    observation.context_length,
-                    self._minimum(
-                        observation.context_token_limit, prepared[0].context_token_limit
-                    ),
-                    self._minimum(
-                        observation.batch_token_limit, prepared[0].batch_token_limit
-                    ),
-                    observation.tokenizer_build,
-                )
-                for record in prepared[start:]:
-                    self._admit(record, observation)
-                maximum = self._current_batch_size(len(prepared) - start, replica)
-                stop, tokens = start, 0
-                while stop < start + maximum:
-                    count = prepared[stop].token_count
-                    if (
-                        stop > start
-                        and observation.batch_token_limit is not None
-                        and tokens + count > observation.batch_token_limit
-                    ):
-                        break
-                    tokens += count
-                    stop += 1
-                provider_batch = [record.text for record in prepared[start:stop]]
-                result = self._request_batch_adaptive(
-                    provider_batch,
+                with quota.lock:
+                    prior = quota.admitted_limits or (None, None)
+                    context_limit = self._minimum(
+                        prior[0],
+                        observed.context_token_limit,
+                        quota.observation.context_token_limit,
+                    )
+                    http_limit = self._minimum(
+                        prior[1],
+                        observed.batch_token_limit,
+                        quota.observation.batch_token_limit,
+                    )
+                    effective = _Observation(
+                        observed.context_length,
+                        context_limit,
+                        http_limit,
+                        observed.tokenizer_build,
+                        observed.identity_key,
+                        observed.native_batch_tokens,
+                        observed.native_microbatch_tokens,
+                        observed.total_slots,
+                    )
+                    key = (context_limit, http_limit)
+                    if quota.admitted_limits != key:
+                        # Validate all unsent inputs before the first POST at a
+                        # new limit; completed/in-flight requests cannot replay.
+                        for index, record in enumerate(quota.records):
+                            if index not in quota.sent_indices:
+                                self._admit(record, effective)
+                        quota.admitted_limits = key
+                    end, tokens = cursor, 0
+                    while end < stop:
+                        count = quota.records[end].token_count
+                        if (
+                            end > cursor
+                            and http_limit is not None
+                            and tokens + count > http_limit
+                        ):
+                            break
+                        tokens += count
+                        end += 1
+                    quota.sent_indices.update(range(cursor, end))
+                vectors = self._request_batch_adaptive(
+                    [item.text for item in quota.records[cursor:end]],
                     replica=replica,
                     cancel=call.probe,
                     call=call,
+                    observation=effective,
+                    records=quota.records[cursor:end],
                 )
-                call.validate_dimensions(result)
-                vectors.extend(result)
-                start = stop
-            call.check()
-            return vectors
+                call.validate_dimensions(vectors)
+                result.extend(vectors)
+                cursor = end
+            return result
         except BaseException as exc:
             call.fail(exc)
             raise
@@ -904,30 +1101,61 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 raise LLMBackendError("llamacpp_embedding_adapter_closed")
             self._calls.add(call)
         outputs = [None] * len(inputs)
-        pending = {}
+        preparations, requests = {}, {}
+        ready = []
         joined = False
+        leased_quotas = 0
         try:
             call.check()
             joined = self._join_pool(call, call.remaining())
-            observations = [
-                self._observe_replica(replica=replica, cancel=call.probe, call=call)
-                for replica in self._replicas.values()
-            ]
-            conservative = (
-                self._minimum(*(item.context_token_limit for item in observations)),
-                self._minimum(*(item.batch_token_limit for item in observations)),
-            )
-            window_start = 0
-            descriptors = []
+            while not self._preparation_permits.acquire(
+                timeout=min(0.05, call.remaining())
+            ):
+                call.check()
+            try:
+                # One catalog for all aliases at this boundary, with per-model props.
+                catalog = None
+                models = getattr(self._client, "models", None)
+                if callable(models):
+                    catalog = (
+                        self._discovery_catalog(
+                            timeout=call.remaining(), cancel=call.probe
+                        )
+                        if self._discovery_enabled
+                        else models(
+                            timeout=call.remaining(),
+                            cancel=call.probe,
+                            cancel_wait=True,
+                        )
+                    )
+                observations = [
+                    self._observe_replica(
+                        replica=replica, cancel=call.probe, call=call, catalog=catalog
+                    )
+                    for replica in self._replicas.values()
+                ]
+                conservative = (
+                    self._minimum(*(item.context_token_limit for item in observations)),
+                    self._minimum(*(item.batch_token_limit for item in observations)),
+                )
+            finally:
+                self._preparation_permits.release()
+            window_start, descriptors = 0, []
             pending_limit = max(
                 1, self.embedding_request_parallelism + self.embedding_queue_size
             )
-            while window_start < len(inputs) or descriptors or pending:
+            while (
+                window_start < len(inputs)
+                or descriptors
+                or preparations
+                or ready
+                or requests
+            ):
                 call.check()
-                while len(pending) < pending_limit and (
-                    descriptors or window_start < len(inputs)
-                ):
-                    call.check()
+                # A bounded lookahead overlaps preparation with active HTTP.
+                while len(preparations) + len(ready) + len(
+                    requests
+                ) < pending_limit and (descriptors or window_start < len(inputs)):
                     if not descriptors:
                         window_end = min(len(inputs), window_start + self.batch_size)
                         offset = window_start
@@ -937,28 +1165,95 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                             descriptors.append((model, offset, size))
                             offset += size
                         window_start = window_end
+                    if not self._preparation_permits.acquire(blocking=False):
+                        break
+                    leased_quotas += 1
                     model, offset, size = descriptors.pop(0)
-                    quota = inputs[offset : offset + size]
-                    future = self._scheduler.submit(
-                        lambda alias, quota=quota: self._run_job(
-                            quota, alias, call, operation, conservative
+                    chunk = inputs[offset : offset + size]
+                    future = self._preparation_executor.submit(
+                        lambda chunk=chunk, model=model, offset=offset: (
+                            self._prepare_job(chunk, model, offset, call, conservative)
+                        )
+                    )
+                    preparations[future] = (offset, size)
+                for future in tuple(preparations):
+                    if not future.done():
+                        continue
+                    preparations.pop(future)
+                    quota = future.result()
+                    if operation == "prepare":
+                        records = [
+                            issue_preparation(self._preparation_key, **asdict(record))
+                            for record in quota.records
+                        ]
+                        outputs[quota.offset : quota.offset + len(records)] = records
+                        self._preparation_permits.release()
+                        leased_quotas -= 1
+                    else:
+                        ready.append(quota)
+                attempts = len(ready)
+                while ready and attempts and len(requests) < pending_limit:
+                    attempts -= 1
+                    quota = ready.pop(0)
+                    replica = self._replicas[quota.model]
+                    start = quota.next_index
+                    maximum = self._current_batch_size(
+                        len(quota.records) - start, replica
+                    )
+                    stop, tokens = start, 0
+                    while stop < start + maximum:
+                        count = quota.records[stop].token_count
+                        limit = quota.observation.batch_token_limit
+                        if (
+                            stop > start
+                            and limit is not None
+                            and tokens + count > limit
+                        ):
+                            break
+                        tokens += count
+                        stop += 1
+                    future = self._scheduler.try_submit(
+                        lambda _alias, quota=quota, start=start, stop=stop: (
+                            self._run_ready_batch(quota, start, stop, call)
                         ),
                         call.check,
-                        model=model,
+                        model=quota.model,
                     )
-                    pending[future] = (offset, size)
+                    if future is None:
+                        ready.append(quota)
+                        continue
+                    requests[future] = (quota.offset + start, stop - start, quota)
+                    quota.pending_requests += 1
+                    quota.next_index = stop
+                    # Rotate ready quotas so a large quota does not starve peers.
+                    if stop < len(quota.records):
+                        ready.append(quota)
+                        attempts += 1
+                pending = set(preparations) | set(requests)
                 if pending:
                     finished, _ = wait(
                         pending, timeout=0.05, return_when=FIRST_COMPLETED
                     )
                     for future in finished:
-                        offset, expected = pending.pop(future)
+                        if future not in requests:
+                            continue
+                        offset, size, quota = requests.pop(future)
                         result = future.result()
-                        if len(result) != expected:
+                        if len(result) != size:
                             raise LLMBackendError(
                                 "llamacpp_embedding_count_or_response_mismatch"
                             )
-                        outputs[offset : offset + expected] = result
+                        outputs[offset : offset + size] = result
+                        quota.pending_requests -= 1
+                        if (
+                            quota.next_index == len(quota.records)
+                            and quota.pending_requests == 0
+                        ):
+                            self._preparation_permits.release()
+                            leased_quotas -= 1
+                else:
+                    # Another caller owns lookahead or HTTP admission capacity.
+                    call.stop.wait(min(0.01, call.remaining()))
             call.check()
             if any(output is None for output in outputs):
                 raise LLMBackendError("llamacpp_embedding_count_or_response_mismatch")
@@ -971,13 +1266,15 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             return outputs
         except BaseException as exc:
             call.fail(exc)
-            for future in pending:
+            for future in (*preparations, *requests):
                 try:
                     future.result()
                 except BaseException:
                     pass
             raise call.failure if call.failure is not None else exc
         finally:
+            for _ in range(leased_quotas):
+                self._preparation_permits.release()
             self._leave_pool(joined)
             with self._calls_condition:
                 self._calls.discard(call)
@@ -1205,9 +1502,10 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                     "batch_token_limit": self._minimum(
                         self.batch_token_limit,
                         replica.batch_token_limit,
-                        replica.loaded_batch_token_limit,
                     ),
                     "loaded_batch_token_limit": replica.loaded_batch_token_limit,
+                    "observed_native_batch_tokens": replica.loaded_batch_token_limit,
+                    "observed_native_microbatch_tokens": replica.native_microbatch_tokens,
                     "tokenizer_build": replica.tokenizer_build,
                     "max_input_tokens": self._input_limit(replica=replica),
                     "loaded_context_length": replica.context_length,
@@ -1257,6 +1555,8 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                     call.stop.set()
             with self._discovery_lock:
                 self._scheduler.close()
+                self._preparation_executor.shutdown(wait=True, cancel_futures=True)
+                self._tokenizer_executor.shutdown(wait=True, cancel_futures=True)
                 if self._owns_client:
                     self._client.close()
             with self._calls_condition:

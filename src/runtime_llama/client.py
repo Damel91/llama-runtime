@@ -263,6 +263,7 @@ class _HTTPCall:
         self._close_started = False
         self._cleanup_started = Event()
         self._response_closed = Event()
+        self._drained = Event()
         self._closer: Thread | None = None
         self._worker: Thread
 
@@ -317,14 +318,16 @@ class _HTTPCall:
                 self._interrupt.detach()
                 unbind_interrupt(self._session, self._interrupt)
             self._client._release_session(self._session)
+        self._drained.set()
 
-    def _chunks(self) -> Iterator[bytes | str]:
+    def _chunks(self, *, json_body: bool = False) -> Iterator[bytes | str]:
         """Check stop between network reads, including a body that never ends.
 
         read1 returns available data after one underlying read instead of
-        waiting to fill a large buffer. Older urllib3 falls back to one-byte
-        iter_content. Finite HTTP read timeouts bound idle reads; disabled SSE
-        idle uses the call-owned socket interrupt for cancellation and closure.
+        waiting to fill a large buffer. Older urllib3 uses larger JSON reads
+        only when a call-owned interrupt can enforce cancellation and the
+        overall deadline even during a slow drip. SSE keeps one-byte fallback
+        reads so that a frame does not wait for a larger buffer to fill.
         """
         raw = getattr(self._response, "raw", None)
         read1 = getattr(raw, "read1", None)
@@ -335,7 +338,8 @@ class _HTTPCall:
                     return
                 yield chunk
         else:
-            for chunk in self._response.iter_content(chunk_size=1):
+            chunk_size = 65536 if json_body and self._interrupt is not None else 1
+            for chunk in self._response.iter_content(chunk_size=chunk_size):
                 if self._stop.is_set():
                     return
                 yield chunk
@@ -351,7 +355,7 @@ class _HTTPCall:
             and getattr(self._response, "raw", None) is not None
         ):
             body = bytearray()
-            for chunk in self._chunks():
+            for chunk in self._chunks(json_body=True):
                 if bound is not None and len(body) + len(chunk) > bound:
                     raise LLMBackendError("llama_server_json_response_too_large")
                 body.extend(chunk)
@@ -370,12 +374,14 @@ class _HTTPCall:
 
     def _signal_close(self) -> None:
         self._stop.set()
+        if self._drained.is_set():
+            return
         if self._interrupt is not None:
             # Shutdown precedes response.close(): a buffered read can otherwise
             # keep close waiting forever when the read timeout is disabled.
             self._interrupt.abort()
         with self._close_lock:
-            if self._cleanup_started.is_set():
+            if self._drained.is_set() or self._cleanup_started.is_set():
                 return
             self._cleanup_started.set()
             self._closer = Thread(
@@ -403,6 +409,15 @@ class _JSONCall(_HTTPCall):
 
     def __init__(self, *args: Any) -> None:
         super().__init__(*args)
+        if (
+            self._interrupt is None
+            and self._client._owns_session
+            and isinstance(self._client._session, requests.sessions.Session)
+        ):
+            # A bulk read can keep receiving a slow drip forever despite a
+            # finite per-recv timeout. The caller's finite JSON deadline must
+            # be able to interrupt that exact owned socket before draining it.
+            self._interrupt = RequestInterrupt(self._stop)
         self._done = Event()
         self._result: Any = None
         self._error: Exception | None = None
@@ -580,6 +595,7 @@ class LlamaCppClient:
         *,
         trust_env: bool = True,
         proxy_url: str | None = None,
+        connection_policy: str = "close",
     ) -> None:
         invalid_url = (
             "base_url must be an HTTP(S) server URL without "
@@ -609,6 +625,12 @@ class LlamaCppClient:
             raise ValueError(invalid_url) from None
         if not isinstance(trust_env, bool):
             raise ValueError("trust_env must be a boolean")
+        if not isinstance(connection_policy, str) or connection_policy not in {
+            "close",
+            "reuse",
+        }:
+            raise ValueError("connection_policy must be close or reuse")
+        self.connection_policy = connection_policy
         self.proxy_url = normalize_proxy_url(proxy_url)
         if self.proxy_url is not None and session is not None:
             raise ValueError("explicit proxy routing requires an owned session")
@@ -657,6 +679,18 @@ class LlamaCppClient:
     def _release_session(self, session: Any) -> None:
         if not self._owns_session:
             return
+        if self.connection_policy == "close":
+            # The request header alone is insufficient: a peer may omit the
+            # response header and send FIN after urllib3 has pooled the socket,
+            # or ignore the close request altogether. The exclusive reader has
+            # drained before release; clear its owned transport pools so the
+            # next lease opens a fresh connection without replay or retry.
+            try:
+                for adapter in tuple(getattr(session, "adapters", {}).values()):
+                    adapter.close()
+            except Exception:
+                self._close_session(session)
+                return
         with self._pool_lock:
             if not self._closed:
                 self._session_pool.append(session)
@@ -664,7 +698,12 @@ class LlamaCppClient:
         self._close_session(session)
 
     def _headers(self) -> dict[str, str]:
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "Connection": "close"
+            if self.connection_policy == "close"
+            else "keep-alive",
+        }
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
