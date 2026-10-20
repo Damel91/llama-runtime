@@ -9,12 +9,12 @@ import os
 import secrets
 from threading import BoundedSemaphore, Condition, Event, Lock
 import time
-from typing import Any, Literal, Sequence
+from typing import Any, AsyncIterable, Literal, Sequence
 
 from runtime_llama.client import ClientHTTPError, LlamaCppClient
 from runtime_llama._proxy import assert_client_proxy
 from runtime_llama.configuration import AdapterProfile, EmbeddingPrefixes
-from runtime_llama.contracts import EmbeddingAdapter
+from runtime_llama.contracts import CancellationProbe, EmbeddingAdapter
 from runtime_llama.errors import LLMBackendError, LLMCancelledError, LLMTimeoutError
 from runtime_llama.replica_discovery import (
     EmbeddingPool,
@@ -30,6 +30,11 @@ from runtime_llama.embedding_preparation import (
     PreparedEmbeddingInput,
     issue_preparation,
     valid_preparation,
+)
+from runtime_llama.embedding_stream import (
+    EmbeddingWindowStream,
+    _EmbeddingWindowBridge,
+    _close_embedding_adapter,
 )
 
 _USE_CACHED_CONTEXT = object()
@@ -222,6 +227,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         self._calls_lock = Lock()
         self._calls_condition = Condition(self._calls_lock)
         self._calls: set[_Call] = set()
+        self._async_window_bridge = None
         self._tokenizer_permits = BoundedSemaphore(self.token_count_parallelism)
         self._preparation_key = secrets.token_bytes(32)
         self._dimension_lock = Lock()
@@ -1301,6 +1307,84 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             inputs, operation="embed", timeout=timeout, cancel=cancel, call=call
         )
 
+    def _stream_bridge(self):
+        with self._calls_lock:
+            if self._closed or self._closing.is_set():
+                raise LLMBackendError("llamacpp_embedding_adapter_closed")
+            if self._async_window_bridge is None:
+                self._async_window_bridge = _EmbeddingWindowBridge(self)
+            return self._async_window_bridge
+
+    def _stream_call(self, cancel, timeout):
+        return _Call(self, cancel, timeout)
+
+    def _stream_execute(self, window, prepared, input_type, call):
+        call.check()
+        if prepared:
+            if any(
+                not valid_preparation(self._preparation_key, item) for item in window
+            ):
+                raise LLMBackendError("llamacpp_embedding_invalid_preparation")
+            inputs = window
+        else:
+            prefix = (
+                ""
+                if input_type == "raw"
+                else getattr(self._embedding_prefixes, input_type)
+            )
+            inputs = [(prefix + text, input_type) for text in window]
+        if not inputs:
+            return []
+        return self._execute(
+            inputs, operation="embed", timeout=None, cancel=call.cancel, call=call
+        )
+
+    def astream_texts(
+        self,
+        windows: AsyncIterable[Sequence[str]],
+        *,
+        input_type: Literal["document", "query", "raw"] = "document",
+        max_pending_windows: int = 2,
+        timeout: float | None = None,
+        cancel: CancellationProbe | None = None,
+        close_source: bool = False,
+    ) -> EmbeddingWindowStream:
+        """Return inert async intake over the same shared embedding scheduler."""
+        self._validate_task(input_type)
+        return EmbeddingWindowStream(
+            self,
+            windows,
+            input_type=input_type,
+            max_pending_windows=max_pending_windows,
+            timeout=timeout,
+            cancel=cancel,
+            close_source=close_source,
+        )
+
+    def astream_prepared(
+        self,
+        windows: AsyncIterable[Sequence[PreparedEmbeddingInput]],
+        *,
+        max_pending_windows: int = 2,
+        timeout: float | None = None,
+        cancel: CancellationProbe | None = None,
+        close_source: bool = False,
+    ) -> EmbeddingWindowStream:
+        """Stream same-adapter preparations without a separate HTTP engine."""
+        return EmbeddingWindowStream(
+            self,
+            windows,
+            prepared=True,
+            max_pending_windows=max_pending_windows,
+            timeout=timeout,
+            cancel=cancel,
+            close_source=close_source,
+        )
+
+    async def aclose(self) -> None:
+        """Drain async intake/source ownership, then shared HTTP work off-loop."""
+        await _close_embedding_adapter(self)
+
     def prepare_texts(
         self,
         texts: Sequence[str],
@@ -1551,10 +1635,15 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             with self._calls_lock:
                 self._closed = True
                 self._closing.set()
+                bridge = self._async_window_bridge
                 for call in self._calls:
                     call.stop.set()
+            if bridge is not None:
+                bridge.signal_close()
             with self._discovery_lock:
                 self._scheduler.close()
+                if bridge is not None:
+                    bridge.shutdown()
                 self._preparation_executor.shutdown(wait=True, cancel_futures=True)
                 self._tokenizer_executor.shutdown(wait=True, cancel_futures=True)
                 if self._owns_client:

@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 import math
 from typing import (
     Any,
+    AsyncIterable,
     Callable,
     Dict,
     Iterator,
@@ -34,6 +35,7 @@ from runtime_llama.usage import (
     LLMUsageStats,
 )
 from runtime_llama.embedding_preparation import PreparedEmbeddingInput
+from runtime_llama.embedding_stream import EmbeddingWindowStream
 from runtime_llama.logging import get_logger
 from runtime_llama.mcp import (
     MCPCallResult,
@@ -820,6 +822,39 @@ class EmbeddingAdapter(ABC):
 
     def load(self) -> bool:
         return self.is_ready()
+
+    def astream_texts(
+        self,
+        windows: AsyncIterable[Sequence[str]],
+        *,
+        input_type: Literal["document", "query", "raw"] = "document",
+        max_pending_windows: int = 2,
+        timeout: Optional[float] = None,
+        cancel: Optional[CancellationProbe] = None,
+        close_source: bool = False,
+    ) -> EmbeddingWindowStream:
+        """Optional bounded asynchronous window API; sync implementations remain valid."""
+        raise NotImplementedError
+
+    def astream_prepared(
+        self,
+        windows: AsyncIterable[Sequence[PreparedEmbeddingInput]],
+        *,
+        max_pending_windows: int = 2,
+        timeout: Optional[float] = None,
+        cancel: Optional[CancellationProbe] = None,
+        close_source: bool = False,
+    ) -> EmbeddingWindowStream:
+        """Optional asynchronous intake of already prepared windows."""
+        raise NotImplementedError
+
+    async def aclose(self) -> None:
+        """Optional async lifecycle without adding abstract requirements."""
+        import asyncio
+
+        close = getattr(self, "close", None)
+        if callable(close):
+            await asyncio.to_thread(close)
 
     @abstractmethod
     def is_ready(self) -> bool:
