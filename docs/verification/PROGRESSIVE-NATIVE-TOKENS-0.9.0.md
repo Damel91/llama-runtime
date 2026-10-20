@@ -153,6 +153,52 @@ or universal throughput improvement.
 
 ## Artifact and evidence binding
 
+### Repeat with the orchestrator reported inactive
+
+A subsequent opt-in execution on the same date repeated the unchanged controller,
+corpus, settings and numerical thresholds after the operator reported stopping
+the orchestrator. The final clean-installed 0.9.0 wheel was used. Loaded model
+profiles remained unchanged; no server, model, consumer or library code was
+modified for this repeat.
+
+| Same 511-document phase | Baseline 0.8.0 | Candidate 0.9.0 |
+| --- | ---: | ---: |
+| Wall time | 3.813 s | 3.988 s |
+| Embedding / tokenize / metadata requests | 4 / 511 / 26 | 14 / 511 / 46 |
+| First tokenize start to first embedding start | 1.275 s | 0.537 s |
+| Preparation interval union | 2.725 s | 3.584 s |
+| Global/per-alias embedding HTTP peak | 2 / 1 | 2 / 1 |
+
+The candidate dispatched ten partial batches before their quota producers
+finished. Its requests contained 17 to 51 texts, demonstrating the configurable
+coalescing tradeoff rather than a changed total text budget. It was 0.175 seconds
+(4.58%) longer in this single adjacent pair, while starting embedding earlier.
+This repeat demonstrates no total-throughput improvement at the default
+coalescing setting on this workload.
+
+All 511 ordered A/B outputs were identical; canary and 33 discriminant checks
+passed at unchanged thresholds. The independent offline audit also verified
+the full token sequences, 1,041 same-response projections, bounded admission and
+complete drainage. The whole qualification used 33 embedding POSTs, 1,046
+tokenizations and 268 metadata GETs within 12.626 seconds.
+
+Both document times returned to approximately four seconds, versus the previous
+8.303/7.844-second pair and the historical 4.209-second 0.8.0 observation.
+This is consistent with the reported concurrent orchestrator having affected
+the earlier measurements. Its inactive state is an operator report, not an
+independent GPU utilization/clock/power measurement; remote caches and ordering
+remain uncontrolled. It does not establish an exact causal contribution or
+GPU-only time.
+
+The repeat's private result SHA-256 is
+`8b8010e0c13e9b62343428e02db0e5b79e499f300c3894c0bf0f99c5346ec39a`;
+its ordered A/B comparison is
+`cf9a47a145f37fe434f9b3531b0d0a7a6fe6963c4dc3fc79b9a0d7f7420dbcbd`.
+The original local artifacts and their checksums remain unchanged; this is
+additional verification evidence.
+
+### Original artifact binding
+
 Tested implementation/test revision:
 `e0333dd410c83ce39fc1827d0c2a738c62ef7ecd`.
 The live-qualified initial 0.9.0 wheel SHA-256 was
