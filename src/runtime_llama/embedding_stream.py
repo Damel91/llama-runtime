@@ -197,6 +197,7 @@ class EmbeddingWindowStream:
         self._close_source = close_source
         self._loop = self._bridge = self._iterator = None
         self._producer = self._pull = self._pull_call = None
+        self._pull_lease = False
         self._cleanup_task = self._changed = None
         self._pending = deque()
         self._stop = Event()
@@ -271,7 +272,6 @@ class EmbeddingWindowStream:
         return self._pull.result()
 
     async def _produce(self):
-        lease = False
         try:
             while not self._stop.is_set():
                 changed = self._changed
@@ -281,7 +281,7 @@ class EmbeddingWindowStream:
                 call = self._adapter._stream_call(self._cancel, self._timeout)
                 self._pull_call = call
                 await self._bridge.acquire(call)
-                lease = True
+                self._pull_lease = True
                 self._pull = asyncio.ensure_future(anext(self._iterator))
                 try:
                     value = await self._wait_pull(call)
@@ -304,7 +304,7 @@ class EmbeddingWindowStream:
                 )
                 wrapped = asyncio.wrap_future(future, loop=self._loop)
                 self._pending.append(_Window(call, wrapped))
-                lease = False
+                self._pull_lease = False
                 self._pull = self._pull_call = None
                 wrapped.add_done_callback(self._completed)
                 self._notify()
@@ -312,8 +312,11 @@ class EmbeddingWindowStream:
             if not self._stop.is_set():
                 self._fail(exc)
         finally:
-            if lease:
+            if self._pull_lease and (self._pull is None or self._pull.done()):
+                self._pull_lease = False
                 self._bridge.release()
+            # A cancelled source pull can still be executing its async finally.
+            # Cleanup owns that lease until the actual pull task has drained.
             self._pull_call = None
             self._notify()
 
@@ -344,6 +347,9 @@ class EmbeddingWindowStream:
             owned = [item for item in (self._pull, self._producer) if item is not None]
             if owned:
                 await asyncio.gather(*owned, return_exceptions=True)
+            if self._pull_lease:
+                self._pull_lease = False
+                self._bridge.release()
             if self._pending:
                 await asyncio.gather(
                     *(asyncio.shield(item.future) for item in self._pending),
