@@ -6,16 +6,19 @@ server, model or device configuration.
 
 ## Embedding and external replicas
 
-`embedding_request_parallelism` limits active embedding jobs across an adapter
-and defaults to 1. `embedding_queue_size` bounds waiting jobs and defaults to
-16; zero permits only active capacity. Admission applies backpressure to
-callers. These budgets are shared by all callers of the adapter.
+In the local 0.7.0 candidate, `embedding_request_parallelism` limits active
+embedding HTTP batch jobs across an adapter. Its default is 4 with automatic
+replica discovery and 1 otherwise. `embedding_queue_size` bounds waiting jobs
+and defaults to 16; zero permits only active capacity. Admission applies
+backpressure to callers. These budgets are shared by all callers of the adapter.
 
 `batch_size` limits the total texts in one distribution window, with balanced
-quotas assigned to distinct aliases. `batch_token_limit`, together with the
-observed native batch limit, bounds aggregate tokens in each HTTP request.
-Context limits apply to individual inputs. A quota can require several HTTP
-requests. `token_count_parallelism` is a global adapter limit, including public
+quotas assigned to distinct aliases. Explicit adapter and per-replica
+`batch_token_limit` settings bound aggregate tokens in each HTTP request.
+Native `n_batch`/`n_ubatch` are execution observations, not aggregate HTTP limits.
+Context limits apply to individual inputs; an unpublished backend splitting
+capability stays unknown. A quota can require several HTTP requests.
+`token_count_parallelism` is a global adapter limit, including public
 preparation. Results preserve input order and cardinality exactly.
 
 `embedding_replicas` explicitly lists destinations on the same endpoint. Each
@@ -26,10 +29,25 @@ per-replica limits. Alias suffixes do not identify devices; the server operator
 controls processes, loading and device assignment. Automatic discovery has
 its own attestation rules in [replica discovery](AUTOMATIC-EMBEDDING-REPLICAS.md).
 
-A job selects a replica, observes its properties and tokenizes/packs inputs for
-that destination. Adaptive splitting after a recognized capacity error stays
-on the same replica and does not replay successful batches. Configured and
-observed limits remain distinguishable; an absent property remains unknown.
+Loaded `total_slots` caps per-replica HTTP concurrency together with global and
+configured per-replica ceilings. Unknown slot capacity falls back to one;
+observed slots are not currently idle slots or a GPU speed guarantee.
+Reductions drain already admitted work, and increases can admit additional
+ready batches. Topology replacement remains a separate drained boundary.
+
+Preparation uses reused executors and globally bounded quota lookahead rather
+than occupying the inference scheduler through tokenization. A lease remains
+held while its quota is preparing, ready or awaiting its last HTTP cleanup.
+Only ready batch jobs enter the one embedding scheduler. Nonblocking admission
+can skip a busy alias to let another ready alias advance; FIFO applies within
+an alias to admitted jobs. There is no second embedding scheduler.
+
+Identity, tokenizer build and limits are observed again after waiting and at
+actual batch boundaries. Stable limits require linear admission passes; a
+changed limit revalidates pending inputs. Adaptive splitting after a recognized
+capacity error stays on the same replica, revalidates pending children and
+does not replay completed inputs. Configured and observed limits remain
+distinguishable; an absent property remains unknown.
 Dimensions and normalization are validated before publishing the complete
 result. Failure stops new submissions for the affected call and drains its
 already started work without cancelling independent calls.
@@ -40,12 +58,16 @@ model identity.
 
 ## Transport ownership and closure
 
-Concurrent client requests use owned sessions with exclusive leases. Keep-alive
-reuse occurs after consuming and closing the response. Dispatch through an
-injected, borrowed session is protected. Active JSON and SSE requests are
-tracked. Embedding cancellation retains its admission permit until HTTP cleanup
-finishes so that active work is not undercounted. Adapter `close()` drains its
-scheduler and owned resources.
+Concurrent client requests use owned sessions with exclusive leases and
+separate active HTTP connections. The 0.7.0 candidate defaults owned requests to
+`http_connection_policy="close"`; explicit `"reuse"` permits keep-alive after
+the response has been consumed and closed. An injected, borrowed session stays
+under its caller's ownership and its dispatch is protected. Active JSON and
+SSE requests are tracked. Embedding cancellation retains its admission permit
+until local HTTP cleanup finishes so that active work is not undercounted.
+Adapter `close()` drains its scheduler, preparation and owned resources.
+See [native HTTP transport](NATIVE-HTTP.md) for connection policy, upstream
+compatibility and the native transport verification boundary.
 
 Embedding and preparation calls apply a finite overall deadline to queueing,
 discovery and HTTP work. Closure can wait for transport cleanup; it does not

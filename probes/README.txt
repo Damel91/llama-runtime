@@ -160,11 +160,14 @@ Contratti embedding: budget totale e preparazione esatta
 
 --install sceglie un'installazione wheel esterna al checkout. Il profilo limitato
 richiede due repliche caricate con identita' verificata, dimensione 768,
-contesto 2048, batch 2048, uno slot e Flash Attention on. Si ferma se il profilo
+contesto 2048, batch nativo 2048, uno slot e Flash Attention on. Si ferma se il profilo
 cambia; non lo amministra. Massimo 551 output sintetici: finestra 256, caller
 concorrenti 255 + 3 query,32 riferimenti diretti, confine 2048/2049 e paritytask.
 Registra tokenizzazioni, richieste embedding, metadata, payload e overlap HTTP,
 preparazione/wall time e cleanup; non sono misure GPU pure. Riutilizzo dei conteggi,
-ordine, nessun HTTP oversize, proiezione raw e soglie numeriche rimangono rigorosi.
+ordine, rifiuto di input oversize, proiezione raw e soglie numeriche rimangono rigorosi.
+La finestra 256 deve usare due POST da 128 testi con somma token superiore a
+2048: il batch nativo non e' un tetto aggregato HTTP. Nessun batch_token_limit
+esplicito viene configurato da questa prova. I limiti pubblici devono rifletterlo.
 Il .http.jsonl conserva hash dei testi/vettori e metadata compatti, non bulk vettori.
 Usare un nome output nuovo per ogni run e conservare manifest e hash wheel.

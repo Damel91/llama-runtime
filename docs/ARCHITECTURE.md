@@ -374,3 +374,25 @@ embedding mantengono timeout finiti; resta valido l'opt-in SSE senza idle.
 Coprire attese, limiti ridotti, topologia e identità cambiate, resti e più
 caller. Il confronto live di prestazioni e le modifiche al runtime restano da eseguire nel proprio
 ambito; questa indagine non modifica consumer, modelli o servizi.
+
+
+## Implementazione candidata 0.7.0 — continuazione dell’indagine
+
+Il piano sopra è stato implementato nel ciclo Flower BOOT-000008, packet
+PACKET-000010 (requisiti REQ-000011–REQ-000014). La sezione precedente conserva
+la diagnosi della baseline; non descrive lo stato del codice candidato.
+
+La policy HTTP predefinita `close` usa connessioni indipendenti senza patch o
+retry. Il limite HTTP aggregato deriva solo dalla policy esplicita, mentre
+`n_batch` e `n_ubatch` restano osservazioni native. Uno scheduler ammette batch
+pronti, con preparazione anticipata limitata globalmente e capacità osservate.
+La rivalidazione dopo attese e durante il recupero conserva identità, build,
+limiti e risultati già completati. Il conteggio pubblico rimane esatto e
+riutilizzabile; i record interni evitano sigilli non consegnati. Sono inclusi
+M01, G01–G03, E01–E05, T01–T02 e la pulizia C01 limitata a questo percorso.
+
+[Contratti embedding](EMBEDDING-CONTRACTS.md) e
+[policy HTTP/timing nativi](NATIVE-HTTP.md) descrivono le API. La
+[verifica locale 0.7.0](verification/LOCAL-NATIVE-0.7.0.md) riporta le prove
+realmente eseguite e distingue il trasporto nativo locale dall’inferenza remota.
+Nessuna modifica ai consumer o amministrazione del runtime fa parte del ciclo.

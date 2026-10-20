@@ -1,16 +1,17 @@
-# Contratto di integrazione — runtime-llama 0.5.1
+# Contratto di integrazione — candidata locale runtime-llama 0.7.0
 
 La libreria usa il `llama-server` scelto dal consumer, locale o remoto.
 Il gestore del server possiede build, processo, pesi, dispositivi, contesto e
-slot. La libreria non avvia processi e non modifica i profili di caricamento.
+slot. La libreria non avvia `llama-server` e non modifica i profili di caricamento.
 Il consumer possiede l'esecuzione dei tool e la continuazione della conversazione.
 
 Questo documento descrive API e responsabilità. Tutti gli alias, endpoint e
 limiti degli esempi sono illustrativi: sostituirli con la propria configurazione.
 Il repository si chiama `llama-runtime`; distribuzione `runtime-llama` e import
-`runtime_llama` restano compatibili. La versione `0.5.0` aggiunge la discovery
-pubblica tipizzata, conservando le API esistenti di generazione ed embedding.
-Non dichiara una nuova qualifica live.
+`runtime_llama` restano compatibili. La candidata locale `0.7.0` conserva le API
+pubbliche di generazione, discovery e preparazione embedding. Le modifiche
+descritte qui non dichiarano una release pubblicata, una nuova qualifica live
+o una migrazione dei consumer.
 
 ## Connessione e disponibilità
 
@@ -40,7 +41,10 @@ controlla prima il catalogo e richiede alias già caricati.
 
 API key opzionale con `api_key_env` o `api_key`; preferire la variabile d'ambiente.
 TLS verificato per default. Non inserire credenziali nell'URL. Il client non
-segue redirect né ripete automaticamente una richiesta fallita.
+segue redirect né ripete automaticamente una richiesta fallita. La candidata
+`0.7.0` usa `http_connection_policy="close"` per le richieste owned; la policy
+esplicita `"reuse"` richiede un endpoint con keep-alive verificato. Contratto e
+confini della verifica sono in [NATIVE-HTTP.md](NATIVE-HTTP.md).
 
 ## Catalogo pubblico read-only
 
@@ -99,12 +103,15 @@ hash del percorso. Non servono porte aggiuntive o patch del binario. Un server
 precedente senza tag può servire un alias preciso come singola istanza non
 verificata; non permette di formare automaticamente un pool verificato.
 
-In modalità automatica ogni alias ha tetto fisso di una richiesta attiva.
-`embedding_request_parallelism`, se omesso, vale 4 come bound globale; il
-numero di repliche disponibili limita il parallelismo effettivo. Un valore
-esplicito resta un tetto, non il numero di modelli da caricare. Senza discovery
-il default storico resta 1. `embedding_queue_size` mantiene la coda limitata.
-Non combinare discovery con `embedding_replicas` esplicite.
+Il tetto HTTP per alias deriva dagli slot positivi osservati (`total_slots`),
+limitati dal tetto globale e dall'eventuale `max_in_flight` configurato per
+replica. Slot ignoti o malformati ammettono una sola richiesta. Gli slot sono
+capacità caricata, non disponibilità istantanea o prova di calcolo GPU parallelo.
+`embedding_request_parallelism`, se omesso, vale 4 con discovery e 1 senza.
+Resta un tetto client, non il numero di modelli da caricare. Una stessa quota
+può usare più slot verificati attraverso batch HTTP distinti.
+`embedding_queue_size` mantiene la coda limitata. Non combinare discovery con
+`embedding_replicas` esplicite.
 
 L'identità verificata si fissa per la vita dell'adapter. I cambi di topologia
 vengono osservati dal catalogo; una sostituzione dei pesi non viene interpretata
@@ -133,10 +140,14 @@ differiscono al massimo di uno. Più finestre condividono la stessa coda.
 Mantenere `batch_size=8` limita la finestra a otto testi complessivi; per le
 finestre consumer da 256 configurare 256. Non è un limite token o un contesto.
 
-Ogni quota può produrre più HTTP. Il packing usa il minimo dei budget token
-configurati e del batch nativo osservato sul processo caricato, distinto da
-contesto e microbatch. Un input sopra un budget noto non viene inviato da solo
-come eccezione. Non viene troncato né spezzato dalla libreria.
+Ogni quota può produrre più HTTP. Il packing usa il minimo dei soli
+`batch_token_limit` configurati sull'adapter e sulla replica; se entrambi
+mancano, il limite token aggregato client resta ignoto. `n_batch` e `n_ubatch`
+nativi sono osservazioni dell'esecuzione, distinte dal contesto per input e
+dal budget della richiesta HTTP. La libreria non deduce da questi numeri una
+capacità universale di spezzare internamente un input. Un input sopra un limite
+verificabile non viene inviato da solo come eccezione. Non viene troncato né
+spezzato; altri limiti del backend possono ancora produrre un errore tipizzato.
 
 ```python
 prepared = embedding.prepare_texts(texts, input_type="document", timeout=120)
@@ -162,11 +173,28 @@ stesso adapter si riusano se identità dei pesi, semantica e policy del tokenize
 sono verificate; un record alterato/estraneo viene rifiutato. Un fallback senza
 attestazione o una build tokenizer ignota riconteggia. Il record non mantiene lease o processi attivi.
 
-Preparazione e inferenza condividono scheduler e limiti di ammissione.
-`token_count_parallelism` è un tetto globale per adapter. Il timeout è una
-deadline complessiva della chiamata, incluse coda e preparazione; ogni HTTP usa
-il tempo residuo. Cleanup e chiusura restano drenati e possono attendere il
-trasporto. Nessuna garanzia sull'arresto immediato del calcolo remoto.
+Preparazione e inferenza mantengono finestre e quote comuni. Executor di
+preparazione e tokenizzazione sono riusati; `token_count_parallelism` è un tetto
+globale per adapter. Il lookahead è limitato globalmente a
+`embedding_request_parallelism + embedding_queue_size` quote, trattenute fino
+alla fine della preparazione pubblica o all'ultimo cleanup HTTP della quota.
+Questo consente di preparare quote successive durante l'inferenza, senza
+occupare uno slot embedding durante la tokenizzazione. È un limite ai dati
+intermedi anticipati, non alla memoria dell'intero input/output del consumer.
+
+Il percorso ordinario usa record contati interni senza buste HMAC inutili.
+`prepare_*` emette i record pubblici sigillati; `embed_prepared` li verifica e
+non li risigilla. Conteggi duplicati si condividono solo entro un'osservazione
+con identità, build tokenizer e task verificabili. Dopo attese e prima di ogni
+batch o figlio adattivo, la libreria osserva nuovamente identità, build e limiti;
+un limite cambiato rivalida i rimanenti, senza invalidare risultati completati.
+Le osservazioni non sono una lease sul server né una transazione atomica tra
+GET e POST.
+
+Il timeout è una deadline complessiva della chiamata, incluse coda e
+preparazione; ogni HTTP usa il tempo residuo. Cleanup e chiusura restano drenati
+e possono attendere il trasporto. Nessuna garanzia sull'arresto immediato del
+calcolo remoto.
 
 Firme e criteri completi: [contratti embedding](EMBEDDING-CONTRACTS.md).
 
@@ -208,9 +236,9 @@ Gli alias sono identificatori HTTP espliciti; il suffisso non prova l'identità
 dei pesi o del dispositivo. Verificare equivalenza e configurazione prima di
 usarli come repliche intercambiabili. Non si configurano GPU tramite il client.
 
-Il numero di slot server resta indipendente dai tetti HTTP del client:
-l'esempio consente quattro lavori globali e due per alias; il server può
-eseguirli con una capacità diversa. Slot, contesto, batch, microbatch, backend
+I tetti dell'esempio consentono fino a quattro batch HTTP globali e due per
+alias, ulteriormente limitati dagli slot caricati osservati; slot ignoti
+mantengono un solo batch attivo per alias. Slot, contesto, batch, microbatch, backend
 hardware e configurazione del processo possono influire sull'equivalenza
 numerica osservata. Verificare lo stesso corpus su ogni replica e sul pool con
 una tolleranza dichiarata; l'identità dei pesi non garantisce da sola risultati
@@ -219,17 +247,20 @@ differenza a un kernel specifico quando cambiano insieme più parametri.
 Le impostazioni del processo restano al gestore e non sono tutte attestabili
 dai soli endpoint HTTP.
 
-`embedding_request_parallelism` limita globalmente i lavori attivi nello stesso
-adapter, anche fra più chiamanti. Il lavoro mantiene il proprio posto durante
-osservazione `/props`, tokenizzazione, packing e richieste embedding. I tetti
-per alias si applicano all'interno di questo limite. Il routing sceglie a turno
-alias distinti per finestra e conserva l'affinità delle quote; non trasferisce automaticamente su un'altra replica
-un lavoro fallito. Adapter distinti hanno scheduler distinti.
+`embedding_request_parallelism` limita globalmente i batch HTTP pronti ammessi
+nello stesso adapter, anche fra più chiamanti. Preparazione e tokenizzazione
+hanno ammissione separata e limitata; le richieste pronte passano dallo stesso
+scheduler embedding. I tetti per alias si applicano all'interno del limite
+globale. Il routing sceglie a turno alias distinti per finestra e conserva
+l'affinità delle quote; non trasferisce automaticamente un lavoro fallito su
+un'altra replica. Adapter distinti hanno scheduler distinti.
 
 `embedding_queue_size` limita i lavori ammessi in attesa; zero applica attesa
-diretta prima dell'ammissione. Una coda piena applica backpressure al chiamante.
-Il default mantiene una sola richiesta attiva, senza introdurre concorrenza
-nelle configurazioni esistenti. `token_count_parallelism` è un controllo
+diretta prima dell'ammissione. Lo scheduler può provare un altro alias pronto
+quando il primo è occupato, senza bloccare il coordinatore e senza seconda
+coda embedding. Una coda piena applica backpressure al chiamante.
+Senza discovery il default mantiene una sola richiesta attiva;
+`token_count_parallelism` è un controllo
 separato: non è il numero di richieste embedding né di slot GPU.
 
 ## Embedding: prefissi per modello e intento
@@ -303,7 +334,8 @@ senza certificare l'identità semantica dell'indice o dei prefissi.
 ## Embedding: limiti e integrità
 
 `batch_size` è il massimo totale di testi per finestra; `batch_token_limit`
-limita i token complessivi per richiesta HTTP, insieme al batch nativo noto.
+limita i token complessivi per richiesta HTTP mediante configurazione esplicita,
+senza usare `n_batch` o `n_ubatch` come tetti aggregati.
 Ogni input resta indivisibile ed è confrontato con il minimo dei limiti di
 contesto e dei budget richiesta noti. Un input che supera da solo un budget
 noto viene rifiutato prima dell'invio, senza eccezioni singleton.
@@ -319,8 +351,10 @@ senza restituire un risultato parziale come completo. Gli altri chiamanti
 mantengono il proprio stato di cancellazione.
 
 Solo HTTP 400 con tipo strutturato `exceed_context_size_error` autorizza lo
-split adattivo del batch fallito sulla stessa replica. Le parti riuscite non
-vengono ripetute. Un singolo input eccessivo e gli altri errori propagano.
+split adattivo del batch fallito sulla stessa replica. Ogni figlio riapre il
+confine di osservazione e verifica tutti gli input ancora pendenti, inclusi
+gli altri figli già misurati; le parti riuscite non vengono ripetute. Un singolo
+input eccessivo e gli altri errori propagano.
 
 ## Thinking diagnostico, esplicitamente abilitato
 

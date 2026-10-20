@@ -1,10 +1,9 @@
 # Embedding contracts and public preparation
 
-This guide describes implemented embedding semantics and their verification
-boundary. Version 0.4.1 preserves the inference and embedding behavior of
-0.4.0. It does not introduce a new live qualification or establish consumer
-acceptance. See [verification requirements](REQUIREMENTS.md) for the public
-checks.
+This guide describes embedding semantics in the local 0.7.0 candidate and their
+verification boundary. It does not declare a published 0.7.0 release, a new live
+qualification or consumer acceptance. See
+[verification requirements](REQUIREMENTS.md) for the public checks.
 
 ## Total text budget, distribution and integrity
 
@@ -18,17 +17,35 @@ a consumer wanting windows of 256 must configure 256.
 
 Each quota remains affine to its selected alias and can require several HTTP
 requests. Text count, individual input context and aggregate HTTP token budget
-are distinct limits. The effective HTTP budget is the minimum of known
-configured and native limits. No request exceeds it, including a single
-indivisible input. Native microbatch size does not replace batch size. Missing
-limits remain unknown.
+are distinct limits. The effective HTTP token budget is the minimum of the
+explicitly configured adapter and per-replica `batch_token_limit` values. No
+request exceeds that budget, including a single indivisible input. If neither
+value is configured, the aggregate client HTTP token limit is unknown.
+
+Native `n_batch` and `n_ubatch` describe execution batch and microbatch sizes.
+They are retained as observations, not converted into aggregate HTTP limits.
+Loaded context and configured input ceilings bound individual inputs. Whether
+a backend/model can split one input internally is not inferred from these
+sizes; an unpublished capability remains unknown. A server can still reject
+an input that fits the limits the client can verify, and its typed error is
+preserved. No text is truncated or split by the library.
 
 The path preserves order/cardinality, cancellation, finite overall deadlines,
 typed errors, content and semantic identity, frozen active topology, draining
 and all-or-error result publication. Successful quotas are not replayed. The
-scheduler can pass a job blocked on another alias while preserving FIFO within
-an alias for admitted jobs. `embedding_queue_size=0` applies backpressure
-without a second job queue.
+scheduler admits ready HTTP batch jobs, rather than holding an inference slot
+through tokenization of an entire quota. A quota can have multiple ready
+batches in flight when its verified slot capacity permits. The same scheduler
+can pass a job blocked on another alias while preserving FIFO within an alias
+for admitted jobs. Its nonblocking admission lets the coordinator try other
+ready aliases, including with `embedding_queue_size=0`, without introducing a
+second embedding scheduler.
+
+Effective per-replica concurrency is bounded by positive observed
+`total_slots`, the adapter's global ceiling and an explicit per-replica ceiling
+when configured. Unknown or malformed slot observations fall back to one;
+additional capacity is not assumed. Slot counts describe loaded capacity,
+not currently idle slots or simultaneous GPU execution.
 
 ## Exact public preparation
 
@@ -48,11 +65,29 @@ an alias/topology change alone does not change the count. An unverified fallback
 or unknown tokenizer build requires recounting. There is no unbounded record
 registry or cache.
 
-Preparation and inference share the scheduler, windows and quotas.
-`token_count_parallelism` is global to the adapter. Bulk admission, waits and
-HTTP calls are bounded, cancellable and covered by an overall deadline.
-`close()` drains preparation and HTTP cleanup as well as inference. Preparation
-does not create a second embedding scheduler.
+Preparation retains the same windows, quota affinity and exact token policy.
+The adapter reuses separate preparation and tokenizer executors;
+`token_count_parallelism` and pending tokenizer admission are global across its
+callers. Lookahead is bounded globally to
+`embedding_request_parallelism + embedding_queue_size` quota leases, held
+through preparation, ready work and the quota's last HTTP cleanup. Preparation
+of subsequent quotas can overlap active inference. This limits intermediate
+lookahead, not the memory occupied by the caller's full input and result.
+
+The normal embedding path uses internal counted records without serializing
+or signing public preparation envelopes. Only `prepare_*` emits sealed public
+records; `embed_prepared` verifies them without signing them again. Exact
+duplicates can share counts inside a verified identity/build/task observation;
+unverified identity or an unknown tokenizer build does not authorize reuse.
+
+Admission observes loaded identity and limits after waits and before each
+actual batch, including adaptive children. Local validation shares each
+boundary's observation rather than performing hidden duplicate catalog reads.
+After a limit changes, remaining inputs are revalidated without invalidating
+already completed inputs. A changed tokenizer build rejects stale counts.
+These observations are not a server-side lease or atomic GET-and-POST
+transaction. Bulk work and waits are cancellable under a finite overall
+deadline; `close()` drains preparation and HTTP cleanup as well as inference.
 
 ## Public API
 
@@ -72,12 +107,16 @@ properties report fit against the available limits. Unknown limits remain
 coercion. `prepare_query("")` measures prefix and special tokens, while
 `embed_query("")` retains its historical `[]` result.
 
-Native batch capacity is observed from supported metadata and structured
-arguments on the verified loaded entry (`--batch-size`, `--batch-size=`, `-b`).
-Malformed, duplicated or conflicting values are rejected. Capacity is not
-inferred from paths, free-form presets, microbatch size or training context.
-Loaded context and training context are distinct. The client performs no
-server administration.
+Native execution sizes are observed from supported metadata and structured
+arguments on the verified loaded entry (`--batch-size`, `--batch-size=`, `-b`,
+`--ubatch-size`, `--ubatch-size=`, `-ub`). Malformed, duplicated or conflicting
+supported values are rejected. Diagnostic `observed_native_batch_tokens` and
+`observed_native_microbatch_tokens` expose these values; the compatibility key
+`loaded_batch_token_limit` also refers to native `n_batch`, not an HTTP budget.
+Sizes are not inferred from paths, free-form presets or training context.
+Loaded context and training context are distinct. The client performs no server
+administration. See [native HTTP transport](NATIVE-HTTP.md) for connection
+policy and its separate verification boundary.
 
 The overall deadline starts at call entry and covers queueing, discovery,
 preparation and HTTP. Cleanup can require transport timeouts to complete;

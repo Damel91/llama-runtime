@@ -32,16 +32,16 @@ The project's engineering lifecycle is managed with
 | Structured output | JSON output mode and JSON schema forwarding, subject to the server build and model's support. |
 | Reasoning | Separate reasoning output, configurable reasoning policies and removal of inline thinking from visible text. |
 | Tool calls | Tool definitions and choice controls, streamed argument assembly, complete structured calls and correlation with tool results. |
-| Usage and outcomes | Token counters, terminal reasons and bounded transport metadata; unavailable counters remain unknown. |
+| Usage and outcomes | Token counters, terminal reasons, bounded transport metadata and optional typed native server timings; unavailable counters remain unknown. |
 | Embeddings | Query, document and raw input modes; optional normalization; validates result order, cardinality, vector dimensions and finite values. |
 | Task-aware preparation | Configurable model-specific query/document prefixes and exact server tokenization, including special tokens; measures oversized inputs and safely reuses verified counts. |
-| Batching | Configurable total text windows, balanced quotas across usable replicas and HTTP packing within known input/context and aggregate token budgets. Inputs are never silently truncated. |
+| Batching | Configurable total text windows, balanced quotas across usable replicas and HTTP packing within known input/context and explicitly configured aggregate token budgets; native computation batch sizes remain separate. Inputs are never silently truncated. |
 | Replica discovery | Explicit aliases or automatic discovery using content and semantic identity tags from a compatible server manager; identity pinning and bounded topology refresh. |
-| Shared concurrency | Per-adapter global and per-replica admission, bounded queues, backpressure, separate tokenizer limits and ordered results across concurrent callers. Each automatic replica admits one active embedding request. |
+| Shared concurrency | Per-adapter global and per-replica admission, bounded queues, backpressure, separate tokenizer limits and ordered results across concurrent callers. Effective admission is bounded by observed slots and configured global/per-replica limits; unknown capacity falls back to one. |
 | Lifecycle and errors | Typed backend, timeout, cancellation and runaway errors; cooperative cancellation, repetition protection and drained embedding shutdown. Embedding calls have overall deadlines; generation supports bounded HTTP and stream-idle waits. |
 | Optional stream idle | Explicit `stream_idle_timeout_sec=None` waits through quiet prefill; connection/JSON budgets remain finite, with per-request socket interruption for Stop and drained close. |
 | Diagnostics | Optional bounded thinking capture, invocation correlation and final diagnostic sinks, including interrupted calls. |
-| HTTP access | Authentication and TLS verification, raw requests and helpers for chat/completion, embeddings, tokenization/detokenization, health, server properties and model catalogs. |
+| HTTP access | Works with native unpatched llama-server using independent connections by default; explicit keep-alive opt-in, authentication, TLS verification and raw endpoint helpers. |
 | Read-only model catalog | Typed observations of catalog entries and proven loaded models, explicit capability unknowns, identity tags and context provenance; bounded GET-only discovery without model loading. |
 | Optional embedded VPN client | A separately built Go tsnet helper for Tailscale or Headscale, with consumer-owned configuration, authenticated loopback proxy, verified peer routing, TLS and bounded teardown; no system VPN installation. |
 | MCP data contracts | Validated integration, call, event and result types for consumer-managed MCP execution. |
@@ -52,6 +52,16 @@ server build, model and chat template. Responses are not locally validated
 against the forwarded JSON Schema. Splitting source documents and tracking their
 fragments belong to the consuming application. The server's own auto-loading
 policy is supported.
+
+## Local 0.7.0 candidate
+
+The current candidate corrects native embedding batch budgets, overlaps bounded
+preparation with ready HTTP work and supports unpatched llama.cpp through the
+standard HTTP connection-close policy. It also reduces generation bookkeeping
+and exposes optional native timings. No server, model or consumer migration is
+performed by the library. See [native HTTP and timing APIs](docs/NATIVE-HTTP.md)
+and [embedding contracts](docs/EMBEDDING-CONTRACTS.md). This candidate is a local
+wheel; the published installation links below still refer to release 0.6.0.
 
 ## Install and generate
 
@@ -212,7 +222,8 @@ already prepared by the consumer.
 An adapter can share bounded concurrency and queue limits across callers.
 Optional `embedding_replica_discovery=True` selects loaded replicas using
 content and semantic identity tags published by a compatible server manager.
-Each automatically discovered replica admits one active request. Explicit
+Each replica is bounded by its observed slots and configured admission limits;
+unknown capacity falls back to one. Explicit
 replica aliases remain supported. Without discovery or concurrency settings,
 embedding requests remain sequential. See the
 [integration guide](docs/INTEGRATION.md) and

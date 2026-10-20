@@ -56,10 +56,18 @@ Internal replica identifiers are monotonic operational identifiers; consumers
 should retain the stable content and semantic identities for indexes and
 caches instead.
 
-Each automatic replica permits one active request. The adapter also enforces
-a global active-work limit and a bounded queue. Multiple replicas permit
-requests to distinct processes without requiring multiple slots within one
-process. These limits do not establish simultaneous GPU execution.
+In the local 0.7.0 candidate, each automatic replica's active HTTP capacity is
+derived from its positive observed `total_slots`, capped by the adapter's global
+`embedding_request_parallelism`. Unknown or malformed capacity permits one
+active request. Explicit replica mode also respects verified slots and its
+configured per-replica ceiling. The client does not set the server's slot count.
+
+The same bounded scheduler admits ready HTTP batch jobs. Multiple batches of
+one quota can use multiple verified slots; another ready alias can advance
+while an alias is busy, including with a zero-length waiting queue. More slots
+are an admission capacity, not a guarantee of higher throughput or simultaneous
+GPU execution. Increased slot use must be numerically qualified with the
+chosen model, build and loading profile.
 
 Calls share the adapter's scheduler. Pool changes take effect at a boundary
 with no active calls, using a bounded wait that responds to cancellation and
@@ -75,6 +83,14 @@ including task prefixes and special tokens in exact input counts. For example,
 changing allocated context to 4096 tokens changes admission capacity, not model
 identity. Flash Attention and allocated context remain runtime execution
 settings.
+
+Text count, input context, native batch/microbatch sizes and aggregate HTTP
+token budgets remain separate. Only explicit adapter/per-replica
+`batch_token_limit` settings bound the aggregate HTTP token count. Native
+`n_batch` and `n_ubatch` are diagnostic execution observations; they do not
+establish a universal input-splitting capability or an HTTP array limit. An
+unpublished capability remains unknown and server rejections retain their
+typed errors.
 
 Runtime-attested weight identity, measured numerical embedding equivalence
 and application retrieval quality are separate properties. A weight digest
@@ -96,8 +112,13 @@ quota is separate from HTTP token packing and the context limit of an
 individual input.
 
 Public preparation returns exact counts even for oversized inputs. Counts are
-reused only when their identity and tokenizer policy are verifiable, and
-admission checks fresh limits. See [embedding contracts](EMBEDDING-CONTRACTS.md)
-for API details and [verification requirements](REQUIREMENTS.md) for the public
-verification boundary. Version 0.4.1 preserves the inference and embedding
-behavior of 0.4.0.
+reused only when their identity, tokenizer build and task policy are verifiable,
+and admission checks fresh limits after waiting and before adaptive children.
+Globally bounded quota lookahead overlaps preparation with inference using
+reused executors. Ordinary embedding does not create public sealed records;
+public preparation and its tamper checks retain their contract.
+
+See [embedding contracts](EMBEDDING-CONTRACTS.md) for API details and
+[verification requirements](REQUIREMENTS.md) for the verification boundary.
+These 0.7.0 candidate changes do not constitute a release, new live
+qualification or consumer migration.
