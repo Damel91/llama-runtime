@@ -1,8 +1,9 @@
 # Embedding contracts and public preparation
 
-This guide describes embedding semantics in the local 0.7.0 candidate and their
-verification boundary. It does not declare a published 0.7.0 release, a new live
-qualification or consumer acceptance. See
+This guide describes embedding semantics in the local 0.9.0 candidate. The
+[progressive queue and native token contract](PROGRESSIVE-EMBEDDING.md) extends
+the scheduler shared by synchronous calls and async window sources. Local
+qualification, publication and consumer acceptance remain distinct; see
 [verification requirements](REQUIREMENTS.md) for the public checks.
 
 ## Total text budget, distribution and integrity
@@ -34,7 +35,11 @@ The path preserves order/cardinality, cancellation, finite overall deadlines,
 typed errors, content and semantic identity, frozen active topology, draining
 and all-or-error result publication. Successful quotas are not replayed. The
 scheduler admits ready HTTP batch jobs, rather than holding an inference slot
-through tokenization of an entire quota. A quota can have multiple ready
+through tokenization of an entire quota. Ready inputs retain their original
+indices and can form coalesced batches before quota preparation finishes.
+`embedding_batch_wait_sec` defaults to 0.5 seconds from the first unsent ready
+input; a filled text/token budget or completed producer can flush earlier.
+Later arrivals do not reset the timer. A quota can have multiple ready
 batches in flight when its verified slot capacity permits. The same scheduler
 can pass a job blocked on another alias while preserving FIFO within an alias
 for admitted jobs. Its nonblocking admission lets the coordinator try other
@@ -60,7 +65,8 @@ A prepared record exposes prepared text, task, count, context and HTTP limits,
 the effective per-input limit, verified identity and digests. Its limits are
 conservative snapshots; admission observes identity and limits again. A private
 adapter seal prevents accidental use of altered records or records from
-another adapter. Count reuse requires verified identity and tokenizer policy;
+another adapter. Retained immutable token IDs are covered by this seal too.
+Count/ID reuse requires verified identity, tokenizer build and tokenizer policy;
 an alias/topology change alone does not change the count. An unverified fallback
 or unknown tokenizer build requires recounting. There is no unbounded record
 registry or cache.
@@ -70,7 +76,7 @@ The adapter reuses separate preparation and tokenizer executors;
 `token_count_parallelism` and pending tokenizer admission are global across its
 callers. Lookahead is bounded globally to
 `embedding_request_parallelism + embedding_queue_size` quota leases, held
-through preparation, ready work and the quota's last HTTP cleanup. Preparation
+until both the producer and the quota's last HTTP cleanup have drained. Preparation
 of subsequent quotas can overlap active inference. This limits intermediate
 lookahead, not the memory occupied by the caller's full input and result.
 
@@ -88,6 +94,18 @@ already completed inputs. A changed tokenizer build rejects stale counts.
 These observations are not a server-side lease or atomic GET-and-POST
 transaction. Bulk work and waits are cancellable under a finite overall
 deadline; `close()` drains preparation and HTTP cleanup as well as inference.
+
+`embedding_input_format="auto"` uses native nested token arrays when the client
+explicitly declares support and retained IDs match the verified identity,
+build and policy. This avoids string tokenization inside the embedding handler;
+new inputs still require exact server tokenization first. `text` selects string
+input; `tokens` requires safe IDs or fails before sending. Unknown custom clients
+use text in auto mode. There is no fallback/replay after an ambiguous POST.
+The standard native client also propagates structured context errors without
+adaptive bisection: the server may already have evaluated sibling inputs.
+Recognized-context recovery remains for custom clients outside that declared
+native contract. Empty token arrays remain measurable; auto uses text for them
+and forced token mode rejects them before inference.
 
 ## Public API
 
@@ -134,8 +152,9 @@ unconsumed outputs. Existing synchronous methods retain their signatures.
   limits, uneven remainders, fewer texts than replicas and multiple windows
   without omissions or duplicates.
 - Exact packing within known budgets; rejection of an indivisible input over
-  the HTTP budget before embedding; adaptive splitting without replaying
-  successful batches.
+  the HTTP budget before embedding; no native replay after a failed POST.
+- Progressive dispatch, first-ready coalescing deadlines, sealed exact token
+  inputs, special/prefix parity and safe pre-dispatch input-mode selection.
 - Concurrent callers, bounded/zero queues, isolated cancellation, finite
   deadlines, partial failure, drained closure and topology transitions.
 - Query/document/raw tasks, Unicode, whitespace, special markers and empty

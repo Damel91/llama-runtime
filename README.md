@@ -39,6 +39,8 @@ The project's engineering lifecycle is managed with
 | Replica discovery | Explicit aliases or automatic discovery using content and semantic identity tags from a compatible server manager; identity pinning and bounded topology refresh. |
 | Shared concurrency | Per-adapter global and per-replica admission, bounded queues, backpressure, separate tokenizer limits and ordered results across concurrent callers. Effective admission is bounded by observed slots and configured global/per-replica limits; unknown capacity falls back to one. |
 | Async embedding windows | Async text or prepared-input sources, ordered complete windows, bounded intake and buffered results, with the same scheduler and limits used by synchronous callers. |
+| Progressive embedding preparation | Ready records can form bounded coalesced batches before the rest of their quota is tokenized; synchronous and async callers share one scheduler. |
+| Native token inputs | Reuses exact retained token IDs with verified weights, tokenizer build and prefix/special policy, avoiding a second string tokenization in the native embedding handler. |
 | Lifecycle and errors | Typed backend, timeout, cancellation and runaway errors; cooperative cancellation, repetition protection and drained embedding shutdown. Embedding calls have overall deadlines; generation supports bounded HTTP and stream-idle waits. |
 | Optional stream idle | Explicit `stream_idle_timeout_sec=None` waits through quiet prefill; connection/JSON budgets remain finite, with per-request socket interruption for Stop and drained close. |
 | Diagnostics | Optional bounded thinking capture, invocation correlation and final diagnostic sinks, including interrupted calls. |
@@ -53,6 +55,24 @@ server build, model and chat template. Responses are not locally validated
 against the forwarded JSON Schema. Splitting source documents and tracking their
 fragments belong to the consuming application. The server's own auto-loading
 policy is supported.
+
+## Local 0.9.0 candidate
+
+The local candidate adds progressive preparation and native token-ID input to
+the existing synchronous and async embedding APIs. Ready records accumulate into
+bounded batches while later texts are still being tokenized. Both APIs retain
+one shared scheduler, verified replica limits and complete ordered windows.
+
+`embedding_batch_wait_sec` controls coalescing (default 0.5 seconds from the
+first unsent ready input). `embedding_input_format="auto"` reuses exact IDs when
+the native client, identity, tokenizer build and policy authorize it; `text`
+selects strings and `tokens` requires safe IDs before dispatch. New texts still
+need server tokenization. See the
+[progressive embedding contract](docs/PROGRESSIVE-EMBEDDING.md).
+The [0.9.0 qualification](docs/verification/PROGRESSIVE-NATIVE-TOKENS-0.9.0.md)
+records deterministic checks, native text/ID equivalence and measured timing.
+This candidate is a local wheel delivery; installing it in consumers and
+publishing a release are separate actions.
 
 ## Release 0.7.0
 
@@ -218,8 +238,10 @@ limits. Prefixes and special tokens are counted once. Splitting documents and
 tracking fragment identity belong to the consumer.
 
 The adapter uses the server tokenizer, preserves order and checks vector
-dimensions and finite values. Only the recognized structured context error
-allows adaptive batch splitting. Unknown limits remain unknown. Query and
+dimensions and finite values. Native POST errors are propagated without replay,
+including context errors whose sibling inputs may already have run. Recognized
+context recovery remains for custom clients outside the native contract.
+Unknown limits remain unknown. Query and
 document prefixes default to empty strings; `input_type="raw"` accepts texts
 already prepared by the consumer.
 
@@ -233,9 +255,9 @@ embedding requests remain sequential. See the
 [integration guide](docs/INTEGRATION.md) and
 [replica discovery contract](docs/AUTOMATIC-EMBEDDING-REPLICAS.md).
 
-### Asynchronous window sources (0.8.0 candidate)
+### Asynchronous window sources
 
-The local 0.8.0 candidate adds `astream_texts()` and `astream_prepared()`.
+Introduced in 0.8.0, `astream_texts()` and `astream_prepared()` remain available.
 The synchronous API remains available. A consumer can supply successive
 windows while earlier windows are preparing or running:
 
@@ -325,6 +347,7 @@ requires its separately distributed native helper.
 - [Functional parity and limits](docs/FUNCTIONAL-PARITY.md)
 - [Read-only model discovery](docs/MODEL-DISCOVERY.md)
 - [Embedding preparation and batching](docs/EMBEDDING-CONTRACTS.md)
+- [Progressive preparation and native token inputs](docs/PROGRESSIVE-EMBEDDING.md)
 - [Asynchronous embedding windows](docs/ASYNC-EMBEDDING-WINDOWS.md)
 - [Concurrency and diagnostics](docs/CONCURRENCY-AND-DIAGNOSTICS.md)
 - [Stream timeouts and cancellation](docs/STREAM-TIMEOUTS.md)

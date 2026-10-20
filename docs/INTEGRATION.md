@@ -1,4 +1,4 @@
-# Contratto di integrazione — candidata locale runtime-llama 0.8.0
+# Contratto di integrazione — candidata locale runtime-llama 0.9.0
 
 La libreria usa il `llama-server` scelto dal consumer, locale o remoto.
 Il gestore del server possiede build, processo, pesi, dispositivi, contesto e
@@ -8,11 +8,14 @@ Il consumer possiede l'esecuzione dei tool e la continuazione della conversazion
 Questo documento descrive API e responsabilità. Tutti gli alias, endpoint e
 limiti degli esempi sono illustrativi: sostituirli con la propria configurazione.
 Il repository si chiama `llama-runtime`; distribuzione `runtime-llama` e import
-`runtime_llama` restano compatibili. La candidata locale `0.8.0` conserva le API
-pubbliche di generazione, discovery e preparazione embedding e aggiunge gli
-stream asincroni di finestre. I risultati deterministici e live sono nel
-[report 0.8.0](verification/ASYNC-WINDOWS-0.8.0.md). La consegna locale non
-pubblica una release e non migra i consumer.
+`runtime_llama` restano compatibili. La candidata locale `0.9.0` conserva le API
+sincrone e gli stream asincroni di finestre, aggiungendo preparazione progressiva
+e riuso degli ID token nativi nello stesso scheduler. Il
+[contratto progressivo](PROGRESSIVE-EMBEDDING.md) descrive i nuovi parametri;
+il [report 0.8.0](verification/ASYNC-WINDOWS-0.8.0.md) resta evidenza storica
+dell'API a finestre. Il [report 0.9.0](verification/PROGRESSIVE-NATIVE-TOKENS-0.9.0.md)
+riporta qualifica attuale e misure. La consegna locale non pubblica una release
+e non migra i consumer.
 
 ## Connessione e disponibilità
 
@@ -178,7 +181,10 @@ Preparazione e inferenza mantengono finestre e quote comuni. Executor di
 preparazione e tokenizzazione sono riusati; `token_count_parallelism` è un tetto
 globale per adapter. Il lookahead è limitato globalmente a
 `embedding_request_parallelism + embedding_queue_size` quote, trattenute fino
-alla fine della preparazione pubblica o all'ultimo cleanup HTTP della quota.
+al completamento sia del produttore sia dell'ultimo cleanup HTTP della quota.
+Ogni record pronto conserva il proprio indice e può essere inviato prima della
+fine della quota, accumulando batch entro `embedding_batch_wait_sec` (default
+0.5 secondi dal primo record pronto non inviato, senza reset a ogni arrivo).
 Questo consente di preparare quote successive durante l'inferenza, senza
 occupare uno slot embedding durante la tokenizzazione. È un limite ai dati
 intermedi anticipati, non alla memoria dell'intero input/output del consumer.
@@ -191,6 +197,16 @@ batch o figlio adattivo, la libreria osserva nuovamente identità, build e limit
 un limite cambiato rivalida i rimanenti, senza invalidare risultati completati.
 Le osservazioni non sono una lease sul server né una transazione atomica tra
 GET e POST.
+
+`embedding_input_format="auto"` riusa gli ID immutabili quando client nativo,
+identità, build e policy sono verificati; `text` invia stringhe e `tokens`
+richiede ID sicuri prima del POST. Prefissi e token speciali restano applicati
+una sola volta. I nuovi testi richiedono ancora `/tokenize`, ma il percorso a ID
+evita la seconda tokenizzazione interna all'embedding. Gli ID JSON possono
+occupare più byte del testo. Non esistono probe di inferenza nascosti o retry
+automatici come testo dopo un errore ambiguo. Anche un errore contesto strutturato
+del client nativo viene propagato senza bisezione: alcuni input fratelli
+potrebbero essere già stati elaborati.
 
 Il timeout è una deadline complessiva della chiamata, incluse coda e
 preparazione; ogni HTTP usa il tempo residuo. Cleanup e chiusura restano drenati

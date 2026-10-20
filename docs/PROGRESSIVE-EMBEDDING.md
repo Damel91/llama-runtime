@@ -88,6 +88,8 @@ the consumer's responsibility.
 ## Configuration example
 
 ```python
+from runtime_llama import build_embedding_adapter
+
 adapter = build_embedding_adapter({
     "model": "embedding-model.gguf",
     "base_url": "http://localhost:8080",

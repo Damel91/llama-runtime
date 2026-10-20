@@ -1,7 +1,9 @@
 # Asynchronous embedding windows
 
-Implementation contract for the local 0.8.0 candidate. The existing synchronous
-embedding API remains available. Flower MCP governs requirements, the work
+Public interface introduced in the local 0.8.0 candidate and retained in 0.9.0.
+The [progressive queue and native token path](PROGRESSIVE-EMBEDDING.md) now run
+inside the same shared execution engine. The synchronous embedding API remains
+available. Flower MCP governs requirements, the work
 packet and verification; implementation completion is separate from acceptance.
 
 ## Public interface
