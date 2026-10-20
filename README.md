@@ -38,6 +38,7 @@ The project's engineering lifecycle is managed with
 | Batching | Configurable total text windows, balanced quotas across usable replicas and HTTP packing within known input/context and explicitly configured aggregate token budgets; native computation batch sizes remain separate. Inputs are never silently truncated. |
 | Replica discovery | Explicit aliases or automatic discovery using content and semantic identity tags from a compatible server manager; identity pinning and bounded topology refresh. |
 | Shared concurrency | Per-adapter global and per-replica admission, bounded queues, backpressure, separate tokenizer limits and ordered results across concurrent callers. Effective admission is bounded by observed slots and configured global/per-replica limits; unknown capacity falls back to one. |
+| Async embedding windows | Async text or prepared-input sources, ordered complete windows, bounded intake and buffered results, with the same scheduler and limits used by synchronous callers. |
 | Lifecycle and errors | Typed backend, timeout, cancellation and runaway errors; cooperative cancellation, repetition protection and drained embedding shutdown. Embedding calls have overall deadlines; generation supports bounded HTTP and stream-idle waits. |
 | Optional stream idle | Explicit `stream_idle_timeout_sec=None` waits through quiet prefill; connection/JSON budgets remain finite, with per-request socket interruption for Stop and drained close. |
 | Diagnostics | Optional bounded thinking capture, invocation correlation and final diagnostic sinks, including interrupted calls. |
@@ -232,6 +233,44 @@ embedding requests remain sequential. See the
 [integration guide](docs/INTEGRATION.md) and
 [replica discovery contract](docs/AUTOMATIC-EMBEDDING-REPLICAS.md).
 
+### Asynchronous window sources (0.8.0 candidate)
+
+The local 0.8.0 candidate adds `astream_texts()` and `astream_prepared()`.
+The synchronous API remains available. A consumer can supply successive
+windows while earlier windows are preparing or running:
+
+```python
+async def incoming_windows():
+    yield ["first document", "second document"]
+    yield ["third document"]
+
+async def ingest(embedding):
+    try:
+        async with embedding.astream_texts(
+            incoming_windows(), max_pending_windows=2, timeout=120.0,
+        ) as stream:
+            async for vectors in stream:
+                await store_next_window(vectors)  # Application-owned storage.
+    finally:
+        await embedding.aclose()
+```
+
+Each yielded vector list corresponds to one source window, in order.
+`max_pending_windows` includes source pulls, preparation, inference and results
+waiting for the consumer. Global intake is bounded across the adapter's async
+streams; synchronous and asynchronous work share HTTP scheduling and replica
+limits. `batch_size` still controls total-text distribution windows internally.
+The finite timeout applies separately to each source window, including waiting
+for capacity and the source itself.
+
+Use `async with` or `await stream.aclose()` when stopping early. Closing a stream
+drains its work and leaves the shared adapter available; `await embedding.aclose()`
+closes the adapter and its active streams. Source iterators are borrowed unless
+`close_source=True` is requested. See the [async window API](docs/ASYNC-EMBEDDING-WINDOWS.md)
+for ownership, deadlines, error propagation and event-loop constraints.
+The [0.8.0 candidate qualification](docs/verification/ASYNC-WINDOWS-0.8.0.md)
+records deterministic and bounded live results, including both embedding replicas.
+
 ## Verification
 
 Run the deterministic tests, HTTP loopback fixtures, lint checks and package
@@ -286,6 +325,7 @@ requires its separately distributed native helper.
 - [Functional parity and limits](docs/FUNCTIONAL-PARITY.md)
 - [Read-only model discovery](docs/MODEL-DISCOVERY.md)
 - [Embedding preparation and batching](docs/EMBEDDING-CONTRACTS.md)
+- [Asynchronous embedding windows](docs/ASYNC-EMBEDDING-WINDOWS.md)
 - [Concurrency and diagnostics](docs/CONCURRENCY-AND-DIAGNOSTICS.md)
 - [Stream timeouts and cancellation](docs/STREAM-TIMEOUTS.md)
 - [Optional Tailscale and Headscale transport](docs/TAILNET.md)

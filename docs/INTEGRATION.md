@@ -1,4 +1,4 @@
-# Contratto di integrazione — candidata locale runtime-llama 0.7.0
+# Contratto di integrazione — candidata locale runtime-llama 0.8.0
 
 La libreria usa il `llama-server` scelto dal consumer, locale o remoto.
 Il gestore del server possiede build, processo, pesi, dispositivi, contesto e
@@ -8,10 +8,11 @@ Il consumer possiede l'esecuzione dei tool e la continuazione della conversazion
 Questo documento descrive API e responsabilità. Tutti gli alias, endpoint e
 limiti degli esempi sono illustrativi: sostituirli con la propria configurazione.
 Il repository si chiama `llama-runtime`; distribuzione `runtime-llama` e import
-`runtime_llama` restano compatibili. La candidata locale `0.7.0` conserva le API
-pubbliche di generazione, discovery e preparazione embedding. Le modifiche
-descritte qui non dichiarano una release pubblicata, una nuova qualifica live
-o una migrazione dei consumer.
+`runtime_llama` restano compatibili. La candidata locale `0.8.0` conserva le API
+pubbliche di generazione, discovery e preparazione embedding e aggiunge gli
+stream asincroni di finestre. I risultati deterministici e live sono nel
+[report 0.8.0](verification/ASYNC-WINDOWS-0.8.0.md). La consegna locale non
+pubblica una release e non migra i consumer.
 
 ## Connessione e disponibilità
 
@@ -41,7 +42,7 @@ controlla prima il catalogo e richiede alias già caricati.
 
 API key opzionale con `api_key_env` o `api_key`; preferire la variabile d'ambiente.
 TLS verificato per default. Non inserire credenziali nell'URL. Il client non
-segue redirect né ripete automaticamente una richiesta fallita. La candidata
+segue redirect né ripete automaticamente una richiesta fallita. Dalla versione
 `0.7.0` usa `http_connection_policy="close"` per le richieste owned; la policy
 esplicita `"reuse"` richiede un endpoint con keep-alive verificato. Contratto e
 confini della verifica sono in [NATIVE-HTTP.md](NATIVE-HTTP.md).
@@ -197,6 +198,30 @@ e possono attendere il trasporto. Nessuna garanzia sull'arresto immediato del
 calcolo remoto.
 
 Firme e criteri completi: [contratti embedding](EMBEDDING-CONTRACTS.md).
+
+## Embedding: flusso asincrono di finestre
+
+`astream_texts(windows, *, input_type="document", max_pending_windows=2,
+timeout=None, cancel=None, close_source=False)` accetta un `AsyncIterable` di
+sequenze di testi. `astream_prepared()` accetta finestre di preparazioni emesse
+dallo stesso adapter e riutilizza i conteggi verificati. Entrambi restituiscono
+`EmbeddingWindowStream`: un async iterator/context manager che consegna una
+lista di vettori completa per finestra, mantenendo ordine e cardinalità.
+
+Il consumer può fornire nuove finestre mentre le precedenti sono in lavorazione.
+`max_pending_windows` include lettura della sorgente, preparazione, inferenza e
+risultati pronti in attesa del consumer. L'ammissione globale precede la lettura
+della sorgente ed è limitata dai budget già configurati sull'adapter. Chiamate
+sincrone e stream condividono lo scheduler e i limiti HTTP globali e per replica.
+`batch_size` continua a definire il budget totale di testi da distribuire
+internamente; ogni finestra sorgente resta un confine di consegna.
+
+Il timeout finito vale per ogni finestra, comprese attesa della sorgente e
+capacità. Usare `async with` o `await stream.aclose()` dopo un'uscita anticipata;
+la chiusura drena soltanto quel flusso. `await adapter.aclose()` chiude anche gli
+stream attivi e le risorse condivise. Le sorgenti sono prese in prestito salvo
+`close_source=True`; splitting e persistenza appartengono al consumer.
+API completa, esempio e limiti sono in [ASYNC-EMBEDDING-WINDOWS.md](ASYNC-EMBEDDING-WINDOWS.md).
 
 ## Embedding: pool esplicito e compatibilità precedente
 
@@ -443,5 +468,6 @@ Il consumer sceglie la versione della libreria, configura endpoint/alias e
 scheduler condiviso, collega eventuali sink e propaga gli errori. Deve poi
 qualificare il proprio flusso, inclusi tool/MCP e autorizzazioni. Le prove della
 libreria non certificano quel flusso. I [requisiti](REQUIREMENTS.md) e il
-[README](../README.md#verification) descrivono i confini della verifica pubblica;
-questa release non dichiara una nuova qualifica live o acceptance del consumer.
+[README](../README.md#verification) descrivono i confini della verifica pubblica.
+La [qualifica locale 0.8.0](verification/ASYNC-WINDOWS-0.8.0.md) copre soltanto
+il profilo caricato e le prove indicate; l'acceptance del consumer resta separata.

@@ -32,7 +32,8 @@ Factories are inert. Async resources, source iteration, threads and HTTP start
 only when entering or iterating the stream. Each stream belongs to its active
 event loop and has at most one pending `__anext__` on its source. Async use of
 one adapter is confined to one active loop; synchronous callers may still use
-the same adapter from other threads. Exhaustion and errors close the stream.
+the same adapter from other threads. Concurrent consumer `__anext__` calls on
+one stream are rejected. Exhaustion and errors close the stream.
 Use `async with` or explicit `aclose()` for deterministic cleanup after an early
 `break`; garbage collection is not a cleanup guarantee.
 
@@ -75,6 +76,9 @@ reported as complete and no successful inference is replayed. Backend and
 timeout errors retain their typed contracts. Source exceptions remain source
 exceptions. Task cancellation propagates as `asyncio.CancelledError` after
 owned cleanup; explicit cancellation probes retain `LLMCancelledError`.
+If source cleanup also fails, the primary window error or cancellation is
+preserved and the cleanup failure is chained as its cause, including during
+async-context exit. Standalone `aclose()` can report a source cleanup failure.
 
 Cancelling an asyncio future alone does not stop a running thread. The bridge
 must register calls before dispatch, set the real cooperative stop signal,
@@ -114,5 +118,6 @@ finally:
 
 The consumer owns source splitting, UTF-8 intervals, fragment identity and its
 graph. It chooses how large each source window is; the library owns batching,
-replica scheduling and bounded intake. Actual verification, API details and
-qualification limits will be recorded with the implementation.
+replica scheduling and bounded intake. See the
+[0.8.0 qualification](verification/ASYNC-WINDOWS-0.8.0.md) for actual checks,
+measured timings and deployment boundaries.

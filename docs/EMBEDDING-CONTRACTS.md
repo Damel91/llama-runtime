@@ -123,6 +123,11 @@ preparation and HTTP. Cleanup can require transport timeouts to complete;
 immediate termination of remote computation is not promised. Failure preserves
 the first typed error without contaminating independent calls.
 
+The additive [asynchronous window API](ASYNC-EMBEDDING-WINDOWS.md) accepts async
+sources of text or prepared-input windows. It uses this same execution engine
+and HTTP scheduler, preserves each result boundary and bounds source pulls and
+unconsumed outputs. Existing synchronous methods retain their signatures.
+
 ## Verification criteria
 
 - Dynamic distribution of 256 texts over two/four replicas, smaller global
