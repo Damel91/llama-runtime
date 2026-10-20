@@ -218,3 +218,60 @@ and response captures, preparation/HTTP intervals, ordered public windows,
 independent audits and delivery manifests. Private endpoint/model paths stay
 outside public artifacts. Host-reported verification does not imply human
 acceptance, production workload endurance or every server/model configuration.
+
+## Bounded repeat with Nomic replicas
+
+On 21 October 2026 (Europe/Rome; execution started at 22:00 UTC on 20 October),
+the operator replaced the loaded embedding models with two
+`nomic-embed-text-v2-moe.Q8_0.gguf` replicas and requested another bounded test.
+Both exposed matching content and embedding-semantic identity tags, dimension
+768 and vocabulary 250048. Each ran on a separate ROCm device with context,
+native batch and microbatch 512, mean pooling, one slot and Flash Attention off,
+using build `b11716-797de63b2`. Profiles and idle slots were checked before and
+after each arm. No model, runtime, consumer or shared installation was changed.
+
+The same 511 document bodies were submitted as ordered windows of 256 and 255,
+with total batch budget 256, global HTTP and tokenizer parallelism two and one
+active embedding request per alias. This model used `search_document: ` and
+`search_query: ` prefixes. A fresh model-specific probe replaced the
+Gemma-specific tokenizer, prefix and boundary fixtures; the older full Nomic
+campaign and Gemma's 2048/2049-token boundary tests were not repeated.
+
+| Nomic 511-document phase | Baseline 0.8.0 | Candidate 0.9.0 |
+| --- | ---: | ---: |
+| Client wall time | 3.504 s | 3.798 s |
+| Embedding / tokenize / metadata requests | 4 / 511 / 26 | 12 / 511 / 42 |
+| First tokenize start to first embedding start | 1.164 s | 0.537 s |
+| Preparation interval union | 2.684 s | 3.471 s |
+| Global/per-alias embedding HTTP peak | 2 / 1 | 2 / 1 |
+
+Each arm distributed 256 and 255 texts across the two verified replicas. All
+511 ordered public A/B vectors were identical. A three-input native canary
+also passed all 21 comparisons between text and exact token IDs, singleton and
+batch shapes, and matching requests across replicas, with maximum absolute
+difference zero. Its maximum raw unit-norm error was `3.713e-8`. Public
+same-response normalization error was at most `2.776e-17`. Thresholds remained
+`1e-5` maximum absolute error, cosine at least `0.999999`, unit-norm error at
+most `1e-6` and same-response projection error at most `1e-12`.
+
+The candidate sent native ID matrices in all 12 document requests. All inputs
+were exactly measured and within the loaded 512-token per-input context.
+Native batch/microbatch 512 are computation sizes, not an asserted aggregate
+HTTP token ceiling; no explicit aggregate request token limit was configured.
+All work drained, and no retry or automatic resubmission was performed. The
+whole canary/A/B execution used 26 embedding POSTs, 1028 tokenizations and 130
+metadata GETs within 11.519 seconds, under finite global and request budgets.
+
+This adjacent pair showed earlier candidate dispatch but a total time 0.295
+seconds longer (8.4%). It demonstrates no throughput improvement at default
+coalescing 0.5 seconds on this workload. Timings include preparation, HTTP,
+capture overhead and server work; caches, arm ordering and global GPU load
+were uncontrolled. They are not pure GPU times or a controlled comparison
+between Nomic and Gemma, and numerical agreement is not retrieval-quality
+evaluation.
+
+The retained private controller result SHA-256 is
+`ae55aa4524020d58fe443dc6d0f32529a510b7321510c2a16c223e5d74049566`;
+the ordered A/B comparison is
+`a4fe3d8dd1e248f1c8a4e56d21065177178aac7d98be8b35541eb24a36916738`.
+The previously delivered wheels and runtime sources remain unchanged.
