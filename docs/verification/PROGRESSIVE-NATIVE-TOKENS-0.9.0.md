@@ -249,8 +249,10 @@ Each arm distributed 256 and 255 texts across the two verified replicas. All
 511 ordered public A/B vectors were identical. A three-input native canary
 also passed all 21 comparisons between text and exact token IDs, singleton and
 batch shapes, and matching requests across replicas, with maximum absolute
-difference zero. Its maximum raw unit-norm error was `3.713e-8`. Public
-same-response normalization error was at most `2.776e-17`. Thresholds remained
+difference zero. Its maximum raw unit-norm error was `3.713e-8`. The probe's
+public same-response normalization error was at most `2.776e-17`; an independent
+offline recomputation using separate arithmetic measured at most `4.164e-17`.
+Thresholds remained
 `1e-5` maximum absolute error, cosine at least `0.999999`, unit-norm error at
 most `1e-6` and same-response projection error at most `1e-12`.
 
@@ -275,3 +277,11 @@ The retained private controller result SHA-256 is
 the ordered A/B comparison is
 `a4fe3d8dd1e248f1c8a4e56d21065177178aac7d98be8b35541eb24a36916738`.
 The previously delivered wheels and runtime sources remain unchanged.
+
+A separate standard-library-only offline audit recomputed the 21 canary and
+511 A/B comparisons, all 1022 public normalization projections and 517 full
+token-ID rows from the retained responses. It verified wheel/installed payloads,
+source and capture hashes, identities, ordering, concurrency and complete
+drainage. Eight candidate requests started before their preparation quota
+finished. Its retained report SHA-256 is
+`79f6fd5c69001a52429d51df562804fc23201ae032a716738d7d8fba7404b49b`.
