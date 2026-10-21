@@ -6,7 +6,7 @@ server, model or device configuration.
 
 ## Embedding and external replicas
 
-In version 0.10.1, `embedding_request_parallelism` limits active
+In the local 0.10.2 candidate, `embedding_request_parallelism` limits active
 embedding HTTP work across an adapter. Its default is 4 with automatic replica
 discovery and 1 otherwise. `embedding_queue_size` defaults to 16 and adds
 bounded preparation lookahead to the request-parallelism budget; zero retains
@@ -44,6 +44,22 @@ The engine can skip a busy alias and rotates among independent ready callers.
 The synchronous and async APIs submit to that same engine; there is no
 blocking coordinator thread per async window or second embedding scheduler.
 
+Readiness summaries update incrementally when ready entries enter or leave a
+queue. Packing uses iterators for the needed prefix and constant-time owner
+rotation, avoiding whole-backlog copies on every preparation event. It does not
+retain a frozen candidate batch across capacity or metadata waits. This changes
+local scheduling work, not native tokenization, inference or numerical limits.
+Diagnostic `packing_candidate_visits` is a cumulative integer counting records
+actually examined by `_pack`; it is not elapsed time or GPU work. An adapter
+snapshot can include preliminary checks as well as the main pipeline.
+
+A partial preflight is renewed when another useful owner arrives during its
+metadata checks. New rows require that fresh membership observation; they do
+not inherit the earlier snapshot. Admission still in progress can help fill a
+batch, while topology-busy or result-credit-blocked owners cannot prevent old
+work from draining. Full batches, resource pressure and an explicitly elapsed
+coalescing wait retain progress.
+
 A preparation plan holds its lookahead lease only while it has input groups
 left to prepare or preparation workers still running. Once those groups are
 exhausted and its workers have finished, that phase credit can admit more
@@ -78,10 +94,25 @@ and a synchronous call's complete output still occupy proportional memory;
 these separate pools and transient handoffs do not claim a total process RSS
 ceiling. Async completed windows retain their admission until consumed.
 
+Completed exact IDs use an additional adapter-owned LRU pool, capped at 1,024
+entries and `min(8 MiB, embedding_max_pending_bytes // 4)` bytes. Entries require
+verified identity, tokenizer build and task/prefix/special policy; raw text
+must match exactly. Unknown identity/build bypasses the cache. It has no TTL
+or singleflight, and concurrent cold misses can perform separate tokenizations.
+Eviction and adapter close release entries. `health_status` exposes cache
+occupancy, hits, misses and eviction counters; these bytes are separate from
+raw/ready and result reservations and are not a process RSS limit.
+Ready-record byte accounting also reserves a conservative extra 128 bytes per
+record for the finite-limit summary index. Dispatch removes ready references,
+but the record's byte/token credits stay held until actual HTTP drain. Fixed
+container overhead and operating-system RSS are not an exact accounting claim.
+
 Tokenizer and metadata HTTP use their own bounded capacity. The total HTTP
 ceiling derives from embedding, tokenizer and control limits; the embedding
 limit alone is not a count of all HTTP requests. Metadata waits and HTTP run
 outside scheduler locks and do not block the coordinator thread.
+Coherent admission observations avoid duplicate catalog reads without removing
+fresh loaded identity, build and limit checks at actual dispatch boundaries.
 
 Independent owners retain their cancellation, deadline, output indices and typed
 outcomes in a shared batch. Cancelling or expiring one owner removes its pending
@@ -91,6 +122,14 @@ That owner's Future waits for actual shared transport drain, even beyond its
 own work deadline; the active lease remains held until cleanup. All-member
 cancellation or adapter close stops and drains the transport. Cancelling an
 awaiting Future alone does not release its lease.
+
+A synchronous embedding/preparation call retains its engine Future while
+waiting. If an external `BaseException` abandons that wait, it stops its owner,
+wakes the coordinator and drains the actual Future before reraising the original
+exception. Repeated interruptions during this cleanup do not replace that
+exception or release resources early. Completed typed worker errors propagate
+unchanged. Surviving shared owners and the shared adapter/client remain open;
+the abandoned owner can wait past its work deadline for shared HTTP cleanup.
 
 Identity, tokenizer build and limits are observed again after waiting and at
 actual batch boundaries. Stable limits require linear admission passes; a

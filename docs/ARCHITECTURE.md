@@ -13,7 +13,7 @@ Generazione, embedding e scheduler mantengono le API esistenti. I test non certi
 compatibilità universale con ogni modello/template; l'integrazione dei consumer
 resta una fase distinta.
 
-La versione `0.10.1` affida il coordinamento embedding a un motore persistente
+La candidata locale `0.10.2` affida il coordinamento embedding a un motore persistente
 dell'adapter. Preparazione esatta e HTTP avanzano in
 pool di thread limitati; ogni replica verificata possiede una coda di record
 pronti. Un solo scheduler seleziona il batch quando dispone della capacità
@@ -43,6 +43,29 @@ attivi. Record pronti o in volo, crediti byte/token, risultati e ownership HTTP
 restano trattenuti fino alla rispettiva consegna o al drain. Anche la lease
 della finestra async resta occupata fino alla consegna o pulizia; liberare
 lookahead non significa liberare la capacita' HTTP.
+
+La candidata `0.10.2` riusa osservazioni metadata coerenti durante l'ammissione,
+senza ripetere il catalogo gia' letto per l'appartenenza al pool. Prima dei POST
+restano verificati identita', build tokenizer e limiti correnti. Una cache LRU
+dell'adapter conserva solo tuple di ID esatti completati: identita' verificata,
+build, task, testo e policy di prefissi/token speciali fanno parte della chiave.
+Non autorizza l'inferenza e non evita la validazione dei record pubblici.
+Il pool aggiuntivo e' limitato a 1.024 entry e a
+`min(8 MiB, embedding_max_pending_bytes // 4)` byte, distinti da code e risultati.
+Non prevede TTL o singleflight; richieste fredde concorrenti possono ripetere
+la tokenizzazione. Evizione e chiusura liberano le entry. I contatori sono
+esposti nella diagnostica, senza dichiarare un tetto globale della RSS.
+
+L'architettura adottata revisione 4 e il packet complementare
+`PACKET-000019` (`REQ-000034`/`REQ-000035`, `MILE-000018`, `CHANGE-000018`)
+mantengono sommari incrementali delle code pronte. Il packing usa iteratori
+sul prefisso necessario alla richiesta corrente e rotazioni dei proprietari
+in tempo costante; non congela un candidato persistente durante le attese.
+Se un'eccezione esterna interrompe l'attesa sincrona della Future del motore,
+viene ritirato soltanto quel proprietario e si attende il drain reale prima di
+rilanciare l'eccezione originale, anche con interruzioni ripetute in cleanup.
+Gli altri proprietari di un POST condiviso e l'adapter/client restano aperti;
+valgono le deadline e i limiti di trasporto gia' descritti.
 
 La versione `0.6.0` aggiunge il trasporto opzionale
 [Tailscale/Headscale](TAILNET.md). `TailnetConfig` mantiene la configurazione

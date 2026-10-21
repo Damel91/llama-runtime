@@ -56,6 +56,40 @@ against the forwarded JSON Schema. Splitting source documents and tracking their
 fragments belong to the consuming application. The server's own auto-loading
 policy is supported.
 
+## Local 0.10.2 candidate
+
+The local candidate reduces redundant metadata observations while preserving
+fresh identity and loaded-limit checks before inference. It also retains a
+bounded adapter-owned cache of completed exact token IDs, keyed by verified
+weights, tokenizer build, task and prefix/special-token policy. A matching
+prepared or raw input can reuse IDs across equivalent aliases; a cache entry
+does not authorize inference or bypass current limits.
+
+The cache retains at most 1,024 entries and `min(8 MiB,
+embedding_max_pending_bytes // 4)` bytes, separately from queued work and async
+results. It has no TTL or singleflight: concurrent cold misses can each need
+tokenization. Unknown identity/build bypasses it; eviction and adapter close
+release retained entries. `health_status` includes preparation-cache counters.
+These resource pools do not define a total process memory limit.
+
+Ready queues maintain incremental summaries and packing walks only the needed
+queue prefix through iterators. Candidate batches are still selected at
+dispatch; no frozen prefix is retained while capacity is unavailable. If an
+external exception interrupts a blocking call's result wait, the library stops
+that owner, drains its real work and reraises the original exception while
+preserving surviving callers and the shared adapter.
+
+Qualification separates the 511 previously unseen texts from a later prepared/raw
+reuse exercise. The existing oversized-input check runs first with an unrelated
+text; it does not populate the cache for those 511 inputs. Worker-time sums and
+HTTP intervals are reported separately;
+neither is pure GPU time. This candidate is a local wheel delivery, with no
+consumer migration or new public release implied. Public installation links
+below continue to target 0.10.1.
+
+See the [0.10.2 qualification report](docs/verification/METADATA-PREPARATION-0.10.2.md)
+for interruption, packing, request counts and exact-reuse evidence.
+
 ## Release 0.10.1
 
 Version 0.10.1 corrects model-wide accumulation in the persistent embedding

@@ -179,6 +179,8 @@ Motore persistente: qualifica funzionale di un wheel installato
     --base-url http://SERVER:8080 --model MODEL_SELECTOR \
     --output /tmp/persistent-queue-01.json
 
+Per verificare anche il riuso dopo il run principale, aggiungere --qualify-reuse.
+
 Il probe richiede un wheel installato, due repliche verificate e dimensione768.
 Non imposta contesto, slot o caricamento. Esegue otto canary stringhe/ID per
 replica, un conteggio oversize con rifiuto prima dell'inferenza e511 documenti
@@ -189,6 +191,13 @@ di finestra verificano cardinalita' e ordine sia interno sia fra finestre.
 Soglie: maxabs1e-5, cosine0.999999, norma1e-6,
 proiezione della stessa risposta1e-12. Registra richieste/payload/concorrenza,
 preparazione e tempi client/HTTP, senza attribuirli al solo calcolo GPU.
+I primi otto output della pipeline sono confrontati anche con i canary piccoli,
+alle stesse soglie fra inferenze. La pipeline deve inviare esattamente511
+tokenizzazioni per i testi nuovi e meno di50metadata, il conteggio della
+baseline0.10.1; i contatori di pipeline e delle altre fasi restano separati.
+"Freddo" significa511testi non presenti in cache, non modello o GPU freddi.
+I canary nativi e il conteggio oversize di un testo diverso precedono comunque
+la pipeline, come nella baseline; l'oversize puo' occupare una entry distinta.
 Il report e il sidecar vettori riguardano il singolo candidato; nessun confronto
 di throughput fra versioni. Uno LLM caricato e attivo e' ammesso e il suo stato
 is_processing viene registrato quando leggibile. Limiti finiti per run:
@@ -196,3 +205,15 @@ is_processing viene registrato quando leggibile. Limiti finiti per run:
 550tokenizzazioni e1200metadata; nessun retry o comando di amministrazione.
 I fingerprint prima/dopo escludono soltanto il timestamp volatile created
 del catalogo, conservando identita', argomenti, build e profilo caricati.
+
+Con --qualify-reuse la prova511 resta per prima. Dopo, un altro adapter nuovo
+prepara otto testi brevi una volta (otto tokenize), esegue due embed_prepared
+e due embed_texts sugli stessi testi; tutte e quattro le inferenze devono
+aggiungere zero tokenize. Le mappe raw sono separate per fase e verificano
+ordine, ID, proiezione e confronto numerico fra i quattro passaggi. Sono
+registrati occupancy/hit/miss della cache, drain su close e wall delle API e
+dei hook di preparazione/issue/validazione dei record pubblici. Le somme dei
+wall dei worker possono sovrapporsi e non sono elapsed, tempo CPU o tempo GPU.
+Il riuso non e' un benchmark a cache fredda. Il totale atteso e'536tokenize
+con riuso,528senza; restano i tetti globali550/600/1200e180secondi. La prova non
+installa wheel, migra consumer o pubblica la candidata locale0.10.2.

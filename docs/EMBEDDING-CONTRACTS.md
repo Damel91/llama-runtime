@@ -1,6 +1,6 @@
 # Embedding contracts and public preparation
 
-This guide describes embedding semantics in version 0.10.1. The
+This guide describes embedding semantics in the local 0.10.2 candidate. The
 [progressive queue and native token contract](PROGRESSIVE-EMBEDDING.md) extends
 the scheduler shared by synchronous calls and async window sources. Local
 qualification, publication and consumer acceptance remain distinct; see
@@ -80,6 +80,20 @@ an alias/topology change alone does not change the count. An unverified fallback
 or unknown tokenizer build requires recounting. There is no unbounded record
 registry or cache.
 
+The local 0.10.2 candidate adds a bounded adapter-owned LRU cache for completed
+exact token tuples. Prepared and raw inputs can reuse a tuple only for the
+same verified weights and semantic identity, tokenizer build, task, text and
+prefix/special policy. A changed context limit alone does not invalidate an
+exact count, but fresh admission must still reject an input over that limit.
+Unknown identity/build bypasses this cache. Public records retain same-adapter
+seal validation; a cached count is not an inference permit.
+
+The cache holds at most 1,024 entries and
+`min(8 MiB, embedding_max_pending_bytes // 4)` bytes in a separate retained pool.
+No TTL or singleflight is promised. Concurrent cold misses may each tokenize;
+eviction and close release entries. Errors and incomplete tokenizations do
+not become hits. Cache diagnostics include occupancy and hit/miss counters.
+
 Preparation retains the same distribution windows, quota affinity and exact
 token policy. Persistent tokenizer workers share `token_count_parallelism`
 across callers and publish ready records while inference is running. One
@@ -103,6 +117,12 @@ capacity is derived from embedding, tokenizer and control capacity. The
 embedding ceiling does not by itself count every tokenizer or metadata GET.
 Native exact tokenization still requires calls for distinct new texts; this
 engine does not add a bulk tokenizer endpoint.
+
+Initial metadata observations can be reused coherently across admission work,
+including the catalog already read for pool membership. Loaded identity,
+tokenizer build and limits are still observed at actual dispatch boundaries.
+This reuse does not add a time-based authorization window or remove topology
+and current-limit checks.
 
 The normal embedding path uses internal counted records without serializing
 or signing public preparation envelopes. Only `prepare_*` emits sealed public
@@ -170,6 +190,13 @@ own work budget. All-member cancellation and adapter close cancel and drain
 the shared request. The overall work deadline starts at call entry and covers
 queueing, discovery, preparation and HTTP. Immediate remote termination is not
 promised; completed inputs are not replayed and owners keep typed outcomes.
+
+When an external exception interrupts a synchronous call's wait for its engine
+Future, the caller stops its owner and waits for real drain before propagating
+that original exception. This also applies to preparation waits. Repeated
+interruptions during cleanup do not release the lease early or close surviving
+owners' transport. A completed typed worker failure propagates unchanged; the
+adapter and borrowed client remain available to independent calls.
 
 The additive [asynchronous window API](ASYNC-EMBEDDING-WINDOWS.md) accepts async
 sources of text or prepared-input windows. It uses this same execution engine

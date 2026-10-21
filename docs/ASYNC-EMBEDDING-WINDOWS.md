@@ -1,6 +1,7 @@
 # Asynchronous embedding windows
 
-Public interface introduced in the local 0.8.0 candidate and retained in 0.10.1.
+Public interface introduced in the local 0.8.0 candidate and retained in the
+local 0.10.2 candidate.
 The [progressive queue and native token path](PROGRESSIVE-EMBEDDING.md) now run
 inside the same shared execution engine. The synchronous embedding API remains
 available. Flower MCP governs requirements, the work

@@ -16,6 +16,8 @@ ledger or certify a particular deployment.
 | Prepare model-specific query/document prefixes exactly once and count server special tokens | [Embedding contracts](EMBEDDING-CONTRACTS.md); prefix and preparation tests |
 | Distribute a total text window across replicas and respect known aggregate HTTP token budgets | [Embedding contracts](EMBEDDING-CONTRACTS.md); embedding contract and scheduler tests |
 | Expose immutable prepared inputs, measure oversize inputs and reject them before inference | [Embedding contracts](EMBEDDING-CONTRACTS.md); prepared-input contract tests |
+| Reuse completed exact IDs within a finite adapter-owned cache without bypassing seals, current loaded identity or inference limits | [Embedding contracts](EMBEDDING-CONTRACTS.md); preparation cache, metadata and optional reuse-probe tests |
+| Retire and drain an owner when its blocking result wait is abandoned; keep ready-queue summaries incremental without frozen dispatch candidates | [Queue engine contract](PROGRESSIVE-EMBEDDING.md); blocking interruption and packing-accounting tests |
 | Preserve vector order, cardinality, dimensions and finite values | [Functional parity](FUNCTIONAL-PARITY.md); embedding and numeric integrity tests |
 | Discover equivalent loaded replicas only from supported content and semantic identity attestations | [Replica discovery](AUTOMATIC-EMBEDDING-REPLICAS.md); discovery and replica configuration tests |
 | Bound admission, queues and tokenization across callers sharing an adapter | [Concurrency](CONCURRENCY-AND-DIAGNOSTICS.md); concurrency and scheduler tests |

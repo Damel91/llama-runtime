@@ -1,8 +1,11 @@
 # Progressive preparation and native token inputs
 
-Contract for version 0.10.1. Flower MCP governs requirements,
-implementation and verification in project `llama-runtime`, packet
-`PACKET-000017`. Qualification and consumer acceptance remain distinct.
+Contract for the local 0.10.2 candidate. Flower MCP governs requirements,
+implementation and verification in project `llama-runtime`. `PACKET-000018`
+covers metadata and exact-ID reuse; complementary `PACKET-000019` covers
+interrupted blocking waits and incremental ready-queue accounting under adopted
+architecture revision 4 (`REQ-000034`/`REQ-000035`, `MILE-000018`,
+`CHANGE-000018`). Qualification, publication and consumer acceptance remain distinct.
 
 The [persistent queue engine design](EMBEDDING-QUEUE-DESIGN.md) records the
 architecture and verification requirements for replacing per-window
@@ -25,6 +28,14 @@ earlier inference is running. A batch is selected only when global and
 per-replica capacity are available; waiting work does not retain an already
 frozen list of batch indices. Records from different ready owners can combine;
 complete public windows and vectors retain input order.
+
+Ready queues maintain summaries as records enter and leave. Readiness checks
+can use those summaries instead of rescanning the growing backlog. Packing
+uses lazy iterators over the records needed for the current bounded request;
+owner rotation does not copy or remove the front of a Python list. This avoids
+repeated whole-queue candidate materialization without retaining a persistent
+candidate prefix across waits. Identity, capacity and byte/token checks still
+apply to the batch actually dispatched.
 
 `embedding_batch_wait_sec` is finite and nonnegative, default `0.0`. Zero uses
 event-driven filling, without a required coalescing timer. A free replica does
@@ -79,6 +90,26 @@ separate bound, and total HTTP capacity is derived from the embedding,
 tokenizer and control limits. Retained records and IDs have no unbounded
 cross-call registry. Limits and identity are rechecked before inference.
 
+The 0.10.2 candidate reuses coherent admission metadata instead of fetching
+the same catalog again within a start boundary. This does not turn metadata
+into an inference permit: actual HTTP dispatch still observes loaded identity,
+tokenizer build and current limits after waiting. Metadata counts depend on
+admission and topology events; there is no fixed request count for every run.
+
+A completed exact-token cache can reuse IDs for repeated prepared or raw
+inputs on this adapter. Its key includes verified content/semantic identity,
+tokenizer build, task and the exact prefix/special policy and text. It has no
+alias/path-only authorization. Unknown identity or build bypasses reuse.
+Public prepared records still require a valid same-adapter seal; cached IDs
+do not authorize oversized inputs or bypass fresh dispatch checks.
+
+The cache is a separate retained pool with at most 1,024 entries and
+`min(8 MiB, embedding_max_pending_bytes // 4)` bytes. LRU eviction and close
+release entries. There is no TTL or singleflight: concurrent cold misses may
+each tokenize, and a failed tokenization does not publish a reusable entry.
+These bytes are additional to raw/ready and async-result budgets, not a total
+process memory ceiling. Diagnostics expose counters without dumping inputs.
+
 An invalid input discovered after valid inputs were dispatched stops/drains the
 window and returns an error. It is never sent for inference, and successful
 earlier work is not replayed. No partial public window is returned. Preparation
@@ -93,6 +124,16 @@ initial members; later cancellation does not extend it. The cancelled owner's
 completion waits for that transport's actual drain and can therefore outlast
 its own work deadline. When every member is stopped, or the adapter closes,
 the request is cancelled and drained. No successful inputs are replayed.
+
+If an external exception such as `KeyboardInterrupt` or `SystemExit` abandons
+a synchronous call while it waits for the engine Future, that owner is stopped
+and the coordinator is woken. The call waits for its genuine completion/drain
+boundary before reraising the original exception, retaining it through repeated
+interruptions during cleanup. Shared HTTP survivors keep their transport, and
+the adapter and borrowed client remain open. A Future already completed with a
+normal typed worker error simply propagates that error. Drain retains the
+existing finite transport/deadline limits and may outlast the abandoned owner's
+work deadline when another shared owner survives.
 
 ## Native token input
 
@@ -134,7 +175,7 @@ measurable as count zero; `auto` uses text for it and explicit `tokens` rejects
 it before embedding HTTP. The client never manufactures a BOS token.
 
 This removes the second internal tokenization when the native ID path is used.
-New texts still require exact `/tokenize` requests. JSON ID arrays may be larger
+Previously unseen texts still require exact `/tokenize` requests. JSON ID arrays may be larger
 than their original strings; bandwidth or latency improvements are measured,
 not assumed. Source splitting, UTF-8 intervals and fragment identity remain
 the consumer's responsibility.
@@ -166,6 +207,6 @@ the [embedding contract](EMBEDDING-CONTRACTS.md).
 
 The [0.9.0 coalescing comparison](verification/COALESCING-TUNING-0.9.0.md)
 records earlier Nomic measurements. Its timer recommendation applies to that
-engine and workload, not automatically to 0.10.1. Compare zero waiting and any
+engine and workload, not automatically to 0.10.2. Compare zero waiting and any
 explicit coalescing value using the same model, build, profiles, corpus and
 numerical thresholds; distinguish preparation, queue, HTTP and total times.
