@@ -4,6 +4,10 @@ Contract for the local 0.9.0 candidate. Flower MCP governs requirements,
 implementation and verification in project `llama-runtime`, packet
 `PACKET-000013`. Qualification and consumer acceptance remain distinct.
 
+The [persistent queue engine proposal](EMBEDDING-QUEUE-DESIGN.md) describes a
+future replacement for per-window coordination and early batch selection. It
+does not change the 0.9.0 contract or configuration documented below.
+
 ## Progressive queues
 
 The synchronous and asynchronous embedding APIs use the same execution engine
