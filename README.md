@@ -56,9 +56,9 @@ against the forwarded JSON Schema. Splitting source documents and tracking their
 fragments belong to the consuming application. The server's own auto-loading
 policy is supported.
 
-## Local 0.10.0 candidate
+## Release 0.10.0
 
-The local candidate replaces per-window coordination with one persistent
+Version 0.10.0 replaces per-window coordination with one persistent
 embedding engine. Tokenizer workers publish ready records into queues owned by
 each verified replica. The engine forms a batch when global and replica
 capacity are available, including records prepared while earlier requests were
@@ -79,14 +79,15 @@ New texts still need exact server tokenization; the queue rewrite does not
 introduce a bulk tokenizer endpoint or eliminate those requests. See the
 [queue and token contract](docs/PROGRESSIVE-EMBEDDING.md) and
 [architecture design](docs/EMBEDDING-QUEUE-DESIGN.md).
-This candidate is a local wheel delivery; installation in consumers and
-publication are separate actions. The
+The [public release record](docs/verification/PUBLIC-RELEASE-0.10.0.md) describes
+normalized assets, retained helper provenance and verification boundaries.
+Consumer installation remains a separate action. The
 [0.9.0 qualification](docs/verification/PROGRESSIVE-NATIVE-TOKENS-0.9.0.md)
 records the earlier engine's measurements and is not a qualification of 0.10.0.
 The [persistent-engine verification record](docs/verification/PERSISTENT-QUEUES-0.10.0.md)
 separates deterministic results, installed-wheel checks and bounded live evidence.
 
-## Release 0.7.0
+## Earlier release 0.7.0
 
 Version 0.7.0 corrects native embedding batch budgets, overlaps bounded
 preparation with ready HTTP work and supports unpatched llama.cpp through the
@@ -104,10 +105,10 @@ results and deployment boundaries.
 With Python 3.11 or later, install the tagged source:
 
 ```bash
-python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.7.0'
+python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.10.0'
 ```
 
-Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.7.0),
+Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.10.0),
 or run the following from a checkout:
 
 ```bash
@@ -188,7 +189,7 @@ directory, hostname, enrollment credentials when needed, coordination server
 and inference endpoint. The Python wheel remains portable and contains no
 native binary. Importing or constructing the library never launches a VPN.
 
-The [release](https://github.com/Damel91/llama-runtime/releases/tag/v0.7.0)
+The [release](https://github.com/Damel91/llama-runtime/releases/tag/v0.10.0)
 provides separate helper archives for macOS ARM64, Linux AMD64 and Windows
 AMD64. Go is needed to build the helper from source, not to run a supplied
 binary. Both Tailscale's coordinator and an explicit HTTPS Headscale
