@@ -1,5 +1,11 @@
 # Progetto del motore embedding a code persistenti
 
+Documento storico del progetto 0.10.0. La correzione 0.10.1 adotta in Flower
+l'architettura revisione 2: accumulo tra finestre, cap per modello e ownership
+logica multipla di una HTTP condivisa. Le precedenti scelte che separavano
+sempre le POST per owner sono supersedute; vedere [architettura corrente](ARCHITECTURE.md)
+e [contratto corrente](PROGRESSIVE-EMBEDDING.md).
+
 Proposta del 21 ottobre 2026 sulla baseline `f94734f`, candidata locale 0.9.0.
 Il progetto sostituisce il coordinamento per finestra con un motore persistente
 dell'adapter: preparazione concorrente, code per replica e composizione dei

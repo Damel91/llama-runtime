@@ -1,6 +1,6 @@
 # Embedding contracts and public preparation
 
-This guide describes embedding semantics in the local 0.10.0 candidate. The
+This guide describes embedding semantics in version 0.10.1. The
 [progressive queue and native token contract](PROGRESSIVE-EMBEDDING.md) extends
 the scheduler shared by synchronous calls and async window sources. Local
 qualification, publication and consumer acceptance remain distinct; see
@@ -37,17 +37,21 @@ and all-or-error result publication. Successful quotas are not replayed. The
 engine owns persistent queues for the verified replicas and selects ready
 records when global and local execution capacity are available. Inputs that
 become ready while a replica is busy can join its next batch. Ready inputs
-retain their original indices; a slow earlier input does not block other
-prepared inputs. Public windows remain ordered result boundaries, without
+retain their original indices and can combine across owners. Public windows
+remain ordered result boundaries, without
 their own blocking coordinator threads.
 
-`embedding_batch_wait_sec` defaults to zero, allowing eligible ready work to
-dispatch without an artificial batch-filling delay. Explicit positive values
-retain bounded coalescing in the same engine: the timer starts at the first
-unsent ready input, and a filled cap or completed producer can flush earlier.
-Later arrivals do not restart it. Accumulated windows do not multiply the
-per-request text cap derived from a distribution quota. A quota can have
-multiple batches active when verified capacity permits. The shared scheduler
+`embedding_batch_wait_sec` defaults to zero: filling follows preparation,
+capacity and resource events without requiring a timer. The first ready input
+does not force a partial POST while compatible admitted work can still fill it.
+Compatible records from different calls and source windows can share a batch.
+Explicit positive values retain bounded coalescing in the same engine: the
+timer starts at the first unsent ready input; a filled cap or exhausted eligible
+preparation can flush earlier.
+Later arrivals do not restart it. The per-replica request text target derives
+from the adapter's total-text budget and usable replicas, independent of source
+window size. Accumulated windows neither shrink nor multiply that target.
+A quota can have multiple batches active when verified capacity permits. The shared scheduler
 rotates among eligible replicas and independent callers; a busy alias does
 not prevent another alias's ready work from advancing.
 
@@ -156,13 +160,16 @@ Loaded context and training context are distinct. The client performs no server
 administration. See [native HTTP transport](NATIVE-HTTP.md) for connection
 policy and its separate verification boundary.
 
-Independent cancellation/deadline domains do not share one embedding POST.
-This preserves per-call Stop while their preparation and dispatch still share
-the same bounded engine. The overall deadline starts at call entry and covers
-queueing, discovery,
-preparation and HTTP. Cleanup can require transport timeouts to complete;
-immediate termination of remote computation is not promised. Failure preserves
-the first typed error without contaminating independent calls.
+Each owner retains its cancellation, finite work deadline and result boundary,
+including when compatible records share an embedding POST. Stop or deadline
+expiry removes that owner's pending inputs and discards its response portion;
+it does not abort surviving owners. Shared transport uses one finite deadline
+fixed at dispatch from the latest deadline among its initial members. An owner
+waits for actual shared HTTP drain before completing, so cleanup can exceed its
+own work budget. All-member cancellation and adapter close cancel and drain
+the shared request. The overall work deadline starts at call entry and covers
+queueing, discovery, preparation and HTTP. Immediate remote termination is not
+promised; completed inputs are not replayed and owners keep typed outcomes.
 
 The additive [asynchronous window API](ASYNC-EMBEDDING-WINDOWS.md) accepts async
 sources of text or prepared-input windows. It uses this same execution engine
@@ -176,7 +183,7 @@ unconsumed outputs. Existing synchronous methods retain their signatures.
   without omissions or duplicates.
 - Exact packing within known budgets; rejection of an indivisible input over
   the HTTP budget before embedding; no native replay after a failed POST.
-- Progressive dispatch, first-ready coalescing deadlines, sealed exact token
+- Event-driven filling across source windows, optional coalescing deadlines, sealed exact token
   inputs, special/prefix parity and safe pre-dispatch input-mode selection.
 - Concurrent callers, bounded/zero queues, isolated cancellation, finite
   deadlines, partial failure, drained closure and topology transitions.

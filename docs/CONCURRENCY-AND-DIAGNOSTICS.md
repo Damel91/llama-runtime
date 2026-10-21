@@ -6,12 +6,12 @@ server, model or device configuration.
 
 ## Embedding and external replicas
 
-In the local 0.10.0 candidate, `embedding_request_parallelism` limits active
+In version 0.10.1, `embedding_request_parallelism` limits active
 embedding HTTP work across an adapter. Its default is 4 with automatic replica
-discovery and 1 otherwise. `embedding_queue_size` supplies the waiting-work
-budget and defaults to 16; zero retains only active admission capacity.
-Admission applies backpressure to callers. These budgets are shared by all
-callers of the adapter.
+discovery and 1 otherwise. `embedding_queue_size` defaults to 16 and adds
+bounded preparation lookahead to the request-parallelism budget; zero retains
+only that base preparation capacity. These budgets are shared across callers
+and complement the byte, token, result and async-intake limits below.
 
 `batch_size` limits the total texts in one distribution window, with balanced
 quotas assigned to distinct aliases. Explicit adapter and per-replica
@@ -44,11 +44,24 @@ The engine can skip a busy alias and rotates among independent ready callers.
 The synchronous and async APIs submit to that same engine; there is no
 blocking coordinator thread per async window or second embedding scheduler.
 
-`embedding_batch_wait_sec=0.0` is the new default and dispatches available work
-without waiting to fill a batch. Positive finite values retain optional
-coalescing in the same engine. More ready data can accumulate while a replica
-is busy; sparse input can still produce small batches. Accumulating multiple
-windows does not multiply the text cap derived from a distribution quota.
+A preparation plan holds its lookahead lease only while it has input groups
+left to prepare or preparation workers still running. Once those groups are
+exhausted and its workers have finished, that phase credit can admit more
+preparation even if the earlier plan retains ready records or active HTTP.
+Its records, token/byte credits, results and shared HTTP ownership remain held
+until their own publication or drain boundaries. Releasing preparation credit
+does not release an HTTP permit or discard retained work. Diagnostic
+`active_plans` counts preparation leases; `retained_plans` also includes plans
+whose preparation phase ended but whose records or HTTP still remain.
+
+`embedding_batch_wait_sec=0.0` remains the default and fills batches from
+preparation and capacity events without a required timer. One ready input does
+not force dispatch while compatible admitted work can still fill the batch.
+Positive finite values retain optional bounded coalescing in the same engine.
+Compatible records from different windows or callers can share an HTTP request.
+The target derives from the adapter's text budget and usable replicas;
+small source windows neither shrink nor multiply it. Sparse input and resource
+pressure can still cause partial batches.
 
 Finite queue resource budgets complement work/window counts:
 `embedding_max_pending_bytes=67108864`,
@@ -70,10 +83,14 @@ ceiling derives from embedding, tokenizer and control limits; the embedding
 limit alone is not a count of all HTTP requests. Metadata waits and HTTP run
 outside scheduler locks and do not block the coordinator thread.
 
-Independent cancellation and deadline domains stay separate in HTTP batches.
-Cancelling one owner cannot close a request containing another owner's work.
-The engine retains an active lease until actual transport cleanup, not merely
-until an awaiting Future is cancelled.
+Independent owners retain their cancellation, deadline, output indices and typed
+outcomes in a shared batch. Cancelling or expiring one owner removes its pending
+work and discards its portion of a response without aborting survivors. Shared
+HTTP has a finite deadline fixed from the latest initial member deadline.
+That owner's Future waits for actual shared transport drain, even beyond its
+own work deadline; the active lease remains held until cleanup. All-member
+cancellation or adapter close stops and drains the transport. Cancelling an
+awaiting Future alone does not release its lease.
 
 Identity, tokenizer build and limits are observed again after waiting and at
 actual batch boundaries. Stable limits require linear admission passes; a
@@ -85,8 +102,11 @@ The owned native client never replays a failed or ambiguous embedding POST.
 Recognized capacity recovery remains available for injected clients with the
 existing explicit recovery contract; its children retain the same HTTP lease.
 Dimensions and normalization are validated before publishing the complete
-result. Failure stops new submissions for the affected call and drains its
-already started work without cancelling independent calls.
+result. Owner-local validation, deadline and cancellation failures stop that
+owner's submissions and drain its started work without cancelling survivors.
+A transport or backend failure of a shared POST fails all participating
+owners; unrelated calls outside that POST remain independent. Failed or
+ambiguous shared requests are not replayed.
 
 Server reachability and model availability are distinct observations. Router
 aliases must be loaded. A direct server may omit router state, but must expose
@@ -99,7 +119,7 @@ separate active HTTP connections. The 0.7.0 candidate defaults owned requests to
 `http_connection_policy="close"`; explicit `"reuse"` permits keep-alive after
 the response has been consumed and closed. An injected, borrowed session stays
 under its caller's ownership and its dispatch is protected. Active JSON and
-SSE requests are tracked. Embedding cancellation retains its admission permit
+SSE requests are tracked. Embedding cancellation retains its HTTP admission permit
 until local HTTP cleanup finishes so that active work is not undercounted.
 Adapter `close()` drains its scheduler, preparation and owned resources.
 See [native HTTP transport](NATIVE-HTTP.md) for connection policy, upstream

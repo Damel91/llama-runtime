@@ -56,18 +56,23 @@ against the forwarded JSON Schema. Splitting source documents and tracking their
 fragments belong to the consuming application. The server's own auto-loading
 policy is supported.
 
-## Release 0.10.0
+## Release 0.10.1
 
-Version 0.10.0 replaces per-window coordination with one persistent
-embedding engine. Tokenizer workers publish ready records into queues owned by
+Version 0.10.1 corrects model-wide accumulation in the persistent embedding
+engine. Tokenizer workers publish ready records into queues owned by
 each verified replica. The engine forms a batch when global and replica
 capacity are available, including records prepared while earlier requests were
 running. Synchronous calls and async window sources share admission, ordering,
-deadlines and drained cleanup. Independent cancellation domains stay separate
-in HTTP requests.
+deadlines and drained cleanup. Compatible records can share an HTTP batch
+across source windows or callers, while preserving each owner's output indices
+and cancellation. Stopping one owner does not abort survivors; its completion
+waits for the actual shared transport drain.
 
-`embedding_batch_wait_sec` now defaults to `0.0`: a free replica can dispatch
-ready work immediately. An explicit positive value enables bounded coalescing
+`embedding_batch_wait_sec` defaults to `0.0`: preparation and capacity events
+fill batches without a required timer. A first ready record does not force a
+small POST while compatible admitted work can still fill it. Source windows
+remain delivery boundaries and do not shrink the per-replica request target.
+An explicit positive value enables bounded coalescing
 in the same engine. The total-text meaning of `batch_size` is unchanged;
 context, aggregate HTTP token budgets and native computation batches remain
 separate. Queue resource limits are configurable with
@@ -78,14 +83,14 @@ separate. Queue resource limits are configurable with
 New texts still need exact server tokenization; the queue rewrite does not
 introduce a bulk tokenizer endpoint or eliminate those requests. See the
 [queue and token contract](docs/PROGRESSIVE-EMBEDDING.md) and
-[architecture design](docs/EMBEDDING-QUEUE-DESIGN.md).
-The [public release record](docs/verification/PUBLIC-RELEASE-0.10.0.md) describes
+[current architecture](docs/ARCHITECTURE.md).
+The [public release record](docs/verification/PUBLIC-RELEASE-0.10.1.md) describes
 normalized assets, retained helper provenance and verification boundaries.
 Consumer installation remains a separate action. The
 [0.9.0 qualification](docs/verification/PROGRESSIVE-NATIVE-TOKENS-0.9.0.md)
-records the earlier engine's measurements and is not a qualification of 0.10.0.
-The [persistent-engine verification record](docs/verification/PERSISTENT-QUEUES-0.10.0.md)
-separates deterministic results, installed-wheel checks and bounded live evidence.
+records historical measurements. The [model batching verification record](docs/verification/MODEL-BATCHING-0.10.1.md)
+separates deterministic results, installed-wheel checks and bounded functional
+live evidence. No comparison with 0.9.0 was run for this correction.
 
 ## Earlier release 0.7.0
 
@@ -105,10 +110,10 @@ results and deployment boundaries.
 With Python 3.11 or later, install the tagged source:
 
 ```bash
-python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.10.0'
+python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.10.1'
 ```
 
-Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.10.0),
+Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.10.1),
 or run the following from a checkout:
 
 ```bash
@@ -189,7 +194,7 @@ directory, hostname, enrollment credentials when needed, coordination server
 and inference endpoint. The Python wheel remains portable and contains no
 native binary. Importing or constructing the library never launches a VPN.
 
-The [release](https://github.com/Damel91/llama-runtime/releases/tag/v0.10.0)
+The [release](https://github.com/Damel91/llama-runtime/releases/tag/v0.10.1)
 provides separate helper archives for macOS ARM64, Linux AMD64 and Windows
 AMD64. Go is needed to build the helper from source, not to run a supplied
 binary. Both Tailscale's coordinator and an explicit HTTPS Headscale

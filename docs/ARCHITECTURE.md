@@ -13,23 +13,36 @@ Generazione, embedding e scheduler mantengono le API esistenti. I test non certi
 compatibilità universale con ogni modello/template; l'integrazione dei consumer
 resta una fase distinta.
 
-La candidata locale `0.10.0` sostituisce il coordinamento embedding per finestra
-con un motore persistente dell'adapter. Preparazione esatta e HTTP avanzano in
+La versione `0.10.1` affida il coordinamento embedding a un motore persistente
+dell'adapter. Preparazione esatta e HTTP avanzano in
 pool di thread limitati; ogni replica verificata possiede una coda di record
 pronti. Un solo scheduler seleziona il batch quando dispone della capacità
 globale e locale, includendo il lavoro arrivato durante l'inferenza precedente.
 Le API sincrona e asincrona attendono i risultati dello stesso motore; le
-finestre restano confini di consegna ordinata. Le richieste con cancellazione
-indipendente non vengono fuse nello stesso POST. Il
+finestre restano confini di consegna ordinata. Record compatibili da finestre o
+chiamate diverse possono condividere un POST, mantenendo indici, risultati e
+cancellazione per proprietario. La cancellazione di uno non interrompe gli
+altri: il suo completamento attende il drain effettivo del trasporto condiviso,
+che ha una deadline finita fissata al massimo delle deadline iniziali. Il
 [progetto delle code persistenti](EMBEDDING-QUEUE-DESIGN.md) e il
 [contratto embedding](PROGRESSIVE-EMBEDDING.md) descrivono limiti e lifecycle.
 
 `batch_size` conserva il budget totale di testi e le quote bilanciate sulle
-repliche utilizzabili. `embedding_batch_wait_sec=0.0` elimina l'attesa artificiale
-predefinita; valori positivi mantengono coalescing opzionale nello stesso
+repliche utilizzabili, senza ridurre il target HTTP alla dimensione delle
+finestre sorgente. `embedding_batch_wait_sec=0.0` riempie i batch tramite eventi
+di preparazione e capacità senza richiedere un timer; il primo record pronto
+non forza un POST parziale mentre altro lavoro compatibile può avanzare.
+Valori positivi mantengono coalescing opzionale nello stesso
 percorso. I budget configurabili di byte pendenti, token preparati e payload
 completano la backpressure. Il lavoro locale non cambia gli slot del server e
 la tokenizzazione remota dei testi nuovi resta necessaria.
+
+Il credito di lookahead della preparazione e' distinto dalla vita del piano:
+si libera quando non restano gruppi da preparare ne' worker di preparazione
+attivi. Record pronti o in volo, crediti byte/token, risultati e ownership HTTP
+restano trattenuti fino alla rispettiva consegna o al drain. Anche la lease
+della finestra async resta occupata fino alla consegna o pulizia; liberare
+lookahead non significa liberare la capacita' HTTP.
 
 La versione `0.6.0` aggiunge il trasporto opzionale
 [Tailscale/Headscale](TAILNET.md). `TailnetConfig` mantiene la configurazione
@@ -173,10 +186,12 @@ I limiti effettivi combinano i tetti configurati e il contesto osservato, quando
 noti. Il batch conserva l'ordine, valida indici e vettori finiti e pubblica una
 nuova dimensione osservata soltanto dopo la validazione completa della chiamata.
 
-Soltanto l'errore HTTP 400 strutturato `exceed_context_size_error` consente lo
-split adattivo del batch; altri errori propagano. Un singolo input fuori limite
-fallisce senza troncamento implicito. Il recupero della dimensione del batch è
-progressivo dopo successi; non modifica il modello o le istanze del server.
+Il client HTTP nativo non ripete un POST embedding fallito o ambiguo.
+Per client iniettati con il contratto esplicito di recupero, soltanto l'errore
+HTTP 400 strutturato `exceed_context_size_error` consente lo split adattivo;
+gli altri errori propagano. Un singolo input fuori limite fallisce senza
+troncamento implicito. Il recupero della dimensione del batch è progressivo
+dopo successi; non modifica il modello o le istanze del server.
 
 Uno scheduler per adapter limita lavori attivi e accodati, anche fra chiamanti
 concorrenti. Ogni lavoro mantiene alias e posto fino alla pulizia HTTP;
@@ -189,8 +204,10 @@ conserva la motivazione architetturale dell'incremento.
 L'opt-in `embedding_replica_discovery` aggiunge uno snapshot delle istanze
 loaded, selezionate da nome logico, alias ancora o digest. L'identità dei byte
 e la compatibilità semantica sono dichiarate da Noxi nei tag nativi; la
-libreria non le deduce dal path. Il pool automatico applica una richiesta
-attiva per replica e gestisce ID operativi, refresh, pinning e cambi topologia
+libreria non le deduce dal path. Il pool automatico limita le richieste attive
+per replica agli slot positivi osservati e al limite globale configurato;
+capacita' sconosciuta implica una sola richiesta. Gestisce ID operativi,
+refresh, pinning e cambi topologia
 senza trasferire questi dettagli al consumer. Il contratto completo è in
 [AUTOMATIC-EMBEDDING-REPLICAS.md](AUTOMATIC-EMBEDDING-REPLICAS.md).
 

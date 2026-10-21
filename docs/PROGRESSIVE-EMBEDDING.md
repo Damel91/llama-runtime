@@ -1,8 +1,8 @@
 # Progressive preparation and native token inputs
 
-Contract for the local 0.10.0 candidate. Flower MCP governs requirements,
+Contract for version 0.10.1. Flower MCP governs requirements,
 implementation and verification in project `llama-runtime`, packet
-`PACKET-000015`. Qualification and consumer acceptance remain distinct.
+`PACKET-000017`. Qualification and consumer acceptance remain distinct.
 
 The [persistent queue engine design](EMBEDDING-QUEUE-DESIGN.md) records the
 architecture and verification requirements for replacing per-window
@@ -12,9 +12,10 @@ coordination and early batch selection.
 
 The synchronous and asynchronous embedding APIs register work with the same
 persistent execution engine and shared HTTP scheduler. Each verified replica
-has a queue of prepared records, with separate ownership for independent
-cancellation domains. Preparation publishes each record with its original
-input index. Public windows are result boundaries; they do not create their
+has a queue of prepared records. Compatible records from different calls or
+source windows can share an HTTP batch while retaining their individual
+cancellation and result ownership. Preparation publishes each record with its
+original input index. Public windows are result boundaries; they do not create their
 own blocking coordinator threads or determine the lifetime of the queues.
 
 `batch_size` remains the total-text budget for dynamic replica distribution.
@@ -22,24 +23,26 @@ Each quota remains affine to its discovered alias. Preparation and ready
 records accumulate within the adapter's admission and resource budgets while
 earlier inference is running. A batch is selected only when global and
 per-replica capacity are available; waiting work does not retain an already
-frozen list of batch indices. A slow input cannot block other ready records.
-Complete public windows and vectors retain input order.
+frozen list of batch indices. Records from different ready owners can combine;
+complete public windows and vectors retain input order.
 
-`embedding_batch_wait_sec` is finite and nonnegative, default `0.0`. At zero,
-a free replica dispatches eligible ready work without an artificial wait to
-fill the batch. While it is busy, later records continue to accumulate for the
-next dispatch. Sparse input or a slower tokenizer can still produce small
-batches; zero waiting does not guarantee full batches or maximum throughput.
+`embedding_batch_wait_sec` is finite and nonnegative, default `0.0`. Zero uses
+event-driven filling, without a required coalescing timer. A free replica does
+not have to dispatch the first ready record while compatible admitted work is
+still being prepared. Preparation, ready records, capacity and resource limits
+drive batching; tails flush when further filling cannot progress. Records
+accumulated during an earlier POST can join the next one. Sparse sources or
+resource limits can still produce partial batches.
 
 An explicit positive value remains an optional coalescing policy in the same
 engine. Its budget starts at the first unsent ready record and is not reset by
-new arrivals. A filled text/token cap, completed producer or expired wait can
+new arrivals. A filled text/token cap, exhausted eligible preparation or expired wait can
 flush the batch. The call/window deadline includes this waiting. This setting
 does not change finite HTTP and overall deadlines.
 
-Text caps come from a single distribution quota and adaptive limits, never
-from a hardcoded 8/64/128 or the number of records that happen to be ready.
-Accumulating multiple windows does not add their per-request text caps.
+Text targets derive from the configured total-text budget, usable replicas and
+adaptive limits, never from a hardcoded 8/64/128 or the size of a source window.
+Accumulating multiple windows neither shrinks nor multiplies these request caps.
 Native computation `n_batch`/`n_ubatch` remain separate from aggregate HTTP
 request token limits. Request-size and timing measurements accompany
 qualification.
@@ -62,6 +65,15 @@ Async intake also bounds source pulls and
 completed windows waiting for the consumer. Resource accounting does not
 claim a fixed process RSS.
 
+Preparation lookahead and retained work have separate lifetimes.
+`embedding_queue_size` adds to request parallelism to bound active preparation
+plans. A plan releases that phase lease when all its groups have been prepared
+and its preparation workers finish; ready or in-flight records can still be
+retained. Their byte/token credits, result reservations and shared HTTP leases
+are not released early. This lets several small source windows fill a replica's
+request target without requiring every earlier window's HTTP to finish first.
+Async source-window intake and delivery leases retain their existing bounds.
+
 Tokenizer concurrency is bounded across the adapter; HTTP control work has a
 separate bound, and total HTTP capacity is derived from the embedding,
 tokenizer and control limits. Retained records and IDs have no unbounded
@@ -73,6 +85,14 @@ earlier work is not replayed. No partial public window is returned. Preparation
 still measures oversized inputs; known limits/identity are rechecked at
 admission. Cancellation, finite deadlines, async backpressure and drained close
 retain the existing contracts.
+
+Cancelling or expiring an owner removes its pending work and discards its
+portion of any shared response without aborting surviving owners. A shared
+transport has one finite deadline fixed from the latest deadline among its
+initial members; later cancellation does not extend it. The cancelled owner's
+completion waits for that transport's actual drain and can therefore outlast
+its own work deadline. When every member is stopped, or the adapter closes,
+the request is cancelled and drained. No successful inputs are replayed.
 
 ## Native token input
 
@@ -146,6 +166,6 @@ the [embedding contract](EMBEDDING-CONTRACTS.md).
 
 The [0.9.0 coalescing comparison](verification/COALESCING-TUNING-0.9.0.md)
 records earlier Nomic measurements. Its timer recommendation applies to that
-engine and workload, not automatically to 0.10.0. Compare zero waiting and any
+engine and workload, not automatically to 0.10.1. Compare zero waiting and any
 explicit coalescing value using the same model, build, profiles, corpus and
 numerical thresholds; distinguish preparation, queue, HTTP and total times.

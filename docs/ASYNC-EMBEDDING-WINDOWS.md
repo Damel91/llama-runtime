@@ -1,6 +1,6 @@
 # Asynchronous embedding windows
 
-Public interface introduced in the local 0.8.0 candidate and retained in 0.10.0.
+Public interface introduced in the local 0.8.0 candidate and retained in 0.10.1.
 The [progressive queue and native token path](PROGRESSIVE-EMBEDDING.md) now run
 inside the same shared execution engine. The synchronous embedding API remains
 available. Flower MCP governs requirements, the work
@@ -53,6 +53,10 @@ pulling the source. This prevents multiple streams from creating an unbounded
 pending-work registry. The global intake capacity derives from the existing
 positive request parallelism plus queue budget. These are counts of windows,
 not a byte limit on individual strings or memory retained by the caller.
+This intake lease is distinct from an internal preparation-lookahead lease:
+completed preparation can free lookahead for another plan while the original
+window, its records, results and HTTP ownership remain retained. It does not
+free that window's intake lease before delivery or cleanup.
 
 The adapter's `batch_size` continues to control total-text windows for replica
 quotas. Source windows are result boundaries and can contain multiple internal
@@ -66,9 +70,13 @@ of HTTP jobs. A completion Future is settled only after the owned work drains,
 rather than merely when its waiter has been cancelled.
 
 Engine-owned byte and prepared-token budgets complement window counts; see
-the [resource settings](PROGRESSIVE-EMBEDDING.md). Independent windows preserve
-their own cancellation and finite-deadline domains and are not silently fused
-into a shared POST that could only be cancelled as a whole.
+the [resource settings](PROGRESSIVE-EMBEDDING.md). Source windows are delivery
+boundaries, not HTTP batch boundaries. Compatible prepared records can share a
+POST across windows or callers, retaining each owner's cancellation, deadline
+and output indices. The request target derives from the adapter's text budget
+and usable replicas; small source windows do not force small request caps.
+With the default zero wait, preparation and capacity events drive filling
+without a required timer, and remaining tails flush when filling cannot progress.
 
 ## Deadlines, failure and ownership
 
@@ -85,13 +93,21 @@ reported as complete and no successful inference is replayed. Backend and
 timeout errors retain their typed contracts. Source exceptions remain source
 exceptions. Task cancellation propagates as `asyncio.CancelledError` after
 owned cleanup; explicit cancellation probes retain `LLMCancelledError`.
+If a stopped window contributed to shared HTTP, its pending records are removed
+and its response portion is discarded. Surviving windows keep the transport.
+Its finite deadline was fixed at dispatch from the latest initial member
+deadline; it does not grow when membership changes. The stopped window's Future
+settles after actual shared transport drain, which may exceed its own work
+deadline. When all members stop, or the adapter closes, HTTP is cancelled and
+drained. A mixed request failure retains typed outcomes without replaying
+already evaluated inputs.
 If source cleanup also fails, the primary window error or cancellation is
 preserved and the cleanup failure is chained as its cause, including during
 async-context exit. Standalone `aclose()` can report a source cleanup failure.
 
 Cancelling an asyncio future alone does not stop a running thread. The bridge
 must register calls before dispatch, set the real cooperative stop signal,
-retain the engine Future and await its drain off-loop, including during
+retain the engine Future and await its owned/shared drain off-loop, including during
 repeated cancellation. Cancelling one stream must not close its shared adapter
 or cancel another caller. Close is idempotent.
 
