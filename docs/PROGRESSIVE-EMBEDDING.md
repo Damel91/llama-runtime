@@ -1,6 +1,6 @@
 # Progressive preparation and native token inputs
 
-Contract for the local 0.10.2 candidate. Flower MCP governs requirements,
+Contract for version 0.10.2. Flower MCP governs requirements,
 implementation and verification in project `llama-runtime`. `PACKET-000018`
 covers metadata and exact-ID reuse; complementary `PACKET-000019` covers
 interrupted blocking waits and incremental ready-queue accounting under adopted

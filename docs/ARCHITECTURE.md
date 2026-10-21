@@ -13,7 +13,7 @@ Generazione, embedding e scheduler mantengono le API esistenti. I test non certi
 compatibilità universale con ogni modello/template; l'integrazione dei consumer
 resta una fase distinta.
 
-La candidata locale `0.10.2` affida il coordinamento embedding a un motore persistente
+La versione `0.10.2` affida il coordinamento embedding a un motore persistente
 dell'adapter. Preparazione esatta e HTTP avanzano in
 pool di thread limitati; ogni replica verificata possiede una coda di record
 pronti. Un solo scheduler seleziona il batch quando dispone della capacità
@@ -44,7 +44,7 @@ restano trattenuti fino alla rispettiva consegna o al drain. Anche la lease
 della finestra async resta occupata fino alla consegna o pulizia; liberare
 lookahead non significa liberare la capacita' HTTP.
 
-La candidata `0.10.2` riusa osservazioni metadata coerenti durante l'ammissione,
+La versione `0.10.2` riusa osservazioni metadata coerenti durante l'ammissione,
 senza ripetere il catalogo gia' letto per l'appartenenza al pool. Prima dei POST
 restano verificati identita', build tokenizer e limiti correnti. Una cache LRU
 dell'adapter conserva solo tuple di ID esatti completati: identita' verificata,

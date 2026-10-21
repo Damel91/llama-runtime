@@ -216,4 +216,4 @@ dei hook di preparazione/issue/validazione dei record pubblici. Le somme dei
 wall dei worker possono sovrapporsi e non sono elapsed, tempo CPU o tempo GPU.
 Il riuso non e' un benchmark a cache fredda. Il totale atteso e'536tokenize
 con riuso,528senza; restano i tetti globali550/600/1200e180secondi. La prova non
-installa wheel, migra consumer o pubblica la candidata locale0.10.2.
+installa wheel, migra consumer o pubblica una release.

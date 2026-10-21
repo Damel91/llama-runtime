@@ -1,6 +1,6 @@
 # Embedding contracts and public preparation
 
-This guide describes embedding semantics in the local 0.10.2 candidate. The
+This guide describes embedding semantics in version 0.10.2. The
 [progressive queue and native token contract](PROGRESSIVE-EMBEDDING.md) extends
 the scheduler shared by synchronous calls and async window sources. Local
 qualification, publication and consumer acceptance remain distinct; see
@@ -80,7 +80,7 @@ an alias/topology change alone does not change the count. An unverified fallback
 or unknown tokenizer build requires recounting. There is no unbounded record
 registry or cache.
 
-The local 0.10.2 candidate adds a bounded adapter-owned LRU cache for completed
+Version 0.10.2 adds a bounded adapter-owned LRU cache for completed
 exact token tuples. Prepared and raw inputs can reuse a tuple only for the
 same verified weights and semantic identity, tokenizer build, task, text and
 prefix/special policy. A changed context limit alone does not invalidate an

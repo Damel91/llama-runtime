@@ -56,9 +56,9 @@ against the forwarded JSON Schema. Splitting source documents and tracking their
 fragments belong to the consuming application. The server's own auto-loading
 policy is supported.
 
-## Local 0.10.2 candidate
+## Release 0.10.2
 
-The local candidate reduces redundant metadata observations while preserving
+Version 0.10.2 reduces redundant metadata observations while preserving
 fresh identity and loaded-limit checks before inference. It also retains a
 bounded adapter-owned cache of completed exact token IDs, keyed by verified
 weights, tokenizer build, task and prefix/special-token policy. A matching
@@ -82,15 +82,17 @@ preserving surviving callers and the shared adapter.
 Qualification separates the 511 previously unseen texts from a later prepared/raw
 reuse exercise. The existing oversized-input check runs first with an unrelated
 text; it does not populate the cache for those 511 inputs. Worker-time sums and
-HTTP intervals are reported separately;
-neither is pure GPU time. This candidate is a local wheel delivery, with no
-consumer migration or new public release implied. Public installation links
-below continue to target 0.10.1.
+HTTP intervals are reported separately; neither is pure GPU time. The qualified
+511-text run used 24 metadata requests instead of 50, with 511 exact tokenizer
+requests and four embedding POSTs. It does not demonstrate a wall-time speedup.
+Consumer installation remains a separate action.
 
 See the [0.10.2 qualification report](docs/verification/METADATA-PREPARATION-0.10.2.md)
 for interruption, packing, request counts and exact-reuse evidence.
+The [public release record](docs/verification/PUBLIC-RELEASE-0.10.2.md) describes
+normalized assets, unchanged helper provenance and installation checks.
 
-## Release 0.10.1
+## Earlier release 0.10.1
 
 Version 0.10.1 corrects model-wide accumulation in the persistent embedding
 engine. Tokenizer workers publish ready records into queues owned by
@@ -144,10 +146,10 @@ results and deployment boundaries.
 With Python 3.11 or later, install the tagged source:
 
 ```bash
-python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.10.1'
+python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.10.2'
 ```
 
-Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.10.1),
+Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.10.2),
 or run the following from a checkout:
 
 ```bash
@@ -228,7 +230,7 @@ directory, hostname, enrollment credentials when needed, coordination server
 and inference endpoint. The Python wheel remains portable and contains no
 native binary. Importing or constructing the library never launches a VPN.
 
-The [release](https://github.com/Damel91/llama-runtime/releases/tag/v0.10.1)
+The [release](https://github.com/Damel91/llama-runtime/releases/tag/v0.10.2)
 provides separate helper archives for macOS ARM64, Linux AMD64 and Windows
 AMD64. Go is needed to build the helper from source, not to run a supplied
 binary. Both Tailscale's coordinator and an explicit HTTPS Headscale

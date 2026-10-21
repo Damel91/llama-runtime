@@ -6,7 +6,7 @@ server, model or device configuration.
 
 ## Embedding and external replicas
 
-In the local 0.10.2 candidate, `embedding_request_parallelism` limits active
+In version 0.10.2, `embedding_request_parallelism` limits active
 embedding HTTP work across an adapter. Its default is 4 with automatic replica
 discovery and 1 otherwise. `embedding_queue_size` defaults to 16 and adds
 bounded preparation lookahead to the request-parallelism budget; zero retains
