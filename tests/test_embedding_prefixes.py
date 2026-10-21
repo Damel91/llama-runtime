@@ -258,7 +258,7 @@ def test_adaptive_capacity_split_does_not_apply_prefix_twice(make_adapter):
     client = RecordingClient(
         responses=[ClientHTTPError(400, error_type="exceed_context_size_error")]
     )
-    adapter, _ = make_adapter(client, batch_size=4)
+    adapter, _ = make_adapter(client, batch_size=4, embedding_batch_wait_sec=0.5)
     expected = ["D: a", "D: b", "D: c", "D: d"]
     assert adapter.embed_texts(["a", "b", "c", "d"]) == [vector(t) for t in expected]
     assert [batch for batch, _, _ in client.embedding_calls] == [

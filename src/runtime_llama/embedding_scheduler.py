@@ -193,6 +193,44 @@ class EmbeddingScheduler:
         with self._condition:
             return job.future if self._try_admit(job) else None
 
+    def has_capacity(self, model: str) -> bool:
+        """Observe immediate admission without reserving or enqueueing work."""
+        with self._condition:
+            return (
+                not self._closed
+                and model in self._limits
+                and self._can_dispatch(model)
+                and not any(job.model == model for job in self._queue)
+            )
+
+    def try_dispatch(
+        self,
+        run: Callable[[str], Any],
+        check: Callable[[], None],
+        *,
+        model: str,
+    ) -> Future | None:
+        """Start only with actual capacity; never freeze a batch in the queue.
+
+        Persistent record queues own work that cannot start yet. Their caller
+        selects the current batch immediately before this operation and keeps
+        ownership when it returns None. Cancellation callbacks run outside the
+        scheduler lock; the worker checks again before touching the transport.
+        """
+        check()
+        job = _Job(run, check, Future(), model)
+        with self._condition:
+            if self._closed:
+                raise LLMBackendError("llamacpp_embedding_adapter_closed")
+            if model not in self._limits:
+                raise LLMBackendError("llamacpp_embedding_unknown_replica")
+            if not self._can_dispatch(model) or any(
+                queued.model == model for queued in self._queue
+            ):
+                return None
+            self._dispatch(job)
+            return job.future
+
     def _try_admit(self, job: _Job) -> bool:
         """Shared admission while holding the scheduler condition lock."""
         job.check()

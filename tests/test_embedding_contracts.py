@@ -182,6 +182,8 @@ def configured(client, **changes):
         "model": NAME,
         "embedding_replica_discovery": True,
         "batch_size": 256,
+        # Keep packing assertions independent from readiness/thread timing.
+        "embedding_batch_wait_sec": 0.5,
         "embedding_request_parallelism": 4,
         "embedding_queue_size": 2,
         "token_count_parallelism": 2,

@@ -309,7 +309,7 @@ def test_progressive_flush_respects_explicit_http_budget_or_adaptive_text_cap(
         adapter.close()
 
 
-@pytest.mark.parametrize("wait", [0, -1, True, float("inf"), float("nan"), "slow"])
+@pytest.mark.parametrize("wait", [-1, True, float("inf"), float("nan"), "slow"])
 def test_invalid_coalescing_wait_is_rejected_before_transport(wait):
     client = TokenClient()
     with pytest.raises(ValueError):
@@ -348,10 +348,10 @@ def test_progressive_ready_pressure_remains_bounded_across_shared_callers(monkey
             assert client.token_peak <= 1 and client.embed_peak <= 1
             # One configured lookahead quota remains leased through its HTTP
             # drain; additional callers cannot prepare unbounded ready data.
-            acquired = adapter._preparation_permits.acquire(blocking=False)
-            if acquired:
-                adapter._preparation_permits.release()
-            assert not acquired
+            pressure = adapter._engine.snapshot()
+            assert pressure["active_plans"] == pressure["peak_active_plans"] == 1
+            assert pressure["pending_bytes"] <= adapter.embedding_max_pending_bytes
+            assert pressure["pending_tokens"] <= adapter.embedding_max_pending_tokens
             assert len(client.token_calls) <= 20
             cancel.set()
             for job in jobs:

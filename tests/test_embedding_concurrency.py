@@ -159,6 +159,10 @@ def configured(base_url, **changes):
         "base_url": base_url,
         "timeout": 2,
         "batch_size": 2,
+        # Exact-array assertions opt into coalescing. Full text/token caps and
+        # completed preparation still flush immediately, independent of worker
+        # interleaving; the optional timer cannot expire before this deadline.
+        "embedding_batch_wait_sec": 30,
         "embedding_request_parallelism": 4,
         "embedding_queue_size": 2,
         "embedding_replicas": [
@@ -188,17 +192,29 @@ def test_real_http_four_in_flight_two_replicas_and_bounded_shared_queue():
                 a = callers.submit(adapter.embed_texts, first)
                 b = callers.submit(adapter.embed_texts, second)
                 eventually(lambda: state.active == 4)
-                eventually(lambda: adapter._scheduler.snapshot()["queued"] == 2)
+                eventually(
+                    lambda: (
+                        adapter._engine.snapshot()["active_plans"] == 6
+                        and sum(adapter._engine.snapshot()["ready_by_replica"].values())
+                        == 2
+                    )
+                )
                 assert state.peak == 4
                 assert state.peak_by_model == {"embed": 2, "embed_1": 2}
+                # Two additional plans remain as ready records, without
+                # freezing their payloads into queued HTTP jobs.
+                assert adapter._scheduler.snapshot()["queued"] == 0
                 state.release.set()
                 assert a.result(timeout=5) == vectors(first)
                 assert b.result(timeout=5) == vectors(second)
             status = adapter.health_status()
             assert status["scheduler"]["peak_in_flight"] == 4
-            assert status["scheduler"]["peak_queued"] == 2
+            assert status["scheduler"]["peak_queued"] == 0
             assert status["scheduler"]["queued"] == 0
             assert status["scheduler"]["in_flight"] == 0
+            assert adapter._engine.snapshot()["peak_active_plans"] == 6
+            assert adapter._engine.snapshot()["active_plans"] == 0
+            assert not any(adapter._engine.snapshot()["ready_by_replica"].values())
             assert status["model_ready"] and status["server_healthy"]
             observed = [text for _, batch in state.calls for text in batch]
             assert Counter(observed) == Counter(first + second)
@@ -308,7 +324,15 @@ def test_real_http_failure_stops_unsent_batches_and_next_call_recovers():
 
         state.action = action
         adapter = LlamaCppEmbeddingAdapter(
-            configured(url, embedding_request_parallelism=1)
+            configured(
+                url,
+                # A single distribution window keeps the first two ready
+                # records consecutive. The independent HTTP token budget
+                # produces many requests; failure must stop every unsent one.
+                batch_size=30,
+                batch_token_limit=4,
+                embedding_request_parallelism=1,
+            )
         )
         try:
             with pytest.raises(ClientHTTPError):

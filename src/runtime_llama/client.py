@@ -895,6 +895,7 @@ class LlamaCppClient:
         *,
         timeout: float | None = None,
         cancel_wait: bool = False,
+        max_response_bytes: int | None = None,
         **kwargs: Any,
     ) -> Any:
         if "idle_timeout" in kwargs:
@@ -909,6 +910,7 @@ class LlamaCppClient:
             cancel=cancel,
             timeout=timeout,
             cancel_wait=cancel_wait,
+            max_response_bytes=max_response_bytes,
         )
 
     def tokenize(
@@ -918,6 +920,7 @@ class LlamaCppClient:
         *,
         timeout: float | None = None,
         cancel_wait: bool = False,
+        max_response_bytes: int | None = None,
         **kwargs: Any,
     ) -> Any:
         if "idle_timeout" in kwargs:
@@ -929,6 +932,7 @@ class LlamaCppClient:
             cancel=cancel,
             timeout=timeout,
             cancel_wait=cancel_wait,
+            max_response_bytes=max_response_bytes,
         )
 
     def detokenize(

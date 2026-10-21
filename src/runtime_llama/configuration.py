@@ -278,8 +278,11 @@ class AdapterProfile:
     embedding_replicas: tuple[EmbeddingReplicaConfig, ...] = ()
     embedding_prefixes: EmbeddingPrefixes = field(default_factory=EmbeddingPrefixes)
     embedding_replica_discovery: bool = False
-    embedding_batch_wait_sec: float = 0.5
+    embedding_batch_wait_sec: float = 0.0
     embedding_input_format: str = "auto"
+    embedding_max_pending_bytes: int = 64 * 1024 * 1024
+    embedding_max_pending_tokens: int = 1024 * 1024
+    embedding_max_request_bytes: int = 8 * 1024 * 1024
 
     def __post_init__(self) -> None:
         if self.adapter_type not in {"llm", "embedding"}:
@@ -299,13 +302,19 @@ class AdapterProfile:
             _positive_int(getattr(self, name), name)
         if self.normalize is not None and not isinstance(self.normalize, bool):
             raise ValueError("normalize must be boolean")
+        for name in (
+            "embedding_max_pending_bytes",
+            "embedding_max_pending_tokens",
+            "embedding_max_request_bytes",
+        ):
+            if _positive_int(getattr(self, name), name) is None:
+                raise ValueError(f"{name} must be a positive integer")
         object.__setattr__(
             self,
             "embedding_batch_wait_sec",
             _finite(
                 self.embedding_batch_wait_sec,
                 "embedding_batch_wait_sec",
-                positive=True,
             ),
         )
         if self.embedding_input_format not in ("auto", "text", "tokens"):
@@ -447,6 +456,9 @@ class AdapterProfile:
                 "embedding_replica_discovery",
                 "embedding_batch_wait_sec",
                 "embedding_input_format",
+                "embedding_max_pending_bytes",
+                "embedding_max_pending_tokens",
+                "embedding_max_request_bytes",
             )
             if name in merged
         }

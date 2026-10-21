@@ -25,6 +25,9 @@ def profile(**changes):
         ),
         generation=SimpleNamespace(api_key=None, api_key_env=None),
         batch_size=32,
+        # These tests exercise full-batch validation/recovery; zero-delay
+        # progressive dispatch is covered separately by the queue-engine tests.
+        embedding_batch_wait_sec=0.5,
         batch_token_limit=None,
         token_count_parallelism=1,
         normalize=False,
@@ -167,7 +170,9 @@ def test_preflight_and_embedding_are_progressive_by_item_batch():
         return tokenize(content, **kwargs)
 
     def request(input, **kwargs):
-        if input == incoming[:2]:
+        # Persistent queues may combine ready records from internal windows;
+        # the first HTTP, rather than one specific composition, owns this gate.
+        if not first_started.is_set():
             first_started.set()
             assert release_first.wait(3)
         return embeddings(input, **kwargs)
@@ -186,11 +191,10 @@ def test_preflight_and_embedding_are_progressive_by_item_batch():
             assert pending.result(timeout=3) == [
                 [float(len(text)), 1.0] for text in incoming
             ]
-        assert [call[0] for call in client.embedding_calls] == [
-            incoming[:2],
-            incoming[2:4],
-            incoming[4:],
-        ]
+        assert [len(call[0]) for call in client.embedding_calls] == [2, 2, 2]
+        assert sorted(
+            text for batch, _, _ in client.embedding_calls for text in batch
+        ) == sorted(incoming)
         assert sorted(text for text, _ in client.tokenize_calls) == sorted(incoming)
         for position, (kind, batch) in enumerate(client.events):
             if kind == "embedding":
@@ -616,6 +620,7 @@ def test_actual_profile_and_http_client_integrate_without_runtime_or_sdk():
             "normalize": True,
             "model_context_length": 12,
             "max_input_tokens": 9,
+            "embedding_batch_wait_sec": 0.5,
         },
     )
     session = Session()

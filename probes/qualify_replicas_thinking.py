@@ -485,6 +485,8 @@ def embedding_profile(args, caps: dict[str, int]) -> dict:
         "dimension": DIMENSION,
         "normalize": True,
         "token_count_parallelism": 1,
+        # Pin the historical qualification profile across library defaults.
+        "embedding_batch_wait_sec": 0.5,
         "embedding_request_parallelism": 4,
         "embedding_queue_size": 8,
         "embedding_replicas": [

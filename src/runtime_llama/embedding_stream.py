@@ -1,11 +1,9 @@
-"""Bounded async window intake over the existing synchronous embedding engine."""
+"""Bounded async window intake over the shared persistent embedding engine."""
 
 from __future__ import annotations
 
 import asyncio
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
-from contextvars import copy_context
 from dataclasses import dataclass
 import math
 from threading import Event
@@ -63,7 +61,7 @@ class _Window:
 
 
 class _EmbeddingWindowBridge:
-    """Bounded coordinator workers, never a second HTTP scheduler."""
+    """Async intake leases and result ownership, without coordinator workers."""
 
     def __init__(self, adapter):
         self.adapter = adapter
@@ -74,7 +72,6 @@ class _EmbeddingWindowBridge:
         self.streams = set()
         self.used = 0
         self.changed = None
-        self.executor = None
 
     def activate(self, stream, loop):
         with self.adapter._calls_lock:
@@ -120,50 +117,17 @@ class _EmbeddingWindowBridge:
         self._notify()
 
     def submit(self, window, *, prepared, input_type, call):
-        adapter = self.adapter
-        context = copy_context()
-        with adapter._calls_condition:
-            if adapter._closed or adapter._closing.is_set():
-                raise LLMBackendError("llamacpp_embedding_adapter_closed")
-            # Register before submit so close also sees queued coordinators.
-            adapter._calls.add(call)
-            try:
-                if self.executor is None:
-                    self.executor = ThreadPoolExecutor(
-                        max_workers=self.capacity,
-                        thread_name_prefix="runtime_llama_window",
-                    )
-                future = self.executor.submit(
-                    context.run,
-                    adapter._stream_execute,
-                    window,
-                    prepared,
-                    input_type,
-                    call,
-                )
-            except BaseException:
-                adapter._calls.discard(call)
-                adapter._calls_condition.notify_all()
-                raise
-
-        def finished(_future):
-            # Also handles a coordinator cancelled before _execute starts.
-            with adapter._calls_condition:
-                adapter._calls.discard(call)
-                adapter._calls_condition.notify_all()
-
-        future.add_done_callback(finished)
-        return future
+        # Registration is nonblocking and belongs to the shared engine. Its
+        # Future completes only after preparation, HTTP and their leases drain.
+        return self.adapter._stream_submit(
+            window, prepared=prepared, input_type=input_type, call=call
+        )
 
     def signal_close(self):
         with self.adapter._calls_lock:
             streams = tuple(self.streams)
         for stream in streams:
             stream._adapter_closed()
-
-    def shutdown(self):
-        if self.executor is not None:
-            self.executor.shutdown(wait=True, cancel_futures=True)
 
 
 class EmbeddingWindowStream:
@@ -258,6 +222,7 @@ class EmbeddingWindowStream:
             self._pull_call.stop.set()
         for window in self._pending:
             window.call.stop.set()
+        self._adapter._engine.wake()
         self._notify()
 
     def _fail(self, exc):
@@ -345,6 +310,15 @@ class EmbeddingWindowStream:
                 self._fail(future.exception())
         self._notify()
 
+    def _release_window(self, window):
+        # A completed result can still occupy the engine's memory budget while
+        # it waits for ordered delivery or a slow consumer. Transfer/discard it
+        # before releasing the source/window admission lease.
+        try:
+            self._adapter._stream_release_result(window.call)
+        finally:
+            self._bridge.release()
+
     def _ensure_cleanup(self):
         if self._cleanup_task is None and self._loop is not None:
             self._cleanup_task = self._loop.create_task(self._cleanup())
@@ -373,8 +347,7 @@ class EmbeddingWindowStream:
                     return_exceptions=True,
                 )
             while self._pending:
-                self._pending.popleft()
-                self._bridge.release()
+                self._release_window(self._pending.popleft())
             if self._close_source:
                 close = getattr(self._iterator, "aclose", None)
                 if callable(close):
@@ -409,7 +382,7 @@ class EmbeddingWindowStream:
                         self._fail(exc)
                         continue
                     self._pending.popleft()
-                    self._bridge.release()
+                    self._release_window(window)
                     self._notify()
                     return result
                 if self._exhausted and not self._pending:

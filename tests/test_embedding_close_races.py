@@ -1,68 +1,83 @@
-"""Deterministic executor-close races and busy-replica admission regressions."""
+"""Deterministic close races and busy-replica admission regressions."""
 
 from collections import Counter
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 
 import pytest
 
 from runtime_llama.errors import LLMBackendError
 
-from test_embedding_contracts import ContractClient, configured, vector
+from test_embedding_contracts import ContractClient, configured, eventually, vector
 
 
-@pytest.mark.parametrize("boundary", ["closed_submit", "cancelled_future"])
+@pytest.mark.parametrize("phase", ["metadata", "preparation", "queued"])
 @pytest.mark.parametrize("prior_failure", [False, True])
-def test_close_at_preparation_submission_preserves_typed_first_failure(
-    monkeypatch, boundary, prior_failure
+def test_close_during_pending_work_preserves_typed_first_failure(
+    monkeypatch, phase, prior_failure
 ):
     client = ContractClient(1)
-    adapter = configured(client, timeout=5)
-    executor = adapter._preparation_executor
-    original_submit, original_shutdown = executor.submit, executor.shutdown
-    submission_entered, executor_shutdown = Event(), Event()
-    cancelled = Future()
+    client.token_gate.clear()
+    adapter = configured(
+        client,
+        timeout=5,
+        token_count_parallelism=1,
+        embedding_request_parallelism=1,
+        embedding_queue_size=0,
+    )
+    metadata_entered, release_metadata = Event(), Event()
+    props = client.props
     expected = LLMBackendError("test_existing_backend_failure")
 
-    def submit(run):
-        if prior_failure:
-            # A concurrent child can fail before close cancels another future.
-            with adapter._calls_lock:
-                call = next(iter(adapter._calls))
-            call.fail(expected)
-        submission_entered.set()
-        assert executor_shutdown.wait(3), "close did not shut down preparation"
-        if boundary == "closed_submit":
-            # Exercise the real executor's post-shutdown RuntimeError.
-            return original_submit(run)
-        assert cancelled.cancelled()
-        return cancelled
+    def observed_props(*args, **kwargs):
+        if phase == "metadata":
+            metadata_entered.set()
+            client._wait(
+                release_metadata,
+                cancel=kwargs.get("cancel"),
+                timeout=kwargs.get("timeout"),
+            )
+        return props(*args, **kwargs)
 
-    def shutdown(*args, **kwargs):
-        original_shutdown(*args, **kwargs)
-        # Model a queued executor future cancelled by cancel_futures=True,
-        # at the boundary after check() and before the coordinator reads it.
-        cancelled.cancel()
-        executor_shutdown.set()
-
-    monkeypatch.setattr(executor, "submit", submit)
-    monkeypatch.setattr(executor, "shutdown", shutdown)
+    monkeypatch.setattr(client, "props", observed_props)
     try:
-        with ThreadPoolExecutor(max_workers=2) as callers:
-            pending = callers.submit(adapter.embed_query, "one")
-            assert submission_entered.wait(2)
-            closing = callers.submit(adapter.close)
-            with pytest.raises(LLMBackendError) as failure:
-                pending.result(timeout=4)
-            if prior_failure:
-                assert failure.value is expected
-            else:
-                assert str(failure.value) == "llamacpp_embedding_adapter_closed"
-            closing.result(timeout=4)
+        with ThreadPoolExecutor(max_workers=4) as callers:
+            pending = [callers.submit(adapter.embed_query, "one")]
+            try:
+                assert (
+                    metadata_entered if phase == "metadata" else client.token_started
+                ).wait(2)
+                if phase == "queued":
+                    pending.append(callers.submit(adapter.embed_query, "two"))
+                    eventually(lambda: len(adapter._calls) == 2)
+                    assert client.token_active == 1
+                    assert len(client.token_calls) == 1
+                if prior_failure:
+                    # A child can already have failed before close interrupts
+                    # another active or queued part of the same call.
+                    with adapter._calls_lock:
+                        calls = tuple(adapter._calls)
+                    for call in calls:
+                        call.fail(expected)
+                closing = callers.submit(adapter.close)
+                for future in pending:
+                    with pytest.raises(LLMBackendError) as failure:
+                        future.result(timeout=4)
+                    if prior_failure:
+                        assert failure.value is expected
+                    else:
+                        assert str(failure.value) == "llamacpp_embedding_adapter_closed"
+                closing.result(timeout=4)
+            finally:
+                release_metadata.set()
+                client.token_gate.set()
         assert not adapter._calls
         assert adapter._scheduler.snapshot()["in_flight"] == 0
+        assert client.token_active == client.embed_active == 0
+        assert not client.embedding_calls
     finally:
-        executor_shutdown.set()
+        release_metadata.set()
+        client.token_gate.set()
         adapter.close()
 
 
@@ -79,14 +94,18 @@ def test_busy_replica_does_not_block_collection_of_other_prepared_quota(monkeypa
         timeout=5,
     )
     a_first_entered, b_second_entered, release_a = Event(), Event(), Event()
-    prepare_job, embeddings = adapter._prepare_job, client.embeddings
+    tokenize, embeddings = client.tokenize, client.embeddings
 
-    def prepare(inputs, model, offset, call, conservative):
+    def prepare(content, *, model=None, **kwargs):
         if model == "embed_1":
-            # Ensure B is still in preparations when A becomes ready, so the
-            # coordinator must collect it while A's next request cannot start.
-            assert a_first_entered.wait(3)
-        return prepare_job(inputs, model, offset, call, conservative)
+            # B is still preparing when A becomes ready; its eventual ready
+            # records must advance while A's next HTTP cannot acquire a slot.
+            client._wait(
+                a_first_entered,
+                cancel=kwargs.get("cancel"),
+                timeout=kwargs.get("timeout"),
+            )
+        return tokenize(content, model=model, **kwargs)
 
     def request(input, *, model, **kwargs):
         result = embeddings(input, model=model, **kwargs)
@@ -101,7 +120,7 @@ def test_busy_replica_does_not_block_collection_of_other_prepared_quota(monkeypa
             b_second_entered.set()
         return result
 
-    monkeypatch.setattr(adapter, "_prepare_job", prepare)
+    monkeypatch.setattr(client, "tokenize", prepare)
     monkeypatch.setattr(client, "embeddings", request)
     try:
         with ThreadPoolExecutor(max_workers=1) as callers:

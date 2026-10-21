@@ -2,7 +2,8 @@
 
 import asyncio
 from collections import Counter
-from threading import Event, enumerate as threads
+from concurrent.futures import Future
+from threading import Event, enumerate as threads, get_ident
 from typing import get_type_hints
 
 import pytest
@@ -1138,6 +1139,296 @@ def test_active_adapter_rejects_a_second_event_loop_before_source_pull():
             pending.cancel()
             await asyncio.gather(pending, return_exceptions=True)
             await first.aclose()
+            await adapter.aclose()
+
+    run(scenario)
+
+
+def test_bridge_submits_directly_on_loop_and_holds_out_of_order_engine_results(
+    monkeypatch,
+):
+    """The bridge registers work; it neither runs nor schedules coordinators."""
+
+    async def scenario():
+        client = ContractClient(1)
+        adapter = configured(
+            client, embedding_request_parallelism=1, embedding_queue_size=1
+        )
+        loop_thread = get_ident()
+        submitted, changed = [], asyncio.Event()
+        calls, released = [], []
+
+        def submit(window, *, prepared, input_type, call):
+            assert get_ident() == loop_thread
+            assert prepared is False and input_type == "document"
+            future = Future()
+            submitted.append((tuple(window), future))
+            calls.append(call)
+            changed.set()
+            return future
+
+        monkeypatch.setattr(adapter, "_stream_submit", submit)
+        monkeypatch.setattr(adapter, "_stream_release_result", released.append)
+        source = WindowSource([["first"], ["second"]])
+        stream = adapter.astream_texts(source, max_pending_windows=2)
+        pending = asyncio.create_task(anext(stream))
+        try:
+            while len(submitted) < 2:
+                changed.clear()
+                if len(submitted) < 2:
+                    await asyncio.wait_for(changed.wait(), 2)
+            await checkpoint()
+            assert source.pulls == 2 and not pending.done()
+            assert not client.token_calls and not client.embedding_calls
+            assert not [
+                thread
+                for thread in threads()
+                if thread.name.startswith("runtime_llama_window")
+            ]
+
+            submitted[1][1].set_result([vector("second")])
+            await checkpoint()
+            assert not pending.done() and source.pulls == 2
+            assert not released
+            submitted[0][1].set_result([vector("first")])
+            assert await asyncio.wait_for(pending, 2) == [vector("first")]
+            assert released == calls[:1]
+            assert await anext(stream) == [vector("second")]
+            assert released == calls
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream)
+            assert adapter._async_window_bridge.used == 0
+        finally:
+            for window, future in submitted:
+                if not future.done():
+                    future.set_result([vector(text) for text in window])
+            if not pending.done():
+                pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+            await stream.aclose()
+            await adapter.aclose()
+
+    run(scenario)
+
+
+def test_bridge_cancellation_keeps_engine_future_until_actual_drain(monkeypatch):
+    """Cancelling a task must not cancel the future that proves engine drain."""
+
+    async def scenario():
+        client = ContractClient(1)
+        adapter = configured(client)
+        submitted, changed = [], asyncio.Event()
+        released = []
+
+        def submit(window, *, prepared, input_type, call):
+            future = Future()
+            submitted.append((call, future))
+            changed.set()
+            return future
+
+        monkeypatch.setattr(adapter, "_stream_submit", submit)
+        monkeypatch.setattr(adapter, "_stream_release_result", released.append)
+        source = WindowSource([["held"]])
+        stream = adapter.astream_texts(source, max_pending_windows=1)
+        pending = asyncio.create_task(anext(stream))
+        try:
+            await asyncio.wait_for(changed.wait(), 2)
+            call, future = submitted[0]
+            pending.cancel()
+            await checkpoint()
+            assert call.stop.is_set()
+            assert not pending.done() and not future.cancelled()
+            assert adapter._async_window_bridge.used == 1
+            assert not released
+            future.set_exception(LLMCancelledError())
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(pending, 2)
+            assert adapter._async_window_bridge.used == 0
+            assert released == [call]
+        finally:
+            for _, future in submitted:
+                if not future.done():
+                    future.set_exception(LLMCancelledError())
+            if not pending.done():
+                pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+            await stream.aclose()
+            await adapter.aclose()
+
+    run(scenario)
+
+
+def test_empty_window_does_not_compare_a_stale_dimension_snapshot(monkeypatch):
+    """An empty result has no dimension even when a sibling learns one first."""
+
+    async def scenario():
+        client = ContractClient(1)
+        adapter = configured(
+            client, embedding_request_parallelism=2, embedding_queue_size=0, timeout=5
+        )
+        empty_registered, dimension_known = Event(), Event()
+        submit, request, finish = (
+            adapter._stream_submit,
+            client.embeddings,
+            adapter._engine_result,
+        )
+
+        def observed_submit(window, **kwargs):
+            if not window:
+                assert kwargs["call"].dimension is None
+                empty_registered.set()
+            return submit(window, **kwargs)
+
+        def embeddings(input, **kwargs):
+            client._wait(
+                empty_registered,
+                cancel=kwargs.get("cancel"),
+                timeout=kwargs.get("timeout"),
+            )
+            return request(input, **kwargs)
+
+        def result(call, operation, outputs):
+            if not outputs:
+                client._wait(
+                    dimension_known, cancel=call.probe, timeout=call.remaining()
+                )
+                assert call.dimension is None and adapter.embedding_dim == 2
+            value = finish(call, operation, outputs)
+            if outputs:
+                dimension_known.set()
+            return value
+
+        monkeypatch.setattr(adapter, "_stream_submit", observed_submit)
+        monkeypatch.setattr(client, "embeddings", embeddings)
+        monkeypatch.setattr(adapter, "_engine_result", result)
+        stream = adapter.astream_texts(
+            WindowSource([["first"], []]), max_pending_windows=2
+        )
+        try:
+            async with stream:
+                assert await asyncio.wait_for(collect(stream), 3) == [
+                    [vector("first")],
+                    [],
+                ]
+            assert_drained(adapter, client)
+        finally:
+            empty_registered.set()
+            dimension_known.set()
+            await stream.aclose()
+            await adapter.aclose()
+
+    run(scenario)
+
+
+def test_paused_consumer_holds_result_budget_and_delivery_allows_progress():
+    async def scenario():
+        client = ContractClient(1)
+        adapter = configured(
+            client,
+            embedding_request_parallelism=1,
+            embedding_queue_size=7,
+            embedding_max_pending_bytes=1024,
+            embedding_max_pending_tokens=100,
+            embedding_batch_wait_sec=0,
+            timeout=5,
+        )
+        source = WindowSource([[str(index)] for index in range(8)])
+        stream = adapter.astream_texts(source, max_pending_windows=8)
+
+        def held_results(count):
+            view = adapter._engine.snapshot()
+            return (
+                view["retained_result_bytes"] == count * 240
+                and view["control_in_flight"] == 0
+                and view["embedding_in_flight"] == 0
+                and view["tokenization_in_flight"] == 0
+            )
+
+        try:
+            async with stream:
+                await asyncio.wait_for(source.wait_pulls(8), 2)
+                # A two-dimensional vector reserves 240 bytes including its
+                # list/window overhead. Four fit; the fifth must wait without
+                # beginning another embedding HTTP request.
+                await wait_until(lambda: held_results(4))
+                assert len(client.embedding_calls) == 4
+                view = adapter._engine.snapshot()
+                assert view["result_reserved_bytes"] == 960
+                assert view["peak_result_reserved_bytes"] <= 1024
+                assert view["peak_retained_result_bytes"] <= 1024
+
+                assert await anext(stream) == [vector("0")]
+                await wait_until(
+                    lambda: len(client.embedding_calls) == 5 and held_results(4)
+                )
+                assert len(client.embedding_calls) == 5
+                assert await collect(stream) == [
+                    [vector(str(index))] for index in range(1, 8)
+                ]
+            await wait_until(
+                lambda: adapter._engine.snapshot()["result_reserved_bytes"] == 0
+            )
+            assert adapter._engine.snapshot()["peak_result_reserved_bytes"] <= 1024
+            assert_drained(adapter, client)
+        finally:
+            await stream.aclose()
+            await adapter.aclose()
+
+    run(scenario)
+
+
+def test_sync_close_releases_completed_stream_result_credits():
+    async def scenario():
+        client = ContractClient(1)
+        adapter = configured(client, timeout=5)
+        stream = adapter.astream_texts(WindowSource([["held"]]), max_pending_windows=1)
+        try:
+            await stream.__aenter__()
+            await wait_until(
+                lambda: bool(stream._pending) and stream._pending[0].future.done()
+            )
+            assert adapter._engine.snapshot()["retained_result_bytes"] > 0
+            # This documented synchronous close cannot await source cleanup on
+            # its own event loop. It still owns releasing engine result credits.
+            adapter.close()
+            await stream.aclose()
+            assert not adapter._engine._retained
+            assert not adapter._engine._release_results
+            assert adapter._engine.snapshot()["retained_result_bytes"] == 0
+            assert adapter._engine.snapshot()["result_reserved_bytes"] == 0
+            assert adapter._async_window_bridge.used == 0
+        finally:
+            await stream.aclose()
+            await adapter.aclose()
+
+    run(scenario)
+
+
+def test_async_window_over_result_lower_bound_fails_before_tokenization():
+    async def scenario():
+        client = ContractClient(1)
+        adapter = configured(
+            client,
+            embedding_request_parallelism=1,
+            embedding_queue_size=0,
+            embedding_max_pending_bytes=512,
+            embedding_batch_wait_sec=0,
+        )
+        assert adapter.embedding_dim == 0
+        stream = adapter.astream_texts(
+            WindowSource([[str(index) for index in range(6)]]),
+            max_pending_windows=1,
+        )
+        try:
+            async with stream:
+                # The six result rows alone exceed the budget, even before
+                # discovering a vector dimension or allocating the output list.
+                with pytest.raises(LLMBackendError, match="result_bytes_limit"):
+                    await anext(stream)
+            assert not client.token_calls and not client.embedding_calls
+            assert_drained(adapter, client)
+        finally:
+            await stream.aclose()
             await adapter.aclose()
 
     run(scenario)

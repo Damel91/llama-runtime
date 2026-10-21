@@ -8,6 +8,7 @@ from threading import Event
 import pytest
 
 import runtime_llama.adapters.embedding as embedding_module
+import runtime_llama.embedding_engine as engine_module
 from runtime_llama.client import ClientHTTPError
 from runtime_llama.errors import LLMBackendError, LLMCancelledError
 
@@ -20,7 +21,7 @@ from test_embedding_contracts import (
 )
 
 
-def test_base_case_shares_pre_send_observation_instead_of_fourth_catalog():
+def test_base_case_observes_start_and_dispatch_without_per_quota_catalog():
     client = ContractClient(1)
     model_calls = []
     original = client.models
@@ -38,8 +39,8 @@ def test_base_case_shares_pre_send_observation_instead_of_fourth_catalog():
     )
     try:
         assert adapter.embed_query("one") == vector("one")
-        assert len(model_calls) == 3
-        assert len(client.props_calls) == 3
+        assert len(model_calls) == 2
+        assert len(client.props_calls) == 2
         assert len(client.token_calls) == 1
         assert len(client.embedding_calls) == 1
     finally:
@@ -72,26 +73,34 @@ def test_only_public_preparation_seals_and_reusable_counts_are_not_duplicated(
         adapter.close()
 
 
-def test_tokenizer_and_preparation_executors_are_reused_across_windows_and_calls(
+def test_control_and_tokenizer_executors_are_reused_across_windows_and_calls(
     monkeypatch,
 ):
     client = ContractClient(1)
     created = []
-    original = embedding_module.ThreadPoolExecutor
+    original = engine_module.ThreadPoolExecutor
 
     def create(*args, **kwargs):
         result = original(*args, **kwargs)
         created.append(result)
         return result
 
-    monkeypatch.setattr(embedding_module, "ThreadPoolExecutor", create)
+    monkeypatch.setattr(engine_module, "ThreadPoolExecutor", create)
     adapter = configured(client, batch_size=2, token_count_parallelism=2)
     try:
+        assert not created
+        first = texts(8)
+        assert adapter.embed_texts(first) == [vector(text) for text in first]
         owned = tuple(created)
         assert len(owned) == 2
-        for incoming in (texts(8), texts(8, start=100)):
-            assert adapter.embed_texts(incoming) == [vector(text) for text in incoming]
+        assert adapter._engine._control in owned
+        assert adapter._engine._tokenizer in owned
+        coordinator = adapter._engine._thread
+        assert coordinator.is_alive()
+        incoming = texts(8, start=100)
+        assert adapter.embed_texts(incoming) == [vector(text) for text in incoming]
         assert tuple(created) == owned
+        assert adapter._engine._thread is coordinator
         assert client.token_peak <= 2
     finally:
         adapter.close()
@@ -267,6 +276,15 @@ def test_adaptive_children_revalidate_counts_and_identity_after_parent_failure(c
 def test_queued_batch_refreshes_loaded_context_after_scheduler_wait():
     client = ContractClient(1, context=64)
     client.counts.update({"first": 2, "second": 2})
+    observed_contexts = []
+    original_props = client.props
+
+    def props(**kwargs):
+        result = original_props(**kwargs)
+        observed_contexts.append(result["default_generation_settings"]["n_ctx"])
+        return result
+
+    client.props = props
     client.embed_gate.clear()
     adapter = configured(
         client,
@@ -281,13 +299,22 @@ def test_queued_batch_refreshes_loaded_context_after_scheduler_wait():
             assert client.embed_started.wait(2)
             second = callers.submit(adapter.embed_query, "second")
             try:
-                eventually(lambda: adapter._scheduler.snapshot()["queued"] == 1)
+                eventually(
+                    lambda: (
+                        adapter._engine.snapshot()["ready_by_replica"].get("embed_0", 0)
+                        == 1
+                    )
+                )
+                assert adapter._scheduler.snapshot()["queued"] == 0
+                before_release = len(observed_contexts)
+                assert observed_contexts and set(observed_contexts) == {64}
                 client.contexts["embed_0"] = 1
             finally:
                 client.embed_gate.set()
             assert first.result(timeout=3) == vector("first")
             with pytest.raises(LLMBackendError, match="exceeds_context"):
                 second.result(timeout=3)
+            assert 1 in observed_contexts[before_release:]
         assert client.embedding_calls == [("embed_0", ("first",))]
     finally:
         client.embed_gate.set()
@@ -452,8 +479,10 @@ def test_close_drains_pending_preparation_and_all_global_admission_waiters():
         assert not adapter._calls
         assert client.token_active == client.embed_active == 0
         assert adapter._scheduler.snapshot()["in_flight"] == 0
-        assert all(not t.is_alive() for t in adapter._preparation_executor._threads)
-        assert all(not t.is_alive() for t in adapter._tokenizer_executor._threads)
+        assert not adapter._engine._thread.is_alive()
+        assert all(not t.is_alive() for t in adapter._engine._control._threads)
+        assert all(not t.is_alive() for t in adapter._engine._tokenizer._threads)
+        assert all(not t.is_alive() for t in adapter._scheduler._executor._threads)
         assert not client.embedding_calls
     finally:
         client.token_gate.set()

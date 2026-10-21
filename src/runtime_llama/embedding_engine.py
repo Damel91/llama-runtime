@@ -1,0 +1,1013 @@
+"""Persistent bounded preparation and record queues over one HTTP scheduler.
+
+The coordinator owns state, never HTTP. Workers publish completion events;
+inference batches are selected only when the shared scheduler can start them.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
+from threading import Condition, Thread, current_thread
+import sys
+import time
+from typing import Any
+
+from runtime_llama.errors import LLMBackendError
+
+
+@dataclass(frozen=True)
+class EngineContext:
+    joined: bool
+    observations: dict[str, Any]
+    conservative: tuple[int | None, int | None]
+
+
+@dataclass(eq=False)
+class _Plan:
+    state: Any
+    model: str
+    offset: int
+    size: int
+    cap: int
+    groups: deque
+    finished: int = 0
+    preparing: int = 0
+    http_active: int = 0
+    admitted: bool = True
+    seeded: bool = False
+    seed_published: bool = False
+
+
+@dataclass(eq=False)
+class _Entry:
+    plan: _Plan
+    index: int
+    record: Any
+    byte_cost: int
+    ready_at: float
+
+
+@dataclass(eq=False)
+class _Publication:
+    plan: _Plan
+    positions: deque[int]
+    record: Any
+    byte_cost: int
+
+
+@dataclass(eq=False)
+class _State:
+    inputs: Any
+    operation: str
+    call: Any
+    future: Future
+    retain_result: bool
+    context: EngineContext | None = None
+    outputs: list | None = None
+    cursor: int = 0
+    descriptors: deque = field(default_factory=deque)
+    plans: list = field(default_factory=list)
+    ready: dict = field(default_factory=dict)
+    preflight: dict = field(default_factory=dict)
+    pending: int = 0
+    starting: bool = False
+    finishing: bool = False
+    blocked_at: int = -1
+    checking: bool = False
+    checked_at: float = 0.0
+    result_credit: int = 0
+    plan_rotation: int = 0
+
+
+class PersistentEmbeddingEngine:
+    """Adapter-scoped record ownership; EmbeddingScheduler owns HTTP leases.
+
+    Raw and ready queue credits are bounded separately from transient worker
+    responses. At most T tokenizer results can await publication; no further
+    tokenization starts until that bounded handoff makes progress. Native
+    response limits bound those transient results before JSON materialization.
+    """
+
+    def __init__(self, adapter):
+        self.adapter = adapter
+        self.parallelism = adapter.embedding_request_parallelism
+        self.tokenizers = adapter.token_count_parallelism
+        self.control_workers = max(1, self.parallelism)
+        self.capacity = max(1, self.parallelism + adapter.embedding_queue_size)
+        self.max_bytes = getattr(
+            adapter, "embedding_max_pending_bytes", 64 * 1024 * 1024
+        )
+        self.max_tokens = getattr(adapter, "embedding_max_pending_tokens", 1024 * 1024)
+        self.max_request_bytes = getattr(
+            adapter, "embedding_max_request_bytes", 8 * 1024 * 1024
+        )
+        self._condition = Condition()
+        self._incoming = deque()
+        self._events = deque()
+        self._states: deque[_State] = deque()
+        # Persistent physical lanes own the queues. State.ready is only an
+        # owner index into these lanes, not a second per-window scheduler.
+        self._lanes: dict[str, dict[_State, deque[_Entry]]] = {}
+        self._publications: deque[_Publication] = deque()
+        self._http_publications: deque = deque()
+        self._observing: set[str] = set()
+        self._retained: dict[Any, int] = {}
+        self._released_calls: set[Any] = set()
+        self._release_results = deque()
+        self._closed = False
+        self._thread = None
+        self._control = self._tokenizer = None
+        self._control_active = self._token_active = self._http_active = 0
+        self._plans = self._bytes = self._tokens = self._raw_bytes = 0
+        self._descriptor_count = 0
+        self._unknown_seeds = 0
+        self._peak_bytes = self._peak_tokens = self._peak_plans = 0
+        self._peak_token_active = self._peak_http_active = 0
+        self._result_bytes = self._peak_result_bytes = 0
+        self._result_reserved = self._peak_result_reserved = 0
+        self._vector_dim = adapter.embedding_dim or None
+        self._progress = self._rotation = 0
+        self._view = {}
+        self._update_view()
+
+    def submit(self, inputs, *, operation, call, retain_result=False) -> Future:
+        """Register borrowed input storage; a Future completes after real drain."""
+        future = Future()
+        # Prevent cancellation of a wrapper from falsely completing owned work.
+        future.set_running_or_notify_cancel()
+        state = _State(inputs, operation, call, future, retain_result)
+        with self._condition:
+            if self._closed:
+                raise LLMBackendError("llamacpp_embedding_adapter_closed")
+            self._incoming.append(state)
+            if self._thread is None:
+                self._control = ThreadPoolExecutor(
+                    max_workers=self.control_workers,
+                    thread_name_prefix="runtime_llama_control",
+                )
+                self._tokenizer = ThreadPoolExecutor(
+                    max_workers=self.tokenizers,
+                    thread_name_prefix="runtime_llama_tokenizer",
+                )
+                self._thread = Thread(
+                    target=self._run,
+                    name="runtime_llama_embedding_coordinator",
+                    daemon=True,
+                )
+                self._thread.start()
+            self._condition.notify_all()
+        return future
+
+    def wake(self):
+        """Notify cancellation without introducing a polling coordinator per call."""
+        with self._condition:
+            self._condition.notify_all()
+
+    def release_result(self, call):
+        with self._condition:
+            if self._closed and (self._thread is None or not self._thread.is_alive()):
+                return
+            self._release_results.append(call)
+            self._condition.notify_all()
+
+    @staticmethod
+    def _resource(name):
+        return LLMBackendError(f"llamacpp_embedding_{name}_limit")
+
+    def _event(self, kind, state, payload, future):
+        with self._condition:
+            self._events.append((kind, state, payload, future))
+            self._condition.notify_all()
+
+    def _task(self, executor, kind, state, payload, run):
+        state.pending += 1
+        if kind == "prepare":
+            self._token_active += 1
+            self._peak_token_active = max(self._peak_token_active, self._token_active)
+        else:
+            self._control_active += 1
+        try:
+            future = executor.submit(run)
+        except BaseException as exc:
+            future = Future()
+            future.set_exception(exc)
+        future.add_done_callback(lambda done: self._event(kind, state, payload, done))
+
+    def _fail(self, state, failure):
+        state.call.fail(failure)
+        state.descriptors.clear()
+        state.cursor = len(state.inputs)
+        for entries in state.ready.values():
+            while entries:
+                self._release_entry(entries.popleft())
+        state.preflight.clear()
+        for plan in state.plans:
+            if plan.admitted:
+                self._descriptor_count -= sum(
+                    len(positions) for _, positions in plan.groups
+                )
+            plan.groups.clear()
+        self._publications = deque(
+            item for item in self._publications if item.plan.state is not state
+        )
+        self._http_publications = deque(
+            item for item in self._http_publications if item[0] is not state
+        )
+
+    def _release_entry(self, entry):
+        self._bytes -= entry.byte_cost
+        self._tokens -= entry.record.token_count
+
+    def _completions(self, events):
+        for kind, state, payload, future in events:
+            state.pending -= 1
+            if kind == "prepare":
+                self._token_active -= 1
+                plan, positions, raw_cost = payload
+                plan.preparing -= 1
+                self._raw_bytes -= raw_cost
+                self._bytes -= raw_cost
+            elif kind == "http":
+                self._http_active -= 1
+                for entry in payload:
+                    entry.plan.http_active -= 1
+                    self._release_entry(entry)
+            else:
+                self._control_active -= 1
+                if kind == "observe":
+                    self._observing.discard(payload)
+                elif kind == "check":
+                    state.checking = False
+                    state.checked_at = time.monotonic()
+            try:
+                result = future.result()
+            except BaseException as exc:
+                self._progress += 1
+                self._fail(state, exc)
+                if kind == "finish":
+                    self._finish_future(state, None)
+                continue
+            if kind != "check" and not (kind == "start" and result is None):
+                self._progress += 1
+            if kind == "finish":
+                self._finish_future(state, result)
+                continue
+            if kind == "start":
+                state.starting = False
+                if result is None:
+                    state.blocked_at = self._progress
+                else:
+                    state.context = result
+                    aliases = set(result.observations)
+                    for alias in tuple(self._lanes):
+                        if alias not in aliases and not self._lanes[alias]:
+                            del self._lanes[alias]
+                    for alias in aliases:
+                        self._lanes.setdefault(alias, {})
+                    if state.retain_result:
+                        if 64 + 96 * len(state.inputs) > self.max_bytes:
+                            self._fail(state, self._resource("result_bytes"))
+                    else:
+                        state.outputs = [None] * len(state.inputs)
+                continue
+            if state.call.failure is not None:
+                continue
+            if kind == "prepare":
+                if state.operation == "prepare":
+                    for position in positions:
+                        state.outputs[position] = result
+                        plan.finished += 1
+                else:
+                    try:
+                        self.adapter._engine_validate(
+                            result, plan.model, state.context.observations[plan.model]
+                        )
+                        count = result.token_count
+                        cost = self._record_bytes(result)
+                        if count > self.max_tokens:
+                            raise self._resource("pending_tokens")
+                        if cost > self.max_bytes:
+                            raise self._resource("pending_bytes")
+                        self._publications.append(
+                            _Publication(plan, deque(positions), result, cost)
+                        )
+                    except BaseException as exc:
+                        self._fail(state, exc)
+            elif kind == "observe":
+                state.preflight[payload] = result
+            elif kind == "http":
+                if len(result) != len(payload):
+                    self._fail(
+                        state,
+                        LLMBackendError(
+                            "llamacpp_embedding_count_or_response_mismatch"
+                        ),
+                    )
+                    continue
+                if result and self._vector_dim is None:
+                    self._vector_dim = len(result[0])
+                destinations = [(entry.plan, entry.index) for entry in payload]
+                if state.retain_result and not state.result_credit:
+                    self._http_publications.append((state, destinations, result))
+                else:
+                    self._publish_http_result(state, destinations, result)
+
+    @staticmethod
+    def _record_bytes(record):
+        ids = getattr(record, "_token_ids", None)
+        return (
+            512 + sys.getsizeof(record.text) + (40 * len(ids) if ids is not None else 0)
+        )
+
+    @staticmethod
+    def _item_key(item):
+        return (item.text, item.input_type) if hasattr(item, "token_count") else item
+
+    def _borrowed_key(self, inputs, index):
+        if hasattr(inputs, "prefix") and hasattr(inputs, "indices"):
+            value = inputs.texts[inputs.indices[index]]
+            return (value if isinstance(value, str) else str(value), inputs.input_type)
+        return self._item_key(inputs[index])
+
+    def _plan(self, state):
+        if not state.descriptors:
+            stop = min(len(state.inputs), state.cursor + self.adapter.batch_size)
+            offset = state.cursor
+            for model, size in self.adapter._scheduler.plan_window(stop - offset):
+                state.descriptors.append((model, offset, size, size))
+                offset += size
+            state.cursor = stop
+        descriptors = list(state.descriptors)
+        selected = min(
+            range(len(descriptors)),
+            key=lambda index: sum(
+                plan.model == descriptors[index][0]
+                for owner in self._states
+                for plan in owner.plans
+            ),
+        )
+        model, offset, remaining, cap = descriptors.pop(selected)
+        state.descriptors = deque(descriptors)
+        # Bound descriptor storage even when a consumer configures huge windows.
+        # This is a bound on small index descriptors, not an estimate of text
+        # sizes. Prefix copies are admitted by their actual UTF-8 bytes below.
+        size = min(remaining, max(1, self.max_bytes // 1024 - self._descriptor_count))
+        if size < remaining:
+            state.descriptors.appendleft((model, offset + size, remaining - size, cap))
+        observed = state.context.observations[model]
+        deduplicate = (
+            observed.identity_key is not None and observed.tokenizer_build is not None
+        )
+        groups, keys = [], {}
+        for index in range(offset, offset + size):
+            key = self._borrowed_key(state.inputs, index)
+            if deduplicate and key in keys:
+                groups[keys[key]][1].append(index)
+            else:
+                keys[key] = len(groups)
+                groups.append((index, [index]))
+        plan = _Plan(state, model, offset, size, cap, deque(groups))
+        state.plans.append(plan)
+        self._plans += 1
+        self._descriptor_count += size
+        self._peak_plans = max(self._peak_plans, self._plans)
+
+    def _publish(self):
+        for _ in range(len(self._publications)):
+            publication = self._publications.popleft()
+            plan, record = publication.plan, publication.record
+            if plan.state.call.failure is not None:
+                continue
+            if not plan.admitted or (
+                plan.state.retain_result
+                and self._vector_dim is not None
+                and not plan.state.result_credit
+            ):
+                self._publications.append(publication)
+                continue
+            while publication.positions:
+                if (
+                    plan.state.retain_result
+                    and self._vector_dim is None
+                    and plan.seed_published
+                ):
+                    break
+                if (
+                    self._bytes + publication.byte_cost > self.max_bytes
+                    or self._tokens + record.token_count > self.max_tokens
+                ):
+                    break
+                position = publication.positions.popleft()
+                entry = _Entry(
+                    plan,
+                    position,
+                    record,
+                    publication.byte_cost,
+                    self.adapter._batch_now(),
+                )
+                lane = self._lanes.setdefault(plan.model, {})
+                queue = lane.setdefault(plan.state, deque())
+                plan.state.ready[plan.model] = queue
+                queue.append(entry)
+                plan.seed_published = True
+                self._bytes += entry.byte_cost
+                self._tokens += record.token_count
+                self._peak_bytes = max(self._peak_bytes, self._bytes)
+                self._peak_tokens = max(self._peak_tokens, self._tokens)
+            if publication.positions:
+                self._publications.append(publication)
+
+    def _prepare(self, states):
+        if any(
+            item.plan.admitted
+            and not (
+                item.plan.state.retain_result
+                and self._vector_dim is not None
+                and not item.plan.state.result_credit
+            )
+            and not (self._vector_dim is None and item.plan.seed_published)
+            for item in self._publications
+        ):
+            return
+        while self._token_active < self.tokenizers:
+            selected = None
+            for state in states:
+                if state.context is None or state.call.failure is not None:
+                    continue
+                if state.retain_result:
+                    if self._vector_dim is not None and not state.result_credit:
+                        continue
+                    if (
+                        self._vector_dim is None
+                        and self._unknown_seeds >= self.parallelism
+                    ):
+                        continue
+                start = state.plan_rotation % max(1, len(state.plans))
+                plans = state.plans[start:] + state.plans[:start]
+                for plan in plans:
+                    if not plan.groups or not plan.admitted:
+                        continue
+                    if state.retain_result and self._vector_dim is None and plan.seeded:
+                        continue
+                    item_index, positions = plan.groups[0]
+                    text = self._borrowed_key(state.inputs, item_index)[0]
+                    prefix = getattr(state.inputs, "prefix", "")
+                    if len(text) + len(prefix) > self.max_request_bytes:
+                        self._fail(state, self._resource("request_bytes"))
+                        break
+                    try:
+                        utf8_bytes = len(text.encode("utf-8")) + len(
+                            prefix.encode("utf-8")
+                        )
+                    except UnicodeError:
+                        self._fail(
+                            state,
+                            LLMBackendError("llamacpp_embedding_invalid_utf8_input"),
+                        )
+                        break
+                    # Mixed-width Python strings can use four bytes per
+                    # character even when most UTF-8 bytes are ASCII.
+                    raw_cost = 336 + 4 * (len(text) + len(prefix))
+                    if raw_cost > self.max_bytes:
+                        self._fail(state, self._resource("pending_bytes"))
+                        break
+                    if utf8_bytes > self.max_request_bytes:
+                        self._fail(state, self._resource("request_bytes"))
+                        break
+                    if self._bytes + raw_cost <= self.max_bytes:
+                        selected = state, plan, item_index, positions, raw_cost
+                        state.plan_rotation = state.plans.index(plan) + 1
+                        break
+                if selected is not None:
+                    break
+            if selected is None:
+                return
+            state, plan, item_index, positions, raw_cost = selected
+            plan.groups.popleft()
+            self._descriptor_count -= len(positions)
+            if state.retain_result and self._vector_dim is None:
+                plan.seeded = True
+                self._unknown_seeds += 1
+            plan.preparing += 1
+            self._bytes += raw_cost
+            self._raw_bytes += raw_cost
+            self._peak_bytes = max(self._peak_bytes, self._bytes)
+            item = state.inputs[item_index]
+            self._task(
+                self._tokenizer,
+                "prepare",
+                state,
+                (plan, positions, raw_cost),
+                lambda item=item, plan=plan, state=state: self.adapter._engine_prepare(
+                    item,
+                    plan.model,
+                    state.call,
+                    state.context.observations[plan.model],
+                    state.context.conservative,
+                ),
+            )
+            states = states[1:] + states[:1]
+
+    def _eligible(self, state, model):
+        entries = state.ready[model]
+        if not entries:
+            return False
+        wait = self.adapter.embedding_batch_wait_sec
+        if not wait:
+            return True
+        first = entries[0]
+        cap = self.adapter._current_batch_size(
+            first.plan.cap, self.adapter._replicas[model]
+        )
+        producer_finished = not any(
+            plan.model == model and (plan.groups or plan.preparing)
+            for plan in state.plans
+        )
+        budget = state.context.observations[model].batch_token_limit
+        tokens = sum(entry.record.token_count for entry in entries)
+        return (
+            len(entries) >= cap
+            or producer_finished
+            or (budget is not None and tokens >= budget)
+            or self.adapter._batch_now() - first.ready_at >= wait
+        )
+
+    def _pack(self, state, model, observation):
+        entries = state.ready[model]
+        cap = self.adapter._current_batch_size(
+            entries[0].plan.cap, self.adapter._replicas[model]
+        )
+        selected, tokens = [], 0
+        budget = observation.batch_token_limit
+        text_bytes = token_bytes = self.adapter._engine_payload_overhead(model)
+        native_ids = (
+            self.adapter.embedding_input_format != "text"
+            and getattr(self.adapter._client, "supports_embedding_token_ids", None)
+            is True
+        )
+        for entry in entries:
+            if len(selected) >= cap:
+                break
+            record = entry.record
+            limit = record.batch_token_limit
+            effective = (
+                budget
+                if limit is None
+                else limit
+                if budget is None
+                else min(budget, limit)
+            )
+            if (
+                selected
+                and effective is not None
+                and tokens + record.token_count > effective
+            ):
+                break
+            row_text = record._text_wire_bytes
+            row_tokens = record._tokens_wire_bytes
+            use_ids = native_ids and row_tokens is not None and bool(record._token_ids)
+            candidate_text = text_bytes + row_text + (2 if selected else 0)
+            candidate_tokens = token_bytes + (row_tokens or 0) + (2 if selected else 0)
+            size = candidate_tokens if use_ids else candidate_text
+            if size > self.max_request_bytes:
+                if selected:
+                    break
+                raise self._resource("request_bytes")
+            selected.append(entry)
+            tokens += record.token_count
+            text_bytes, token_bytes, native_ids = (
+                candidate_text,
+                candidate_tokens,
+                use_ids,
+            )
+            budget = effective
+        return selected
+
+    def _dispatch(self, states):
+        for state in states:
+            if state.context is None or state.call.failure is not None:
+                continue
+            if state.retain_result and not state.result_credit:
+                if self._vector_dim is not None:
+                    continue
+            for model, entries in tuple(state.ready.items()):
+                if not entries or not self._eligible(state, model):
+                    continue
+                scheduler = self.adapter._scheduler
+                if not scheduler.has_capacity(model):
+                    state.preflight.pop(model, None)
+                    continue
+                if model not in state.preflight:
+                    # Rotation must not launch another GET for this alias
+                    # before a later owner consumes its completed observation.
+                    # Keep metadata in the original owner's cancellation scope.
+                    if any(
+                        owner.context is not None
+                        and owner.call.failure is None
+                        and model in owner.preflight
+                        and owner.ready.get(model)
+                        and (
+                            not owner.retain_result
+                            or owner.result_credit
+                            or self._vector_dim is None
+                        )
+                        and self._eligible(owner, model)
+                        for owner in states
+                    ):
+                        continue
+                    if (
+                        model not in self._observing
+                        and self._control_active < self.control_workers
+                    ):
+                        self._observing.add(model)
+                        self._task(
+                            self._control,
+                            "observe",
+                            state,
+                            model,
+                            lambda model=model, state=state: (
+                                self.adapter._engine_observe(model, state.call)
+                            ),
+                        )
+                    continue
+                observation = state.preflight.pop(model)
+                try:
+                    selected = self._pack(state, model, observation)
+                    if not selected:
+                        continue
+                    future = scheduler.try_dispatch(
+                        lambda _alias, state=state, model=model, selected=selected, observed=observation: (
+                            self.adapter._engine_run(
+                                model,
+                                [item.record for item in selected],
+                                state.call,
+                                observed,
+                            )
+                        ),
+                        state.call.check_local,
+                        model=model,
+                    )
+                    if future is None:
+                        continue
+                except BaseException as exc:
+                    self._fail(state, exc)
+                    continue
+                for expected in selected:
+                    assert entries.popleft() is expected
+                    expected.plan.http_active += 1
+                state.pending += 1
+                self._http_active += 1
+                self._peak_http_active = max(self._peak_http_active, self._http_active)
+                future.add_done_callback(
+                    lambda done, state=state, selected=selected: self._event(
+                        "http", state, selected, done
+                    )
+                )
+
+    def _complete(self, state):
+        failure = state.call.failure
+        try:
+            result = (
+                None
+                if failure is not None
+                else self.adapter._engine_result(
+                    state.call, state.operation, state.outputs
+                )
+            )
+        finally:
+            self.adapter._engine_finish(
+                state.call, state.context.joined if state.context else False
+            )
+        return result
+
+    @staticmethod
+    def _output_bytes(outputs):
+        return 64 + sum(96 + 40 * len(vector) for vector in outputs)
+
+    def _reserve_result(self, state):
+        if not state.retain_result:
+            return True
+        dimension = self._vector_dim
+        if dimension is None and state.inputs:
+            # The shared scheduler bounds all first HTTPs by P, also when one
+            # owner is using several replicas. Their bounded responses may
+            # discover dimension concurrently.
+            # Its response stays in the HTTP handoff until the whole window has
+            # result credits; it is not an unaccounted retained public result.
+            return True
+        wanted = (
+            64 if not state.inputs else 64 + len(state.inputs) * (96 + 40 * dimension)
+        )
+        if wanted > self.max_bytes:
+            self._fail(state, self._resource("result_bytes"))
+            return False
+        delta = wanted - state.result_credit
+        if self._result_reserved + delta > self.max_bytes:
+            return False
+        self._result_reserved += delta
+        state.result_credit = wanted
+        if state.outputs is None:
+            state.outputs = [None] * len(state.inputs)
+        self._peak_result_reserved = max(
+            self._peak_result_reserved, self._result_reserved
+        )
+        return True
+
+    @staticmethod
+    def _publish_http_result(state, destinations, vectors):
+        for (plan, index), vector in zip(destinations, vectors):
+            state.outputs[index] = vector
+            plan.finished += 1
+
+    def _publish_http(self):
+        for _ in range(len(self._http_publications)):
+            state, destinations, vectors = self._http_publications.popleft()
+            if state.call.failure is not None:
+                continue
+            if state.result_credit:
+                self._publish_http_result(state, destinations, vectors)
+            else:
+                self._http_publications.append((state, destinations, vectors))
+
+    def _sync_result_admission(self):
+        """Dormant uncredited windows cannot monopolize the working pool.
+
+        Unknown-dimension bootstrap prepares at most P seed records. Unsent
+        seeds can move back to that bounded handoff when a different window
+        gets result credits first. Their borrowed index plans release lookahead
+        admission until the owner can reserve its complete result window.
+        """
+        if self._vector_dim is None:
+            return
+        for state in self._states:
+            if not state.retain_result or state.call.failure is not None:
+                continue
+            if not state.result_credit:
+                for entries in state.ready.values():
+                    while entries:
+                        entry = entries.popleft()
+                        self._release_entry(entry)
+                        self._publications.append(
+                            _Publication(
+                                entry.plan,
+                                deque([entry.index]),
+                                entry.record,
+                                entry.byte_cost,
+                            )
+                        )
+                for plan in state.plans:
+                    if plan.admitted and not plan.preparing and not plan.http_active:
+                        self._plans -= 1
+                        self._descriptor_count -= sum(
+                            len(positions) for _, positions in plan.groups
+                        )
+                        plan.admitted = False
+                state.preflight.clear()
+        for state in self._states:
+            if (
+                not state.retain_result
+                or not state.result_credit
+                or state.call.failure is not None
+            ):
+                continue
+            for plan in state.plans:
+                count = sum(len(positions) for _, positions in plan.groups)
+                if (
+                    not plan.admitted
+                    and self._plans < self.capacity
+                    and self._descriptor_count + count <= max(1, self.max_bytes // 1024)
+                ):
+                    plan.admitted = True
+                    self._plans += 1
+                    self._descriptor_count += count
+
+    def _finish_future(self, state, result):
+        self._states.remove(state)
+        for lane in self._lanes.values():
+            lane.pop(state, None)
+        if (
+            state.retain_result
+            and state.call.failure is None
+            and state.call not in self._released_calls
+        ):
+            cost = self._output_bytes(result)
+            if cost > state.result_credit:
+                # Dimensions have been validated before result publication.
+                # A larger object must never silently exceed its reservation.
+                self._fail(state, self._resource("result_bytes"))
+                self._result_reserved -= state.result_credit
+            else:
+                self._result_reserved -= state.result_credit - cost
+                self._retained[state.call] = cost
+                self._result_bytes += cost
+                self._peak_result_bytes = max(
+                    self._peak_result_bytes, self._result_bytes
+                )
+        else:
+            self._result_reserved -= state.result_credit
+        self._released_calls.discard(state.call)
+        self._update_view()
+        if state.call.failure is not None:
+            state.future.set_exception(state.call.failure)
+        else:
+            state.future.set_result(result)
+
+    def _finish(self, states):
+        for state in states:
+            if state.finishing:
+                continue
+            if (
+                state.retain_result
+                and not state.result_credit
+                and state.call.failure is None
+            ):
+                continue
+            for plan in tuple(state.plans):
+                if state.call.failure is not None or plan.finished == plan.size:
+                    if not plan.preparing and (
+                        state.call.failure is None or not state.pending
+                    ):
+                        state.plans.remove(plan)
+                        if plan.seeded:
+                            self._unknown_seeds -= 1
+                            plan.seeded = False
+                        if plan.admitted:
+                            self._plans -= 1
+            failed = state.call.failure is not None
+            exhausted = state.cursor == len(state.inputs) and not state.descriptors
+            if state.pending or (
+                not failed and (state.context is None or not exhausted or state.plans)
+            ):
+                continue
+            if self._control_active >= self.control_workers:
+                continue
+            state.finishing = True
+            self._task(
+                self._control,
+                "finish",
+                state,
+                None,
+                lambda state=state: self._complete(state),
+            )
+
+    def _update_view(self):
+        view = {
+            "pending_bytes": self._bytes,
+            "peak_pending_bytes": self._peak_bytes,
+            "pending_tokens": self._tokens,
+            "peak_pending_tokens": self._peak_tokens,
+            "active_plans": self._plans,
+            "peak_active_plans": self._peak_plans,
+            "tokenization_in_flight": self._token_active,
+            "peak_tokenization_in_flight": self._peak_token_active,
+            "embedding_in_flight": self._http_active,
+            "peak_embedding_in_flight": self._peak_http_active,
+            "control_in_flight": self._control_active,
+            "preparation_results_waiting": len(self._publications),
+            "http_results_waiting": len(self._http_publications),
+            "retained_result_bytes": self._result_bytes,
+            "peak_retained_result_bytes": self._peak_result_bytes,
+            "result_reserved_bytes": self._result_reserved,
+            "peak_result_reserved_bytes": self._peak_result_reserved,
+            "http_parallelism_bound": self.parallelism
+            + self.tokenizers
+            + self.control_workers,
+            "ready_by_replica": {
+                model: sum(len(queue) for queue in owners.values())
+                for model, owners in self._lanes.items()
+            },
+        }
+        with self._condition:
+            self._view = view
+
+    def snapshot(self):
+        with self._condition:
+            return {
+                **self._view,
+                "ready_by_replica": dict(self._view["ready_by_replica"]),
+            }
+
+    def _run(self):
+        while True:
+            with self._condition:
+                self._states.extend(self._incoming)
+                self._incoming.clear()
+                events, self._events = self._events, deque()
+                releases, self._release_results = self._release_results, deque()
+            for call in releases:
+                cost = self._retained.pop(call, 0)
+                self._result_bytes -= cost
+                self._result_reserved -= cost
+                if not cost and any(state.call is call for state in self._states):
+                    self._released_calls.add(call)
+            self._completions(events)
+            states = list(self._states)
+            if states:
+                offset = self._rotation % len(states)
+                states = states[offset:] + states[:offset]
+                self._rotation += 1
+            for state in self._states:
+                if state.call.failure is None:
+                    try:
+                        state.call.check_local()
+                    except BaseException as exc:
+                        self._fail(state, exc)
+                if state.call.failure is None and (
+                    state.retain_result or state.context is not None
+                ):
+                    self._reserve_result(state)
+            self._sync_result_admission()
+            self._publish_http()
+            self._publish()
+            # Existing ready work and cleanup take priority over new discovery.
+            self._dispatch(states)
+            self._finish(states)
+            for state in states:
+                if state.finishing or state.call.failure is not None:
+                    continue
+                if (
+                    state.call.cancel is not None
+                    and not state.checking
+                    and time.monotonic() - state.checked_at >= 0.05
+                    and self._control_active < self.control_workers
+                ):
+                    state.checking = True
+                    self._task(self._control, "check", state, None, state.call.check)
+                if state.context is None:
+                    if (
+                        not state.starting
+                        and state.blocked_at != self._progress
+                        and self._control_active < self.control_workers
+                    ):
+                        state.starting = True
+                        self._task(
+                            self._control,
+                            "start",
+                            state,
+                            None,
+                            lambda state=state: self.adapter._engine_start(state.call),
+                        )
+                    continue
+            # Admit fairly across owners before assigning tokenizer workers.
+            # Otherwise the first alias could occupy every tokenizer with slow
+            # inputs while another selected replica has not received a plan.
+            while self._plans < self.capacity:
+                admitted = False
+                for state in states:
+                    if (
+                        state.context is not None
+                        and not state.finishing
+                        and state.call.failure is None
+                        and self._plans < self.capacity
+                        and (state.cursor < len(state.inputs) or state.descriptors)
+                        and self._descriptor_count < max(1, self.max_bytes // 1024)
+                        and (
+                            not state.retain_result
+                            or state.result_credit
+                            or self._vector_dim is None
+                        )
+                        and not (
+                            state.retain_result
+                            and self._vector_dim is None
+                            and len(state.plans)
+                            >= min(len(state.context.observations), self.parallelism)
+                        )
+                    ):
+                        try:
+                            self._plan(state)
+                            admitted = True
+                        except BaseException as exc:
+                            self._fail(state, exc)
+                if not admitted:
+                    break
+            self._prepare(states)
+            self._update_view()
+            with self._condition:
+                if self._closed and not self._states and not self._incoming:
+                    return
+                if self._events or self._incoming or self._release_results:
+                    continue
+                # One bounded poll is needed for arbitrary caller probes and
+                # opt-in coalescing clocks, never one polling thread per window.
+                self._condition.wait(0.01 if self._states else None)
+
+    def close(self):
+        with self._condition:
+            self._closed = True
+            for state in (*self._incoming, *self._states):
+                state.call.stop.set()
+            self._condition.notify_all()
+            coordinator = self._thread
+        if coordinator is not None:
+            if coordinator is current_thread():
+                raise LLMBackendError("llamacpp_embedding_close_from_coordinator")
+            coordinator.join()
+            self._control.shutdown(wait=True, cancel_futures=True)
+            self._tokenizer.shutdown(wait=True, cancel_futures=True)
+        self._retained.clear()
+        self._released_calls.clear()
+        self._release_results.clear()
+        self._result_bytes = self._result_reserved = 0
+        self._update_view()
