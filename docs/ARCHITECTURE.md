@@ -13,6 +13,24 @@ Generazione, embedding e scheduler mantengono le API esistenti. I test non certi
 compatibilità universale con ogni modello/template; l'integrazione dei consumer
 resta una fase distinta.
 
+La candidata locale `0.10.0` sostituisce il coordinamento embedding per finestra
+con un motore persistente dell'adapter. Preparazione esatta e HTTP avanzano in
+pool di thread limitati; ogni replica verificata possiede una coda di record
+pronti. Un solo scheduler seleziona il batch quando dispone della capacità
+globale e locale, includendo il lavoro arrivato durante l'inferenza precedente.
+Le API sincrona e asincrona attendono i risultati dello stesso motore; le
+finestre restano confini di consegna ordinata. Le richieste con cancellazione
+indipendente non vengono fuse nello stesso POST. Il
+[progetto delle code persistenti](EMBEDDING-QUEUE-DESIGN.md) e il
+[contratto embedding](PROGRESSIVE-EMBEDDING.md) descrivono limiti e lifecycle.
+
+`batch_size` conserva il budget totale di testi e le quote bilanciate sulle
+repliche utilizzabili. `embedding_batch_wait_sec=0.0` elimina l'attesa artificiale
+predefinita; valori positivi mantengono coalescing opzionale nello stesso
+percorso. I budget configurabili di byte pendenti, token preparati e payload
+completano la backpressure. Il lavoro locale non cambia gli slot del server e
+la tokenizzazione remota dei testi nuovi resta necessaria.
+
 La versione `0.6.0` aggiunge il trasporto opzionale
 [Tailscale/Headscale](TAILNET.md). `TailnetConfig` mantiene la configurazione
 del consumer; `TailnetHelper` supervisiona un binario Go separato che espone
@@ -70,6 +88,7 @@ flowchart TD
 | `helpers/tsnet` | Binario opzionale con stato dedicato, peer verificati, netstack userspace, proxy HTTP/CONNECT autenticato e teardown drenato |
 | `adapters/llama.py` | `/v1/chat/completions`, storia completa, sampling, reasoning/template, schema, tool delta e usage |
 | `adapters/embedding.py` | Preparazione query/document/raw, `/v1/embeddings`, `/tokenize`, `/props`, batching, limiti, ordine e integrità numerica |
+| `embedding_engine.py` | Motore persistente condiviso dalle API sync/async, code per replica, preparazione concorrente, selezione dei batch al dispatch e budget delle risorse |
 | `embedding_scheduler.py` | Ammissione condivisa, coda limitata, routing per alias e tetti globali/per replica |
 | `replica_discovery.py` | Selezione del modello logico e repliche loaded dai tag Noxi di identità contenuto e compatibilità semantica |
 | `diagnostics.py` | Cattura thinking opzionale e limitata, correlazione per chiamata e sink finale |

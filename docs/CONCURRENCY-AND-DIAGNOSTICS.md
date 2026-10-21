@@ -6,11 +6,12 @@ server, model or device configuration.
 
 ## Embedding and external replicas
 
-In the local 0.7.0 candidate, `embedding_request_parallelism` limits active
-embedding HTTP batch jobs across an adapter. Its default is 4 with automatic
-replica discovery and 1 otherwise. `embedding_queue_size` bounds waiting jobs
-and defaults to 16; zero permits only active capacity. Admission applies
-backpressure to callers. These budgets are shared by all callers of the adapter.
+In the local 0.10.0 candidate, `embedding_request_parallelism` limits active
+embedding HTTP work across an adapter. Its default is 4 with automatic replica
+discovery and 1 otherwise. `embedding_queue_size` supplies the waiting-work
+budget and defaults to 16; zero retains only active admission capacity.
+Admission applies backpressure to callers. These budgets are shared by all
+callers of the adapter.
 
 `batch_size` limits the total texts in one distribution window, with balanced
 quotas assigned to distinct aliases. Explicit adapter and per-replica
@@ -35,12 +36,44 @@ observed slots are not currently idle slots or a GPU speed guarantee.
 Reductions drain already admitted work, and increases can admit additional
 ready batches. Topology replacement remains a separate drained boundary.
 
-Preparation uses reused executors and globally bounded quota lookahead rather
-than occupying the inference scheduler through tokenization. A lease remains
-held while its quota is preparing, ready or awaiting its last HTTP cleanup.
-Only ready batch jobs enter the one embedding scheduler. Nonblocking admission
-can skip a busy alias to let another ready alias advance; FIFO applies within
-an alias to admitted jobs. There is no second embedding scheduler.
+One persistent engine owns input admission and ready queues for each verified
+replica. Its fixed worker pools overlap exact remote tokenization, metadata and
+embedding HTTP. Batch contents are selected when execution capacity is
+available, so records prepared during a previous POST can join the next batch.
+The engine can skip a busy alias and rotates among independent ready callers.
+The synchronous and async APIs submit to that same engine; there is no
+blocking coordinator thread per async window or second embedding scheduler.
+
+`embedding_batch_wait_sec=0.0` is the new default and dispatches available work
+without waiting to fill a batch. Positive finite values retain optional
+coalescing in the same engine. More ready data can accumulate while a replica
+is busy; sparse input can still produce small batches. Accumulating multiple
+windows does not multiply the text cap derived from a distribution quota.
+
+Finite queue resource budgets complement work/window counts:
+`embedding_max_pending_bytes=67108864`,
+`embedding_max_pending_tokens=1048576`, and
+`embedding_max_request_bytes=8388608`. They bound raw/counted-record queue
+credits, prepared tokens queued or active for inference, and individual
+request payloads. A separate completed-async-output credit pool has the same
+`embedding_max_pending_bytes` ceiling; it is not shared with the raw-record
+pool. Result reservations follow submission order, including windows still
+awaiting metadata. Cold-start response handoffs are bounded by active HTTP
+workers until the first result establishes dimensions. Tokenizer and embedding
+response handoffs also have native JSON response limits. Original caller inputs
+and a synchronous call's complete output still occupy proportional memory;
+these separate pools and transient handoffs do not claim a total process RSS
+ceiling. Async completed windows retain their admission until consumed.
+
+Tokenizer and metadata HTTP use their own bounded capacity. The total HTTP
+ceiling derives from embedding, tokenizer and control limits; the embedding
+limit alone is not a count of all HTTP requests. Metadata waits and HTTP run
+outside scheduler locks and do not block the coordinator thread.
+
+Independent cancellation and deadline domains stay separate in HTTP batches.
+Cancelling one owner cannot close a request containing another owner's work.
+The engine retains an active lease until actual transport cleanup, not merely
+until an awaiting Future is cancelled.
 
 Identity, tokenizer build and limits are observed again after waiting and at
 actual batch boundaries. Stable limits require linear admission passes; a
@@ -48,6 +81,9 @@ changed limit revalidates pending inputs. Adaptive splitting after a recognized
 capacity error stays on the same replica, revalidates pending children and
 does not replay completed inputs. Configured and observed limits remain
 distinguishable; an absent property remains unknown.
+The owned native client never replays a failed or ambiguous embedding POST.
+Recognized capacity recovery remains available for injected clients with the
+existing explicit recovery contract; its children retain the same HTTP lease.
 Dimensions and normalization are validated before publishing the complete
 result. Failure stops new submissions for the affected call and drains its
 already started work without cancelling independent calls.

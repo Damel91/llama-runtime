@@ -1,6 +1,6 @@
 # Asynchronous embedding windows
 
-Public interface introduced in the local 0.8.0 candidate and retained in 0.9.0.
+Public interface introduced in the local 0.8.0 candidate and retained in 0.10.0.
 The [progressive queue and native token path](PROGRESSIVE-EMBEDDING.md) now run
 inside the same shared execution engine. The synchronous embedding API remains
 available. Flower MCP governs requirements, the work
@@ -50,18 +50,25 @@ the consumer pauses.
 
 Admission is also bounded across all async streams of the adapter before
 pulling the source. This prevents multiple streams from creating an unbounded
-executor queue. The global intake capacity derives from the existing positive
-request parallelism plus queue budget. These are counts of windows, not a byte
-limit on individual strings or memory retained by the caller.
+pending-work registry. The global intake capacity derives from the existing
+positive request parallelism plus queue budget. These are counts of windows,
+not a byte limit on individual strings or memory retained by the caller.
 
 The adapter's `batch_size` continues to control total-text windows for replica
 quotas. Source windows are result boundaries and can contain multiple internal
-batch windows. Each uses the existing `_execute` path, discovery, identity and
-token-count validation, preparation permits and the single HTTP scheduler.
+batch windows. Each registers with the persistent engine, discovery, identity
+and token-count validation, preparation budgets and the single HTTP scheduler.
 Observed slots and configured global/per-replica limits remain authoritative,
-also across concurrent synchronous calls. The async bridge coordinates calls;
-it does not route replicas or schedule a second set of HTTP jobs. It must not
-run a coordinator in the preparation/tokenizer pools that it waits on.
+also across concurrent synchronous calls. The async bridge submits work and
+awaits the engine's completion Future; it does not allocate a blocking
+coordinator thread for every window, route replicas or schedule a second set
+of HTTP jobs. A completion Future is settled only after the owned work drains,
+rather than merely when its waiter has been cancelled.
+
+Engine-owned byte and prepared-token budgets complement window counts; see
+the [resource settings](PROGRESSIVE-EMBEDDING.md). Independent windows preserve
+their own cancellation and finite-deadline domains and are not silently fused
+into a shared POST that could only be cancelled as a whole.
 
 ## Deadlines, failure and ownership
 
@@ -84,7 +91,7 @@ async-context exit. Standalone `aclose()` can report a source cleanup failure.
 
 Cancelling an asyncio future alone does not stop a running thread. The bridge
 must register calls before dispatch, set the real cooperative stop signal,
-retain the worker future and await its drain off-loop, including during
+retain the engine Future and await its drain off-loop, including during
 repeated cancellation. Cancelling one stream must not close its shared adapter
 or cancel another caller. Close is idempotent.
 

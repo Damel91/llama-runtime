@@ -1,41 +1,71 @@
 # Progressive preparation and native token inputs
 
-Contract for the local 0.9.0 candidate. Flower MCP governs requirements,
+Contract for the local 0.10.0 candidate. Flower MCP governs requirements,
 implementation and verification in project `llama-runtime`, packet
-`PACKET-000013`. Qualification and consumer acceptance remain distinct.
+`PACKET-000015`. Qualification and consumer acceptance remain distinct.
 
-The [persistent queue engine proposal](EMBEDDING-QUEUE-DESIGN.md) describes a
-future replacement for per-window coordination and early batch selection. It
-does not change the 0.9.0 contract or configuration documented below.
+The [persistent queue engine design](EMBEDDING-QUEUE-DESIGN.md) records the
+architecture and verification requirements for replacing per-window
+coordination and early batch selection.
 
 ## Progressive queues
 
-The synchronous and asynchronous embedding APIs use the same execution engine
-and shared HTTP scheduler. Preparation publishes each ready record with its
-original input index. A batch can run before every text in its quota has been
-tokenized; a slow earlier text does not prevent other ready records from being
-processed. Complete public windows and their vectors retain input order.
+The synchronous and asynchronous embedding APIs register work with the same
+persistent execution engine and shared HTTP scheduler. Each verified replica
+has a queue of prepared records, with separate ownership for independent
+cancellation domains. Preparation publishes each record with its original
+input index. Public windows are result boundaries; they do not create their
+own blocking coordinator threads or determine the lifetime of the queues.
 
 `batch_size` remains the total-text budget for dynamic replica distribution.
-Each quota remains affine to its discovered alias. Preparation, ready records
-and HTTP work share the existing global admission bounds. Quota capacity is
-held until both its producer and all its HTTP work drain. Tokenizer concurrency
-is bounded across the adapter, and retained records/IDs have no unbounded
-cross-call registry.
+Each quota remains affine to its discovered alias. Preparation and ready
+records accumulate within the adapter's admission and resource budgets while
+earlier inference is running. A batch is selected only when global and
+per-replica capacity are available; waiting work does not retain an already
+frozen list of batch indices. A slow input cannot block other ready records.
+Complete public windows and vectors retain input order.
 
-`embedding_batch_wait_sec` is a positive finite coalescing budget, default
-`0.5` seconds, starting when the first unsent record becomes ready. New arrivals
-do not restart it. A batch can flush when its derived text cap is filled, an
-explicit HTTP token budget prevents another addition, preparation finishes or
-the wait expires. While its replica is busy, ready records continue to
-accumulate within the bounds. The call/window deadline includes this waiting.
-This is a throughput/latency setting, not a guaranteed response time.
+`embedding_batch_wait_sec` is finite and nonnegative, default `0.0`. At zero,
+a free replica dispatches eligible ready work without an artificial wait to
+fill the batch. While it is busy, later records continue to accumulate for the
+next dispatch. Sparse input or a slower tokenizer can still produce small
+batches; zero waiting does not guarantee full batches or maximum throughput.
 
-Text caps come from the planned quota/adaptive limits, never from a hardcoded
-8/64/128 or the number of records that happen to be ready. Native computation
-`n_batch`/`n_ubatch` remain separate from aggregate HTTP request token limits.
-An undersupplied producer can still produce small batches; request-size and
-timing measurements accompany qualification.
+An explicit positive value remains an optional coalescing policy in the same
+engine. Its budget starts at the first unsent ready record and is not reset by
+new arrivals. A filled text/token cap, completed producer or expired wait can
+flush the batch. The call/window deadline includes this waiting. This setting
+does not change finite HTTP and overall deadlines.
+
+Text caps come from a single distribution quota and adaptive limits, never
+from a hardcoded 8/64/128 or the number of records that happen to be ready.
+Accumulating multiple windows does not add their per-request text caps.
+Native computation `n_batch`/`n_ubatch` remain separate from aggregate HTTP
+request token limits. Request-size and timing measurements accompany
+qualification.
+
+The finite resource budgets are configurable:
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `embedding_max_pending_bytes` | 67,108,864 bytes | Ceiling for the raw/counted queue pool and, separately, the completed async output pool |
+| `embedding_max_pending_tokens` | 1,048,576 tokens | Bound prepared tokens queued or active for inference |
+| `embedding_max_request_bytes` | 8,388,608 bytes | Bound individual request payloads |
+
+All three require positive integers. Oversized embedding inputs remain
+measurable with `prepare_*` within the configured resource ceilings, but are
+not admitted for inference. The caller's original input and the complete
+result required by the synchronous API remain proportional to that call.
+Transient worker response handoffs have separate bounds from worker count
+and native JSON response limits; they do not borrow the output pool's credits.
+Async intake also bounds source pulls and
+completed windows waiting for the consumer. Resource accounting does not
+claim a fixed process RSS.
+
+Tokenizer concurrency is bounded across the adapter; HTTP control work has a
+separate bound, and total HTTP capacity is derived from the embedding,
+tokenizer and control limits. Retained records and IDs have no unbounded
+cross-call registry. Limits and identity are rechecked before inference.
 
 An invalid input discovered after valid inputs were dispatched stops/drains the
 window and returns an error. It is never sent for inference, and successful
@@ -101,7 +131,10 @@ adapter = build_embedding_adapter({
     "batch_size": 256,
     "embedding_request_parallelism": 2,
     "token_count_parallelism": 2,
-    "embedding_batch_wait_sec": 0.5,
+    "embedding_batch_wait_sec": 0.0,
+    "embedding_max_pending_bytes": 64 * 1024 * 1024,
+    "embedding_max_pending_tokens": 1024 * 1024,
+    "embedding_max_request_bytes": 8 * 1024 * 1024,
     "embedding_input_format": "auto",
 })
 ```
@@ -111,11 +144,8 @@ The existing `embed_texts`/`embed_prepared` and
 these settings. Configure model-specific prefixes and limits as described in
 the [embedding contract](EMBEDDING-CONTRACTS.md).
 
-For sustained ingestion, coalescing should be measured for the selected model
-and workload. On the qualified two-replica Nomic Q8_0 profile, setting
-`embedding_batch_wait_sec=1.0` reduced embedding POSTs from 14 to 8 for the same
-511 documents while preserving partial dispatch during preparation and use of
-both replicas. The total-wall difference was small; a longer wait trades later
-first dispatch for fuller batches. This is a profile-specific recommendation,
-and the default remains 0.5 seconds. See the
-[bounded comparison and consumer configuration](verification/COALESCING-TUNING-0.9.0.md).
+The [0.9.0 coalescing comparison](verification/COALESCING-TUNING-0.9.0.md)
+records earlier Nomic measurements. Its timer recommendation applies to that
+engine and workload, not automatically to 0.10.0. Compare zero waiting and any
+explicit coalescing value using the same model, build, profiles, corpus and
+numerical thresholds; distinguish preparation, queue, HTTP and total times.

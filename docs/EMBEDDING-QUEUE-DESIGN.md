@@ -6,10 +6,12 @@ dell'adapter: preparazione concorrente, code per replica e composizione dei
 batch quando esiste capacità di esecuzione. Le API Python restano compatibili;
 llama.cpp continua a possedere tokenizzazione nativa e inferenza.
 
-Questa è una proposta di architettura, requisiti e verifiche, non una nuova
-implementazione o qualifica. L'acquisizione nel progetto Flower `llama-runtime`
-resta pendente: i tool non sono esposti nella sessione e l'endpoint configurato
-ha rifiutato la connessione. Non sono assegnati identificativi Flower locali.
+Il progetto è stato acquisito in Flower `llama-runtime`: requisiti
+`REQ-000024`–`REQ-000026`, scenario `GOAL-000012`, milestone `MILE-000014`,
+change `CHANGE-000014` e packet `PACKET-000015`. Il ciclo `BOOT-000013` e il
+run `RUN-000009` governano l'implementazione. L'architettura revisione 1 è
+adottata nel server; implementazione, qualifica e accettazione restano distinte.
+Le sezioni seguenti conservano le decisioni progettuali e i criteri di verifica.
 
 ## Diagnosi della pipeline attuale
 
@@ -135,8 +137,10 @@ slot ignoti o non validi autorizzano soltanto una richiesta.
 Sotto un lock breve il motore sceglie una sottocoda equamente, estrae i record
 pronti compatibili e riserva atomicamente capacità locale/globale. Il batch è
 composto in quel momento. Serializzazione del payload, HTTP, callback utente,
-completamento delle Future e `join` avvengono fuori dal lock. Un lease
-corrisponde a una singola POST; un limite ridotto prima dell'invio richiede
+completamento delle Future e `join` avvengono fuori dal lock. Con il client
+nativo un lease corrisponde a una singola POST, senza replay. Il contratto di
+recovery già esistente dei client iniettati può invece trattenere lo stesso
+lease durante i figli di un errore di capacità riconosciuto. Un limite ridotto prima dell'invio richiede
 nuova selezione o suddivisione dei soli record non inviati.
 
 Mentre una replica è occupata, preparazione e pubblicazione continuano entro
@@ -180,9 +184,10 @@ globale dei contenuti. Il parallelismo tokenizer va misurato perché compete
 con le altre richieste sul server.
 
 Il limite globale embedding continua a riguardare le POST embedding. Tokenizer
-e metadati hanno limiti propri, visibili in diagnostica. Il motore deve inoltre
-avere un tetto esplicito delle HTTP totali; la sua configurazione pubblica sarà
-definita nel packet di implementazione. Un'unica autorità assegna tutti questi
+e metadati hanno limiti propri, visibili in diagnostica. Nell'implementazione
+il tetto delle HTTP totali deriva da `P + T + max(1, P)`: embedding, tokenizer
+e worker di controllo, rispettivamente. Non è un nuovo parametro indipendente.
+Un'unica autorità assegna tutti questi
 budget. Il controllo conserva possibilità di avanzare quando l'inferenza e la
 preparazione sono sature, evitando deadlock per permessi annidati.
 
@@ -194,6 +199,12 @@ asincroni completati ma non consegnati. La capacità della coda non viene
 affidata soltanto al numero di finestre. Le tuple di interi Python non valgono
 quattro byte per token: l'accounting deve includere contenitori e rappresentazioni
 temporanee con margini conservativi.
+
+L'implementazione assegna il tetto `embedding_max_pending_bytes` alla coda
+raw/preparata e un secondo pool dello stesso tetto ai risultati async trattenuti.
+Le risposte temporanee dei worker hanno limiti JSON e concorrenza finiti:
+questi pool separati non rappresentano un tetto unico della RSS. Le riserve dei
+risultati seguono l'ordine di registrazione, anche durante l'attesa dei metadati.
 
 Prima della tokenizzazione si riserva il budget raw e il massimo buffer
 temporaneo ammesso per quel lavoro. La pubblicazione trasferisce atomicamente

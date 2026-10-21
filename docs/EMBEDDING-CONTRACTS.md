@@ -1,6 +1,6 @@
 # Embedding contracts and public preparation
 
-This guide describes embedding semantics in the local 0.9.0 candidate. The
+This guide describes embedding semantics in the local 0.10.0 candidate. The
 [progressive queue and native token contract](PROGRESSIVE-EMBEDDING.md) extends
 the scheduler shared by synchronous calls and async window sources. Local
 qualification, publication and consumer acceptance remain distinct; see
@@ -34,17 +34,22 @@ preserved. No text is truncated or split by the library.
 The path preserves order/cardinality, cancellation, finite overall deadlines,
 typed errors, content and semantic identity, frozen active topology, draining
 and all-or-error result publication. Successful quotas are not replayed. The
-scheduler admits ready HTTP batch jobs, rather than holding an inference slot
-through tokenization of an entire quota. Ready inputs retain their original
-indices and can form coalesced batches before quota preparation finishes.
-`embedding_batch_wait_sec` defaults to 0.5 seconds from the first unsent ready
-input; a filled text/token budget or completed producer can flush earlier.
-Later arrivals do not reset the timer. A quota can have multiple ready
-batches in flight when its verified slot capacity permits. The same scheduler
-can pass a job blocked on another alias while preserving FIFO within an alias
-for admitted jobs. Its nonblocking admission lets the coordinator try other
-ready aliases, including with `embedding_queue_size=0`, without introducing a
-second embedding scheduler.
+engine owns persistent queues for the verified replicas and selects ready
+records when global and local execution capacity are available. Inputs that
+become ready while a replica is busy can join its next batch. Ready inputs
+retain their original indices; a slow earlier input does not block other
+prepared inputs. Public windows remain ordered result boundaries, without
+their own blocking coordinator threads.
+
+`embedding_batch_wait_sec` defaults to zero, allowing eligible ready work to
+dispatch without an artificial batch-filling delay. Explicit positive values
+retain bounded coalescing in the same engine: the timer starts at the first
+unsent ready input, and a filled cap or completed producer can flush earlier.
+Later arrivals do not restart it. Accumulated windows do not multiply the
+per-request text cap derived from a distribution quota. A quota can have
+multiple batches active when verified capacity permits. The shared scheduler
+rotates among eligible replicas and independent callers; a busy alias does
+not prevent another alias's ready work from advancing.
 
 Effective per-replica concurrency is bounded by positive observed
 `total_slots`, the adapter's global ceiling and an explicit per-replica ceiling
@@ -71,14 +76,29 @@ an alias/topology change alone does not change the count. An unverified fallback
 or unknown tokenizer build requires recounting. There is no unbounded record
 registry or cache.
 
-Preparation retains the same windows, quota affinity and exact token policy.
-The adapter reuses separate preparation and tokenizer executors;
-`token_count_parallelism` and pending tokenizer admission are global across its
-callers. Lookahead is bounded globally to
-`embedding_request_parallelism + embedding_queue_size` quota leases, held
-until both the producer and the quota's last HTTP cleanup have drained. Preparation
-of subsequent quotas can overlap active inference. This limits intermediate
-lookahead, not the memory occupied by the caller's full input and result.
+Preparation retains the same distribution windows, quota affinity and exact
+token policy. Persistent tokenizer workers share `token_count_parallelism`
+across callers and publish ready records while inference is running. One
+adapter engine owns scheduling for sync and async APIs. No record is frozen
+into a waiting HTTP batch before execution capacity is available.
+
+Resource ceilings complement the existing queue and async-window admission
+bounds. `embedding_max_pending_bytes` defaults to 64 MiB,
+`embedding_max_pending_tokens` to 1,048,576, and
+`embedding_max_request_bytes` to 8 MiB; all require positive integers.
+These budgets bound raw/counted-record queue credits, prepared tokens queued
+or active for inference, and individual request payloads. Transient tokenizer
+response handoffs are separately bounded by worker count and native JSON
+response limits. Oversized inputs are measurable within those resource
+ceilings but remain invalid for inference. The caller's original input and
+complete synchronous result are outside any constant-memory claim. Async
+completed outputs remain bounded with their unconsumed windows.
+
+Tokenization and metadata have their own concurrency limits; total HTTP
+capacity is derived from embedding, tokenizer and control capacity. The
+embedding ceiling does not by itself count every tokenizer or metadata GET.
+Native exact tokenization still requires calls for distinct new texts; this
+engine does not add a bulk tokenizer endpoint.
 
 The normal embedding path uses internal counted records without serializing
 or signing public preparation envelopes. Only `prepare_*` emits sealed public
@@ -136,7 +156,10 @@ Loaded context and training context are distinct. The client performs no server
 administration. See [native HTTP transport](NATIVE-HTTP.md) for connection
 policy and its separate verification boundary.
 
-The overall deadline starts at call entry and covers queueing, discovery,
+Independent cancellation/deadline domains do not share one embedding POST.
+This preserves per-call Stop while their preparation and dispatch still share
+the same bounded engine. The overall deadline starts at call entry and covers
+queueing, discovery,
 preparation and HTTP. Cleanup can require transport timeouts to complete;
 immediate termination of remote computation is not promised. Failure preserves
 the first typed error without contaminating independent calls.

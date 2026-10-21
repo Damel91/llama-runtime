@@ -171,3 +171,23 @@ La finestra 256 deve usare due POST da 128 testi con somma token superiore a
 esplicito viene configurato da questa prova. I limiti pubblici devono rifletterlo.
 Il .http.jsonl conserva hash dei testi/vettori e metadata compatti, non bulk vettori.
 Usare un nome output nuovo per ogni run e conservare manifest e hash wheel.
+
+Motore persistente: confronto limitato fra wheel installati
+---------------------------------------------------------
+
+  /path/to/clean-env/bin/python probes/qualify_queue_engine.py --allow-live \
+    --base-url http://SERVER:8080 --model MODEL_SELECTOR \
+    --output /tmp/persistent-queue-01.json
+
+Il probe richiede un wheel installato, due repliche verificate e dimensione768.
+Non imposta contesto, slot o caricamento. Esegue otto canary stringhe/ID per
+replica, un conteggio oversize con rifiuto prima dell'inferenza e511 documenti
+sintetici in finestre256+255. Soglie: maxabs1e-5, cosine0.999999, norma1e-6,
+proiezione della stessa risposta1e-12. Registra richieste/payload/concorrenza,
+preparazione e tempi client/HTTP, senza attribuirli al solo calcolo GPU.
+Il report e il sidecar vettori permettono confronti fra wheel con lo stesso
+corpus. --wait-sec permette una policy di coalescing esplicita; se omesso usa
+il default del wheel. Limiti finiti per run:180secondi,600HTTP embedding,
+550tokenizzazioni e1200metadata; nessun retry o comando di amministrazione.
+I fingerprint prima/dopo escludono soltanto il timestamp volatile created
+del catalogo, conservando identita', argomenti, build e profilo caricati.

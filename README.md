@@ -39,7 +39,7 @@ The project's engineering lifecycle is managed with
 | Replica discovery | Explicit aliases or automatic discovery using content and semantic identity tags from a compatible server manager; identity pinning and bounded topology refresh. |
 | Shared concurrency | Per-adapter global and per-replica admission, bounded queues, backpressure, separate tokenizer limits and ordered results across concurrent callers. Effective admission is bounded by observed slots and configured global/per-replica limits; unknown capacity falls back to one. |
 | Async embedding windows | Async text or prepared-input sources, ordered complete windows, bounded intake and buffered results, with the same scheduler and limits used by synchronous callers. |
-| Progressive embedding preparation | Ready records can form bounded coalesced batches before the rest of their quota is tokenized; synchronous and async callers share one scheduler. |
+| Persistent embedding queues | Prepared records accumulate in adapter-owned queues for each verified replica; batches are formed when execution capacity is available, with the same engine for synchronous and async callers. |
 | Native token inputs | Reuses exact retained token IDs with verified weights, tokenizer build and prefix/special policy, avoiding a second string tokenization in the native embedding handler. |
 | Lifecycle and errors | Typed backend, timeout, cancellation and runaway errors; cooperative cancellation, repetition protection and drained embedding shutdown. Embedding calls have overall deadlines; generation supports bounded HTTP and stream-idle waits. |
 | Optional stream idle | Explicit `stream_idle_timeout_sec=None` waits through quiet prefill; connection/JSON budgets remain finite, with per-request socket interruption for Stop and drained close. |
@@ -56,23 +56,35 @@ against the forwarded JSON Schema. Splitting source documents and tracking their
 fragments belong to the consuming application. The server's own auto-loading
 policy is supported.
 
-## Local 0.9.0 candidate
+## Local 0.10.0 candidate
 
-The local candidate adds progressive preparation and native token-ID input to
-the existing synchronous and async embedding APIs. Ready records accumulate into
-bounded batches while later texts are still being tokenized. Both APIs retain
-one shared scheduler, verified replica limits and complete ordered windows.
+The local candidate replaces per-window coordination with one persistent
+embedding engine. Tokenizer workers publish ready records into queues owned by
+each verified replica. The engine forms a batch when global and replica
+capacity are available, including records prepared while earlier requests were
+running. Synchronous calls and async window sources share admission, ordering,
+deadlines and drained cleanup. Independent cancellation domains stay separate
+in HTTP requests.
 
-`embedding_batch_wait_sec` controls coalescing (default 0.5 seconds from the
-first unsent ready input). `embedding_input_format="auto"` reuses exact IDs when
-the native client, identity, tokenizer build and policy authorize it; `text`
-selects strings and `tokens` requires safe IDs before dispatch. New texts still
-need server tokenization. See the
-[progressive embedding contract](docs/PROGRESSIVE-EMBEDDING.md).
-The [0.9.0 qualification](docs/verification/PROGRESSIVE-NATIVE-TOKENS-0.9.0.md)
-records deterministic checks, native text/ID equivalence and measured timing.
-This candidate is a local wheel delivery; installing it in consumers and
-publishing a release are separate actions.
+`embedding_batch_wait_sec` now defaults to `0.0`: a free replica can dispatch
+ready work immediately. An explicit positive value enables bounded coalescing
+in the same engine. The total-text meaning of `batch_size` is unchanged;
+context, aggregate HTTP token budgets and native computation batches remain
+separate. Queue resource limits are configurable with
+`embedding_max_pending_bytes` (64 MiB), `embedding_max_pending_tokens`
+(1,048,576) and `embedding_max_request_bytes` (8 MiB).
+
+`embedding_input_format="auto"` retains the verified native token-ID path.
+New texts still need exact server tokenization; the queue rewrite does not
+introduce a bulk tokenizer endpoint or eliminate those requests. See the
+[queue and token contract](docs/PROGRESSIVE-EMBEDDING.md) and
+[architecture design](docs/EMBEDDING-QUEUE-DESIGN.md).
+This candidate is a local wheel delivery; installation in consumers and
+publication are separate actions. The
+[0.9.0 qualification](docs/verification/PROGRESSIVE-NATIVE-TOKENS-0.9.0.md)
+records the earlier engine's measurements and is not a qualification of 0.10.0.
+The [persistent-engine verification record](docs/verification/PERSISTENT-QUEUES-0.10.0.md)
+separates deterministic results, installed-wheel checks and bounded live evidence.
 
 ## Release 0.7.0
 
@@ -311,14 +323,14 @@ its imports and distribution metadata. Reusable [live probes](probes/README.txt)
 require explicit opt-in and your own endpoint, model and build identifiers.
 They describe reproducible checks rather than a certification of your setup.
 
-This release includes bounded live qualification of the profile described in
-the release report, without claiming consumer acceptance. Local tests, a
+Historical release reports include bounded live qualification of their stated
+profiles, without claiming consumer acceptance. Local tests, a
 particular server/model qualification and application
 acceptance are separate. Closing a client stream does not by itself prove
 that remote inference stopped. Missing usage values remain missing.
 
 See the [0.7.0 release verification](docs/verification/PUBLIC-RELEASE-0.7.0.md)
-for the checks performed on this distribution. Release assets include SHA-256
+for the checks performed on that release. Its assets include SHA-256
 checksums for the wheel, source archive, native helper archives and source
 manifest. Native Linux/Windows assets are crossbuilt; this release does not
 claim execution on those systems or live VPN enrollment/inference.
