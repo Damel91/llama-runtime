@@ -91,7 +91,7 @@ def test_replica_objects_are_accepted():
     assert profile(embedding_replicas=(replica,)).embedding_replicas == (replica,)
 
 
-def test_persistent_queue_defaults_are_finite_and_nonblocking():
+def test_persistent_queue_defaults_are_finite_without_a_required_timer():
     parsed = profile()
     assert parsed.embedding_batch_wait_sec == 0.0
     assert parsed.embedding_max_pending_bytes == 64 * 1024 * 1024

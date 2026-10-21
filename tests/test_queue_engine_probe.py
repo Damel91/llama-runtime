@@ -109,6 +109,9 @@ def test_invalid_endpoint_is_rejected_before_runtime_import_or_files(tmp_path, u
 def test_fixed_corpus_and_numeric_oracles_preserve_thresholds_and_order():
     assert len(set(probe.corpus())) == 511
     assert probe.corpus() == probe.corpus()
+    assert [len(window) for window in probe.source_windows(probe.corpus())] == [
+        64
+    ] * 7 + [63]
     assert probe.compare(vector(), vector())["passed"]
     measured = probe.compare(vector(), vector(1))
     assert not measured["passed"]
@@ -133,6 +136,18 @@ def test_fixed_corpus_and_numeric_oracles_preserve_thresholds_and_order():
         1e-6,
         1e-12,
     )
+
+
+def test_window_audit_requires_complete_boundaries_and_mixed_http():
+    windows = [["a", "b"], ["c"]]
+    request = {"phase": "pipeline", "kind": "embedding", "source_windows": [0, 1]}
+    result = probe.audit_windows(windows, [2, 1], [request])
+    assert result["mixed_source_window_posts"] == 1
+    assert result["maximum_source_windows_per_post"] == 2
+    with pytest.raises(ValueError, match="cardinality"):
+        probe.audit_windows(windows, [1, 2], [request])
+    with pytest.raises(ValueError, match="mixed source windows"):
+        probe.audit_windows(windows, [2, 1], [{**request, "source_windows": [0]}])
 
 
 def test_response_indices_are_required_unique_and_reordered():
@@ -165,15 +180,18 @@ def test_observer_correlates_native_ids_and_records_bounded_http():
     budget = probe.Budget()
     client = probe.observed_client_type(FixtureClient)(budget=budget)
     client.request("POST", "/tokenize", {"model": "replica", "content": "first"})
+    budget.source_positions = {"first": (3, 7)}
     budget.phase = "pipeline"
     client.request("POST", "/v1/embeddings", {"model": "replica", "input": [[1, 2]]})
     assert budget.raw["first"]["model"] == "replica"
+    assert budget.raw["first"]["source_position"] == (3, 7)
     assert (
         probe.validate_pipeline(["first"], [vector()], budget.raw)["correlations"] == 1
     )
     assert budget.counts["tokenize"] == budget.counts["embedding"] == 1
     assert not any(budget.active.values())
     assert budget.records[-1]["tokens"] == 2
+    assert budget.records[-1]["source_windows"] == [3]
     assert all(
         call[3]["max_response_bytes"] == 8 * 1024 * 1024 for call in client.calls
     )
@@ -206,6 +224,36 @@ def test_request_cap_is_atomic_across_threads_and_never_replays():
     assert len(client.calls) == budget.counts["metadata"] == 2
     assert budget.peaks["metadata"] == 2
     assert not any(budget.active.values())
+
+
+def test_observer_audits_mixed_source_positions_and_response_reordering():
+    class MixedClient(FixtureClient):
+        def request(self, method, path, body=None, **kwargs):
+            self.calls.append((method, path, body, kwargs))
+            return {
+                "data": [
+                    {"index": 1, "embedding": vector(1)},
+                    {"index": 0, "embedding": vector()},
+                ]
+            }
+
+    budget = probe.Budget()
+    budget.phase = "pipeline"
+    budget.source_positions = {"first": (0, 7), "second": (1, 2)}
+    budget.ids = {("replica", (1, 2)): "first", ("replica", (3, 4)): "second"}
+    client = probe.observed_client_type(MixedClient)(budget=budget)
+    client.request(
+        "POST", "/v1/embeddings", {"model": "replica", "input": [[1, 2], [3, 4]]}
+    )
+    assert budget.records[0]["source_windows"] == [0, 1]
+    assert budget.raw["first"]["source_position"] == (0, 7)
+    assert budget.raw["second"]["source_position"] == (1, 2)
+    assert (
+        probe.validate_pipeline(["first", "second"], [vector(), vector(1)], budget.raw)[
+            "correlations"
+        ]
+        == 2
+    )
 
 
 def test_oversize_oracle_requires_remote_exact_count_and_zero_embedding_posts():
@@ -305,7 +353,6 @@ def test_complete_probe_runs_against_offline_native_fixture(monkeypatch, tmp_pat
         base_url="http://fixture.invalid",
         model="fixture.gguf",
         prefix="",
-        wait_sec=10.0,
         wall_timeout=30,
         output=tmp_path / "report.json",
     )
@@ -313,6 +360,9 @@ def test_complete_probe_runs_against_offline_native_fixture(monkeypatch, tmp_pat
     assert report["result"] == "passed", report.get("failure")
     assert report["profiles_unchanged"]
     assert report["pipeline"]["correlations"] == 511
+    assert report["pipeline"]["source_window_sizes"] == [64] * 7 + [63]
+    assert report["pipeline"]["mixed_source_window_posts"] > 0
+    assert report["effective_batch_wait_sec"] == 0
     assert report["oversize"]["exact_token_count"] > 2048
     assert report["request_counts"]["tokenize"] == 528
     assert not any(report["active_at_finish"].values())

@@ -2,7 +2,9 @@
 """Bounded opt-in queue qualification against an installed wheel and loaded models.
 
 No source-path injection, server administration, consumer jobs or retries.
-Timings include client/HTTP work and instrumentation, never pure GPU time.
+A single installed candidate uses eight source windows with no wait override;
+loaded LLM work is allowed. Timings include client/HTTP work and instrumentation,
+never pure GPU time or a throughput comparison.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import time
 from urllib.parse import urlencode, urlsplit
 
 DIMENSION = 768
+WINDOW_SIZE, PENDING_WINDOWS = 64, 4
 MAX_ABS, MIN_COSINE, MAX_NORM, MAX_PROJECTION = 1e-5, 0.999999, 1e-6, 1e-12
 
 
@@ -55,6 +58,37 @@ def corpus(prefix=""):
         f"ordered results, exact tokens and bounded preparation. Unicode città 🔬 {i:03d}."
         for i in range(511)
     ]
+
+
+def source_windows(texts):
+    return [
+        texts[start : start + WINDOW_SIZE]
+        for start in range(0, len(texts), WINDOW_SIZE)
+    ]
+
+
+def audit_windows(expected, observed, requests):
+    require(
+        observed == [len(window) for window in expected],
+        "source window cardinality mismatch",
+    )
+    pipeline = [
+        request
+        for request in requests
+        if request["phase"] == "pipeline" and request["kind"] == "embedding"
+    ]
+    mixed = [
+        request for request in pipeline if len(request.get("source_windows", [])) > 1
+    ]
+    require(mixed, "no embedding HTTP batch mixed source windows")
+    return {
+        "source_window_sizes": observed,
+        "delivered_windows": len(observed),
+        "mixed_source_window_posts": len(mixed),
+        "maximum_source_windows_per_post": max(
+            len(request["source_windows"]) for request in pipeline
+        ),
+    }
 
 
 def normalized(vector):
@@ -107,8 +141,8 @@ class Budget:
     def __init__(self, wall=180, limits=None):
         self.started = time.monotonic()
         self.deadline = self.started + wall
-        # Zero-coalescing may legitimately send one POST per text, each with
-        # a fresh models/props pair. Leave finite headroom for postflight too.
+        # Retain finite diagnostic headroom even if batching regresses to one
+        # POST per text. Such fragmentation remains visible in the report.
         self.limits = limits or {"embedding": 600, "tokenize": 550, "metadata": 1200}
         self.lock, self.counts, self.active, self.peaks = (
             Lock(),
@@ -117,6 +151,7 @@ class Budget:
             Counter(),
         )
         self.records, self.ids, self.raw = [], {}, {}
+        self.source_positions = {}
         self.phase = "preflight"
 
     def remaining(self):
@@ -228,6 +263,21 @@ def observed_client_type(base):
                     )
                     if budget.phase == "pipeline":
                         with budget.lock:
+                            record["source_windows"] = sorted(
+                                {
+                                    budget.source_positions[text][0]
+                                    for text in texts
+                                    if text in budget.source_positions
+                                }
+                            )
+                            if budget.source_positions:
+                                require(
+                                    all(
+                                        text in budget.source_positions
+                                        for text in texts
+                                    ),
+                                    "unknown source-window input",
+                                )
                             for text, vector in zip(texts, vectors):
                                 require(
                                     text not in budget.raw,
@@ -238,6 +288,10 @@ def observed_client_type(base):
                                     "vector": vector,
                                     "input_format": record["input_format"],
                                 }
+                                if text in budget.source_positions:
+                                    budget.raw[text]["source_position"] = (
+                                        budget.source_positions[text]
+                                    )
                 return result
             except BaseException as exc:
                 record["error_type"] = type(exc).__name__
@@ -399,6 +453,7 @@ def run(args):
         "scope": "Synthetic client/HTTP qualification; no pure GPU timing or retrieval-quality claim",
         "runtime_admin_actions": False,
         "consumer_changes": False,
+        "qualification_mode": "single-candidate functional; active LLM allowed; no version throughput comparison",
         "canary": [],
     }
     budget = Budget(args.wall_timeout)
@@ -406,6 +461,13 @@ def run(args):
         args.base_url, timeout=20, budget=budget
     )
     adapter, outputs, aliases, data = None, [], [], corpus(args.prefix)
+    windows = source_windows(data)
+    budget.source_positions = {
+        text: (window_index, input_index)
+        for window_index, window in enumerate(windows)
+        for input_index, text in enumerate(window)
+    }
+    delivered_sizes = []
     artifacts = {"texts": data, "outputs": outputs, "raw_by_text": budget.raw}
     try:
         catalog = client.models()
@@ -457,9 +519,12 @@ def run(args):
             "dimension": DIMENSION,
             "timeout": 150,
         }
-        if args.wait_sec is not None:
-            config["embedding_batch_wait_sec"] = args.wait_sec
         adapter = runtime_llama.build_embedding_adapter(config, client=client)
+        report["effective_batch_wait_sec"] = adapter.embedding_batch_wait_sec
+        require(
+            adapter.embedding_batch_wait_sec == 0,
+            "functional queue qualification requires default zero wait",
+        )
         budget.phase = "oversize"
         report["oversize"] = oversize_canary(
             adapter, budget, data[-1] * 100, runtime_llama.LLMBackendError
@@ -483,17 +548,18 @@ def run(args):
         budget.phase = "pipeline"
 
         async def ingest():
-            async def windows():
-                yield data[:256]
-                yield data[256:]
+            async def incoming():
+                for window in windows:
+                    yield window
 
             async with adapter.astream_texts(
-                windows(),
+                incoming(),
                 input_type="raw",
-                max_pending_windows=2,
+                max_pending_windows=PENDING_WINDOWS,
                 timeout=min(150, budget.remaining()),
             ) as stream:
                 async for window in stream:
+                    delivered_sizes.append(len(window))
                     outputs.extend(window)
 
         started = time.monotonic()
@@ -501,6 +567,9 @@ def run(args):
         report["pipeline_wall_sec"] = time.monotonic() - started
         report["preparation"] = {"hook": name, **prep}
         report["pipeline"] = validate_pipeline(data, outputs, budget.raw)
+        report["pipeline"].update(
+            audit_windows(windows, delivered_sizes, budget.records)
+        )
         require(
             {row["model"] for row in budget.raw.values()} == set(aliases),
             "pipeline did not use both replicas",
@@ -550,7 +619,6 @@ def main(argv=None):
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--prefix", default="")
-    parser.add_argument("--wait-sec", type=float)
     parser.add_argument("--wall-timeout", type=float, default=180)
     args = parser.parse_args(argv)
     if not args.allow_live:
@@ -574,10 +642,6 @@ def main(argv=None):
     del port
     if not math.isfinite(args.wall_timeout) or not 0 < args.wall_timeout <= 180:
         parser.error("wall timeout must be finite and within (0, 180]")
-    if args.wait_sec is not None and (
-        not math.isfinite(args.wait_sec) or args.wait_sec < 0
-    ):
-        parser.error("wait must be finite and nonnegative")
     vectors = args.output.with_suffix(".vectors.json")
     if args.output.exists() or vectors.exists():
         parser.error("output files must not already exist")

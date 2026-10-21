@@ -197,6 +197,78 @@ class _Call:
                 self.dimension = len(vector)
 
 
+class _BatchCall:
+    """One transport lease with immutable, independently failing members.
+
+    An owner's work deadline is never extended. The shared HTTP deadline is
+    fixed at dispatch, and its transport is stopped only after the last live
+    member leaves. Owner Futures retain their share of the lease through drain.
+    Consumer cancellation hooks are evaluated outside engine/scheduler locks.
+    """
+
+    def __init__(self, calls):
+        self.calls = tuple(dict.fromkeys(calls))
+        if not self.calls:
+            raise ValueError("an embedding batch needs at least one owner")
+        self.adapter = self.calls[0].adapter
+        if any(call.adapter is not self.adapter for call in self.calls):
+            raise ValueError("embedding batch owners must share one adapter")
+        self.deadline = max(call.deadline for call in self.calls)
+        self._validated_records = ()
+        self._validated_observation = None
+
+    def _live(self, *, local=False):
+        live = []
+        for call in self.calls:
+            if call.failure is not None:
+                continue
+            try:
+                call.check_local() if local else call.check()
+            except BaseException as exc:
+                call.fail(exc)
+            else:
+                live.append(call)
+        return live
+
+    def _check(self, *, local=False):
+        if self.adapter._closing.is_set():
+            raise LLMBackendError("llamacpp_embedding_adapter_closed")
+        if self._live(local=local):
+            return
+        for call in self.calls:
+            if call.failure is not None:
+                raise call.failure
+        raise LLMCancelledError()
+
+    def check(self):
+        self._check()
+
+    def check_local(self):
+        self._check(local=True)
+
+    def probe(self):
+        return self.adapter._closing.is_set() or not self._live()
+
+    def remaining(self):
+        self.check()
+        return max(0.000001, self.deadline - time.monotonic())
+
+    def validate_dimensions(self, _vectors):
+        # The shared response is parsed once; each owner's selected subset is
+        # dimension-checked separately before it is returned to the engine.
+        return None
+
+    def prevalidated(self, records, observation):
+        if (
+            observation is not self._validated_observation
+            or tuple(id(record) for record in records) != self._validated_records
+        ):
+            return False
+        self._validated_records = ()
+        self._validated_observation = None
+        return True
+
+
 class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
     """Validate embeddings from a server whose runtime policy remains external."""
 
@@ -1014,7 +1086,10 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                     )
                     key = (observed.tokenizer_build, context_limit, http_limit)
                     if key != admitted:
-                        for index in pending:
+                        prevalidated = isinstance(
+                            call, _BatchCall
+                        ) and call.prevalidated(records, observed)
+                        for index in () if prevalidated else pending:
                             record = records[index]
                             self._validate_vocab(record._token_ids, observed)
                             if record._tokenizer_build != observed.tokenizer_build:
@@ -1192,6 +1267,55 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         )
         call.validate_dimensions(vectors)
         return vectors
+
+    @staticmethod
+    def _engine_batch_call(calls):
+        return _BatchCall(calls)
+
+    def _engine_run_shared(self, model, records, calls_per_record, group, observation):
+        """Prune owner-local failures, send once, and retain original row indexes."""
+        if len(records) != len(calls_per_record):
+            raise LLMBackendError("llamacpp_embedding_batch_owner_mismatch")
+        owned = {}
+        for record, call in zip(records, calls_per_record):
+            owned.setdefault(call, []).append(record)
+        if any(call not in group.calls for call in owned):
+            raise LLMBackendError("llamacpp_embedding_batch_owner_mismatch")
+        for call, owner_records in owned.items():
+            if call.failure is not None:
+                continue
+            try:
+                call.check()
+                for record in owner_records:
+                    self._engine_validate(record, model, observation)
+                call.check()
+            except BaseException as exc:
+                call.fail(exc)
+        sent = [
+            (index, record, call)
+            for index, (record, call) in enumerate(zip(records, calls_per_record))
+            if call.failure is None
+        ]
+        if not sent:
+            return []
+        active_records = [record for _, record, _ in sent]
+        group._validated_records = tuple(id(record) for record in active_records)
+        group._validated_observation = observation
+        vectors = self._engine_run(model, active_records, group, observation)
+        if len(vectors) != len(sent):
+            raise LLMBackendError("llamacpp_embedding_count_or_response_mismatch")
+        by_owner = {}
+        for (_, _, call), vector in zip(sent, vectors):
+            by_owner.setdefault(call, []).append(vector)
+        for call, owner_vectors in by_owner.items():
+            if call.failure is not None:
+                continue
+            try:
+                call.check()
+                call.validate_dimensions(owner_vectors)
+            except BaseException as exc:
+                call.fail(exc)
+        return [(index, vector) for (index, _, _), vector in zip(sent, vectors)]
 
     def _engine_result(self, call, operation, outputs):
         call.check()

@@ -25,24 +25,23 @@ from test_embedding_async_stream import WindowSource, run, wait_thread
 
 def test_batch_is_selected_after_capacity_not_when_its_first_record_arrives():
     client = TokenClient(1)
-    incoming = texts(8)
-    later = client.gate(incoming[1])
+    incoming = texts(15)
     client.embed_gate.clear()
     adapter = configured(
         client,
         batch_size=8,
         embedding_batch_wait_sec=0,
         embedding_request_parallelism=1,
-        embedding_queue_size=0,
+        embedding_queue_size=1,
         token_count_parallelism=1,
         timeout=5,
     )
     try:
-        with ThreadPoolExecutor(1) as callers:
-            pending = callers.submit(adapter.embed_texts, incoming)
+        with ThreadPoolExecutor(2) as callers:
+            first = callers.submit(adapter.embed_texts, incoming[:8])
             assert client.embed_started.wait(2)
-            assert client.embedding_calls == [("embed_0", (incoming[0],))]
-            later.set()
+            assert client.embedding_calls == [("embed_0", tuple(incoming[:8]))]
+            pending = callers.submit(adapter.embed_texts, incoming[8:])
             eventually(
                 lambda: all(
                     client.token_done.get(text, Event()).is_set() for text in incoming
@@ -56,13 +55,13 @@ def test_batch_is_selected_after_capacity_not_when_its_first_record_arrives():
             assert adapter._scheduler.snapshot()["queued"] == 0
             assert len(client.embedding_calls) == 1
             client.embed_gate.set()
-            assert pending.result(3) == [vector(text) for text in incoming]
-        assert [len(batch) for _, batch in client.embedding_calls] == [1, 7]
+            assert first.result(3) == [vector(text) for text in incoming[:8]]
+            assert pending.result(3) == [vector(text) for text in incoming[8:]]
+        assert [len(batch) for _, batch in client.embedding_calls] == [8, 7]
         assert Counter(
             text for _, batch in client.embedding_calls for text in batch
         ) == Counter(incoming)
     finally:
-        later.set()
         client.embed_gate.set()
         adapter.close()
 

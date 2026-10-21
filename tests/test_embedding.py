@@ -154,7 +154,12 @@ def test_empty_inputs_do_not_contact_server():
 def test_preflight_and_embedding_are_progressive_by_item_batch():
     client = Client()
     adapter = LlamaCppEmbeddingAdapter(
-        profile(batch_size=2, embedding_queue_size=1), client=client
+        profile(
+            batch_size=2,
+            embedding_queue_size=1,
+            embedding_max_pending_tokens=8,
+        ),
+        client=client,
     )
     incoming = ["one", "two", "three", "four", "five", "six"]
     first_started, second_prepared, release_first = Event(), Event(), Event()
@@ -163,10 +168,6 @@ def test_preflight_and_embedding_are_progressive_by_item_batch():
     def count(content, **kwargs):
         if content == "four":
             second_prepared.set()
-        if content == "five":
-            # One active quota plus one lookahead quota holds the entire
-            # preparation budget until the first HTTP request drains.
-            assert release_first.is_set(), "preparation exceeded bounded lookahead"
         return tokenize(content, **kwargs)
 
     def request(input, **kwargs):
@@ -184,8 +185,24 @@ def test_preflight_and_embedding_are_progressive_by_item_batch():
             try:
                 assert first_started.wait(2)
                 assert second_prepared.wait(2)
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    pressure = adapter._engine.snapshot()
+                    if (
+                        pressure["pending_tokens"] == 8
+                        and pressure["preparation_results_waiting"] > 0
+                    ):
+                        break
+                    time.sleep(0.001)
+                else:
+                    pytest.fail("prepared records did not reach the token budget")
                 assert not pending.done()
-                assert {text for text, _ in client.tokenize_calls} <= set(incoming[:4])
+                # Preparation admission may retire before HTTP drain. The
+                # explicit token budget, including ready and active records,
+                # bounds retained work; one worker handoff can await credit.
+                assert pressure["peak_pending_tokens"] <= 8
+                assert sum(pressure["ready_by_replica"].values()) == 2
+                assert len(client.tokenize_calls) < len(incoming)
             finally:
                 release_first.set()
             assert pending.result(timeout=3) == [

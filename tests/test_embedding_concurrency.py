@@ -184,7 +184,9 @@ def test_real_http_four_in_flight_two_replicas_and_bounded_shared_queue():
             return 200, response(body["input"])
 
         state.action = action
-        adapter = LlamaCppEmbeddingAdapter(configured(url))
+        adapter = LlamaCppEmbeddingAdapter(
+            configured(url, embedding_max_pending_tokens=12)
+        )
         first = [f"item-{index}" for index in range(16)]
         second = [f"item-{index}" for index in range(100, 116)]
         try:
@@ -194,16 +196,24 @@ def test_real_http_four_in_flight_two_replicas_and_bounded_shared_queue():
                 eventually(lambda: state.active == 4)
                 eventually(
                     lambda: (
-                        adapter._engine.snapshot()["active_plans"] == 6
+                        adapter._engine.snapshot()["pending_tokens"] == 12
                         and sum(adapter._engine.snapshot()["ready_by_replica"].values())
                         == 2
+                        and adapter._engine.snapshot()["preparation_results_waiting"]
+                        > 0
                     )
                 )
                 assert state.peak == 4
                 assert state.peak_by_model == {"embed": 2, "embed_1": 2}
-                # Two additional plans remain as ready records, without
-                # freezing their payloads into queued HTTP jobs.
+                # Four active rows and two ready rows exhaust the explicit
+                # token budget. A bounded worker handoff cannot publish more
+                # until a real HTTP lease drains; preparation leases can retire.
                 assert adapter._scheduler.snapshot()["queued"] == 0
+                pressure = adapter._engine.snapshot()
+                assert pressure["active_preparation_plans"] <= 6
+                assert pressure["peak_pending_tokens"] <= 12
+                assert pressure["retained_plans"] > 0
+                assert len(state.tokenize_calls) < len(first + second)
                 state.release.set()
                 assert a.result(timeout=5) == vectors(first)
                 assert b.result(timeout=5) == vectors(second)
@@ -212,7 +222,7 @@ def test_real_http_four_in_flight_two_replicas_and_bounded_shared_queue():
             assert status["scheduler"]["peak_queued"] == 0
             assert status["scheduler"]["queued"] == 0
             assert status["scheduler"]["in_flight"] == 0
-            assert adapter._engine.snapshot()["peak_active_plans"] == 6
+            assert 1 <= adapter._engine.snapshot()["peak_active_plans"] <= 6
             assert adapter._engine.snapshot()["active_plans"] == 0
             assert not any(adapter._engine.snapshot()["ready_by_replica"].values())
             assert status["model_ready"] and status["server_healthy"]

@@ -329,6 +329,7 @@ def test_progressive_ready_pressure_remains_bounded_across_shared_callers(monkey
         embedding_request_parallelism=1,
         embedding_queue_size=0,
         token_count_parallelism=1,
+        embedding_max_pending_bytes=4096,
         timeout=5,
     )
     monkeypatch.setattr(adapter, "_batch_now", BatchClock())
@@ -346,18 +347,27 @@ def test_progressive_ready_pressure_remains_bounded_across_shared_callers(monkey
             snapshot = adapter._scheduler.snapshot()
             assert snapshot["queued"] == 0 and snapshot["in_flight"] == 1
             assert client.token_peak <= 1 and client.embed_peak <= 1
-            # One configured lookahead quota remains leased through its HTTP
-            # drain; additional callers cannot prepare unbounded ready data.
+            # Preparation leases bound active producers, while ready/in-flight
+            # records retain their byte/token credits through real HTTP drain.
             pressure = adapter._engine.snapshot()
-            assert pressure["active_plans"] == pressure["peak_active_plans"] == 1
-            assert pressure["pending_bytes"] <= adapter.embedding_max_pending_bytes
+            assert pressure["active_preparation_plans"] <= 1
+            assert pressure["peak_active_plans"] == 1
+            assert 0 < pressure["pending_bytes"] <= 4096
+            assert pressure["peak_pending_bytes"] <= 4096
             assert pressure["pending_tokens"] <= adapter.embedding_max_pending_tokens
-            assert len(client.token_calls) <= 20
+            assert 1 <= len(client.token_calls) <= 4
             cancel.set()
             for job in jobs:
                 with pytest.raises(LLMCancelledError):
                     job.result(3)
         drain_assertions(adapter, client)
+        assert adapter._engine.snapshot()["pending_bytes"] == 0
+        assert (
+            Counter(
+                text for _, batch in client.embedding_calls for text in batch
+            ).most_common(1)[0][1]
+            == 1
+        )
     finally:
         cancel.set()
         client.embed_gate.set()

@@ -68,6 +68,26 @@ class EmbeddingScheduler:
             self._next_alias = (self._next_alias + count) % len(self._aliases)
             return planned
 
+    def text_cap(self, text_budget: int) -> int:
+        """Return one configured quota ceiling without rotating destinations.
+
+        Small source windows keep their own distribution credits, but do not
+        reduce the ceiling of an HTTP batch assembled from several windows.
+        """
+        if (
+            not isinstance(text_budget, int)
+            or isinstance(text_budget, bool)
+            or text_budget <= 0
+        ):
+            raise ValueError("text_budget must be a positive integer")
+        with self._condition:
+            if self._closed:
+                raise LLMBackendError("llamacpp_embedding_adapter_closed")
+            count = min(text_budget, len(self._aliases), self.parallelism)
+            if not count:
+                raise LLMBackendError("llamacpp_embedding_no_usable_replica")
+            return (text_budget + count - 1) // count
+
     def _can_dispatch(self, model: str) -> bool:
         return (
             self._active < self.parallelism

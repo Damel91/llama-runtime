@@ -36,6 +36,7 @@ class _Plan:
     preparing: int = 0
     http_active: int = 0
     admitted: bool = True
+    preparation_lease: bool = True
     seeded: bool = False
     seed_published: bool = False
 
@@ -58,6 +59,13 @@ class _Publication:
 
 
 @dataclass(eq=False)
+class _Batch:
+    entries: list[_Entry]
+    owners: tuple[Any, ...]
+    call: Any
+
+
+@dataclass(eq=False)
 class _State:
     inputs: Any
     operation: str
@@ -77,6 +85,7 @@ class _State:
     blocked_at: int = -1
     checking: bool = False
     checked_at: float = 0.0
+    failure_handled: bool = False
     result_credit: int = 0
     plan_rotation: int = 0
 
@@ -123,6 +132,7 @@ class PersistentEmbeddingEngine:
         self._plans = self._bytes = self._tokens = self._raw_bytes = 0
         self._descriptor_count = 0
         self._unknown_seeds = 0
+        self._preparation_blocked = False
         self._peak_bytes = self._peak_tokens = self._peak_plans = 0
         self._peak_token_active = self._peak_http_active = 0
         self._result_bytes = self._peak_result_bytes = 0
@@ -197,6 +207,9 @@ class PersistentEmbeddingEngine:
 
     def _fail(self, state, failure):
         state.call.fail(failure)
+        if state.failure_handled:
+            return
+        state.failure_handled = True
         state.descriptors.clear()
         state.cursor = len(state.inputs)
         for entries in state.ready.values():
@@ -222,6 +235,9 @@ class PersistentEmbeddingEngine:
 
     def _completions(self, events):
         for kind, state, payload, future in events:
+            if kind == "http":
+                self._http_completion(payload, future)
+                continue
             state.pending -= 1
             if kind == "prepare":
                 self._token_active -= 1
@@ -229,11 +245,6 @@ class PersistentEmbeddingEngine:
                 plan.preparing -= 1
                 self._raw_bytes -= raw_cost
                 self._bytes -= raw_cost
-            elif kind == "http":
-                self._http_active -= 1
-                for entry in payload:
-                    entry.plan.http_active -= 1
-                    self._release_entry(entry)
             else:
                 self._control_active -= 1
                 if kind == "observe":
@@ -297,22 +308,57 @@ class PersistentEmbeddingEngine:
                         self._fail(state, exc)
             elif kind == "observe":
                 state.preflight[payload] = result
-            elif kind == "http":
-                if len(result) != len(payload):
-                    self._fail(
-                        state,
-                        LLMBackendError(
-                            "llamacpp_embedding_count_or_response_mismatch"
-                        ),
+
+    def _http_completion(self, batch, future):
+        self._http_active -= 1
+        self._progress += 1
+        for owner in batch.owners:
+            owner.pending -= 1
+        for entry in batch.entries:
+            entry.plan.http_active -= 1
+            self._release_entry(entry)
+        try:
+            rows = future.result()
+            indexed = {}
+            for index, vector in rows:
+                if (
+                    isinstance(index, bool)
+                    or not isinstance(index, int)
+                    or not 0 <= index < len(batch.entries)
+                    or index in indexed
+                ):
+                    raise LLMBackendError(
+                        "llamacpp_embedding_count_or_response_mismatch"
                     )
-                    continue
-                if result and self._vector_dim is None:
-                    self._vector_dim = len(result[0])
-                destinations = [(entry.plan, entry.index) for entry in payload]
-                if state.retain_result and not state.result_credit:
-                    self._http_publications.append((state, destinations, result))
-                else:
-                    self._publish_http_result(state, destinations, result)
+                indexed[index] = vector
+        except BaseException as exc:
+            for owner in batch.owners:
+                self._fail(owner, exc)
+            return
+        destinations = {owner: [] for owner in batch.owners}
+        vectors = {owner: [] for owner in batch.owners}
+        for index, entry in enumerate(batch.entries):
+            owner = entry.plan.state
+            if owner.call.failure is not None:
+                continue
+            if index not in indexed:
+                self._fail(
+                    owner,
+                    LLMBackendError("llamacpp_embedding_count_or_response_mismatch"),
+                )
+                continue
+            destinations[owner].append((entry.plan, entry.index))
+            vectors[owner].append(indexed[index])
+        for owner in batch.owners:
+            if owner.call.failure is not None:
+                continue
+            result = vectors[owner]
+            if result and self._vector_dim is None:
+                self._vector_dim = len(result[0])
+            if owner.retain_result and not owner.result_credit:
+                self._http_publications.append((owner, destinations[owner], result))
+            else:
+                self._publish_http_result(owner, destinations[owner], result)
 
     @staticmethod
     def _record_bytes(record):
@@ -420,6 +466,7 @@ class PersistentEmbeddingEngine:
                 self._publications.append(publication)
 
     def _prepare(self, states):
+        self._preparation_blocked = False
         if any(
             item.plan.admitted
             and not (
@@ -427,12 +474,23 @@ class PersistentEmbeddingEngine:
                 and self._vector_dim is not None
                 and not item.plan.state.result_credit
             )
-            and not (self._vector_dim is None and item.plan.seed_published)
+            and not (
+                item.plan.state.retain_result
+                and self._vector_dim is None
+                and item.plan.seed_published
+            )
             for item in self._publications
         ):
+            self._preparation_blocked = True
             return
         while self._token_active < self.tokenizers:
             selected = None
+            choices, preparing = [], {}
+            for owner in self._states:
+                for plan in owner.plans:
+                    preparing[plan.model] = (
+                        preparing.get(plan.model, 0) + plan.preparing
+                    )
             for state in states:
                 if state.context is None or state.call.failure is not None:
                     continue
@@ -451,37 +509,42 @@ class PersistentEmbeddingEngine:
                         continue
                     if state.retain_result and self._vector_dim is None and plan.seeded:
                         continue
-                    item_index, positions = plan.groups[0]
-                    text = self._borrowed_key(state.inputs, item_index)[0]
-                    prefix = getattr(state.inputs, "prefix", "")
-                    if len(text) + len(prefix) > self.max_request_bytes:
-                        self._fail(state, self._resource("request_bytes"))
-                        break
-                    try:
-                        utf8_bytes = len(text.encode("utf-8")) + len(
-                            prefix.encode("utf-8")
-                        )
-                    except UnicodeError:
-                        self._fail(
-                            state,
-                            LLMBackendError("llamacpp_embedding_invalid_utf8_input"),
-                        )
-                        break
-                    # Mixed-width Python strings can use four bytes per
-                    # character even when most UTF-8 bytes are ASCII.
-                    raw_cost = 336 + 4 * (len(text) + len(prefix))
-                    if raw_cost > self.max_bytes:
-                        self._fail(state, self._resource("pending_bytes"))
-                        break
-                    if utf8_bytes > self.max_request_bytes:
-                        self._fail(state, self._resource("request_bytes"))
-                        break
-                    if self._bytes + raw_cost <= self.max_bytes:
-                        selected = state, plan, item_index, positions, raw_cost
-                        state.plan_rotation = state.plans.index(plan) + 1
-                        break
-                if selected is not None:
+                    choices.append((state, plan))
+            # A fast worker continues feeding a lane that has no tokenizer
+            # active instead of joining another lane's slow in-flight inputs.
+            # The stable owner order still rotates fairly within each lane.
+            choices.sort(key=lambda item: preparing.get(item[1].model, 0))
+            for state, plan in choices:
+                if state.call.failure is not None:
+                    continue
+                item_index, positions = plan.groups[0]
+                text = self._borrowed_key(state.inputs, item_index)[0]
+                prefix = getattr(state.inputs, "prefix", "")
+                if len(text) + len(prefix) > self.max_request_bytes:
+                    self._fail(state, self._resource("request_bytes"))
+                    continue
+                try:
+                    utf8_bytes = len(text.encode("utf-8")) + len(prefix.encode("utf-8"))
+                except UnicodeError:
+                    self._fail(
+                        state,
+                        LLMBackendError("llamacpp_embedding_invalid_utf8_input"),
+                    )
+                    continue
+                # Mixed-width Python strings can use four bytes per
+                # character even when most UTF-8 bytes are ASCII.
+                raw_cost = 336 + 4 * (len(text) + len(prefix))
+                if raw_cost > self.max_bytes:
+                    self._fail(state, self._resource("pending_bytes"))
+                    continue
+                if utf8_bytes > self.max_request_bytes:
+                    self._fail(state, self._resource("request_bytes"))
+                    continue
+                if self._bytes + raw_cost <= self.max_bytes:
+                    selected = state, plan, item_index, positions, raw_cost
+                    state.plan_rotation = state.plans.index(plan) + 1
                     break
+                self._preparation_blocked = True
             if selected is None:
                 return
             state, plan, item_index, positions, raw_cost = selected
@@ -510,35 +573,80 @@ class PersistentEmbeddingEngine:
             )
             states = states[1:] + states[:1]
 
-    def _eligible(self, state, model):
-        entries = state.ready[model]
-        if not entries:
-            return False
-        wait = self.adapter.embedding_batch_wait_sec
-        if not wait:
-            return True
-        first = entries[0]
-        cap = self.adapter._current_batch_size(
-            first.plan.cap, self.adapter._replicas[model]
-        )
-        producer_finished = not any(
-            plan.model == model and (plan.groups or plan.preparing)
-            for plan in state.plans
-        )
-        budget = state.context.observations[model].batch_token_limit
-        tokens = sum(entry.record.token_count for entry in entries)
+    def _owner_eligible(self, state, model):
         return (
-            len(entries) >= cap
-            or producer_finished
-            or (budget is not None and tokens >= budget)
-            or self.adapter._batch_now() - first.ready_at >= wait
+            state.context is not None
+            and state.call.failure is None
+            and model in state.context.observations
+            and (
+                not state.retain_result
+                or state.result_credit
+                or self._vector_dim is None
+            )
         )
 
-    def _pack(self, state, model, observation):
-        entries = state.ready[model]
-        cap = self.adapter._current_batch_size(
-            entries[0].plan.cap, self.adapter._replicas[model]
+    def _can_produce(self, model, states):
+        """Whether useful admitted work can still fill this physical lane."""
+        for state in states:
+            if state.operation == "prepare" or not self._owner_eligible(state, model):
+                continue
+            if any(
+                plan.admitted
+                and plan.model == model
+                and (plan.groups or plan.preparing)
+                for plan in state.plans
+            ):
+                return True
+            if any(
+                item.plan.state is state
+                and item.plan.model == model
+                and item.plan.admitted
+                for item in self._publications
+            ):
+                return True
+            # Admission runs after dispatch. Do not prematurely flush just
+            # before an already registered producer can obtain a free plan.
+            if (
+                self._plans < self.capacity
+                and self._descriptor_count < max(1, self.max_bytes // 1024)
+                and (
+                    state.cursor < len(state.inputs)
+                    or any(item[0] == model for item in state.descriptors)
+                )
+            ):
+                return True
+        return False
+
+    def _eligible(self, model, selected, bounded, states):
+        if not selected:
+            return False
+        if bounded or self._preparation_blocked or self._tokens >= self.max_tokens:
+            return True
+        if self._vector_dim is None and any(
+            item.plan.state.retain_result for item in selected
+        ):
+            return True
+        if not self._can_produce(model, states):
+            return True
+        wait = self.adapter.embedding_batch_wait_sec
+        return (
+            bool(wait)
+            and self.adapter._batch_now() - min(entry.ready_at for entry in selected)
+            >= wait
         )
+
+    def _pack(self, model, observation, states):
+        """Fairly gather owners without summing their source-window ceilings."""
+        cap = self.adapter._current_batch_size(
+            self.adapter._scheduler.text_cap(self.adapter.batch_size),
+            self.adapter._replicas[model],
+        )
+        owners = [
+            state
+            for state in states
+            if self._owner_eligible(state, model) and state.ready.get(model)
+        ]
+        cursors = dict.fromkeys(owners, 0)
         selected, tokens = [], 0
         budget = observation.batch_token_limit
         text_bytes = token_bytes = self.adapter._engine_payload_overhead(model)
@@ -547,9 +655,13 @@ class PersistentEmbeddingEngine:
             and getattr(self.adapter._client, "supports_embedding_token_ids", None)
             is True
         )
-        for entry in entries:
-            if len(selected) >= cap:
-                break
+        while owners:
+            state = owners.pop(0)
+            entries = state.ready[model]
+            entry = entries[cursors[state]]
+            cursors[state] += 1
+            if cursors[state] < len(entries):
+                owners.append(state)
             record = entry.record
             limit = record.batch_token_limit
             effective = (
@@ -564,7 +676,7 @@ class PersistentEmbeddingEngine:
                 and effective is not None
                 and tokens + record.token_count > effective
             ):
-                break
+                return selected, True
             row_text = record._text_wire_bytes
             row_tokens = record._tokens_wire_bytes
             use_ids = native_ids and row_tokens is not None and bool(record._token_ids)
@@ -573,8 +685,9 @@ class PersistentEmbeddingEngine:
             size = candidate_tokens if use_ids else candidate_text
             if size > self.max_request_bytes:
                 if selected:
-                    break
-                raise self._resource("request_bytes")
+                    return selected, True
+                self._fail(state, self._resource("request_bytes"))
+                return [], False
             selected.append(entry)
             tokens += record.token_count
             text_bytes, token_bytes, native_ids = (
@@ -583,88 +696,90 @@ class PersistentEmbeddingEngine:
                 use_ids,
             )
             budget = effective
-        return selected
+            if (
+                len(selected) >= cap
+                or (budget is not None and tokens >= budget)
+                or size >= self.max_request_bytes
+            ):
+                return selected, True
+        return selected, False
 
     def _dispatch(self, states):
-        for state in states:
-            if state.context is None or state.call.failure is not None:
+        models = dict.fromkeys(model for state in states for model in state.ready)
+        scheduler = self.adapter._scheduler
+        for model in models:
+            owners = [
+                state
+                for state in states
+                if self._owner_eligible(state, model) and state.ready.get(model)
+            ]
+            if not owners:
                 continue
-            if state.retain_result and not state.result_credit:
-                if self._vector_dim is not None:
-                    continue
-            for model, entries in tuple(state.ready.items()):
-                if not entries or not self._eligible(state, model):
-                    continue
-                scheduler = self.adapter._scheduler
-                if not scheduler.has_capacity(model):
+            if not scheduler.has_capacity(model):
+                for state in states:
                     state.preflight.pop(model, None)
-                    continue
-                if model not in state.preflight:
-                    # Rotation must not launch another GET for this alias
-                    # before a later owner consumes its completed observation.
-                    # Keep metadata in the original owner's cancellation scope.
-                    if any(
-                        owner.context is not None
-                        and owner.call.failure is None
-                        and model in owner.preflight
-                        and owner.ready.get(model)
-                        and (
-                            not owner.retain_result
-                            or owner.result_credit
-                            or self._vector_dim is None
-                        )
-                        and self._eligible(owner, model)
-                        for owner in states
-                    ):
-                        continue
-                    if (
-                        model not in self._observing
-                        and self._control_active < self.control_workers
-                    ):
-                        self._observing.add(model)
-                        self._task(
-                            self._control,
-                            "observe",
-                            state,
-                            model,
-                            lambda model=model, state=state: (
-                                self.adapter._engine_observe(model, state.call)
-                            ),
-                        )
-                    continue
-                observation = state.preflight.pop(model)
-                try:
-                    selected = self._pack(state, model, observation)
-                    if not selected:
-                        continue
-                    future = scheduler.try_dispatch(
-                        lambda _alias, state=state, model=model, selected=selected, observed=observation: (
-                            self.adapter._engine_run(
-                                model,
-                                [item.record for item in selected],
-                                state.call,
-                                observed,
-                            )
+                continue
+            state = next(
+                (owner for owner in owners if model in owner.preflight), owners[0]
+            )
+            observation = state.preflight.get(model, state.context.observations[model])
+            selected, bounded = self._pack(model, observation, states)
+            if not self._eligible(model, selected, bounded, states):
+                state.preflight.pop(model, None)
+                continue
+            if model not in state.preflight:
+                if (
+                    model not in self._observing
+                    and self._control_active < self.control_workers
+                ):
+                    self._observing.add(model)
+                    self._task(
+                        self._control,
+                        "observe",
+                        state,
+                        model,
+                        lambda model=model, state=state: self.adapter._engine_observe(
+                            model, state.call
                         ),
-                        state.call.check_local,
-                        model=model,
                     )
-                    if future is None:
-                        continue
-                except BaseException as exc:
-                    self._fail(state, exc)
-                    continue
-                for expected in selected:
-                    assert entries.popleft() is expected
-                    expected.plan.http_active += 1
-                state.pending += 1
-                self._http_active += 1
-                self._peak_http_active = max(self._peak_http_active, self._http_active)
-                future.add_done_callback(
-                    lambda done, state=state, selected=selected: self._event(
-                        "http", state, selected, done
-                    )
+                continue
+            for owner in states:
+                owner.preflight.pop(model, None)
+            try:
+                distinct = tuple(dict.fromkeys(entry.plan.state for entry in selected))
+                group = self.adapter._engine_batch_call(
+                    tuple(owner.call for owner in distinct)
                 )
+                batch = _Batch(selected, distinct, group)
+                future = scheduler.try_dispatch(
+                    lambda _alias, batch=batch, model=model, observed=observation: (
+                        self.adapter._engine_run_shared(
+                            model,
+                            [item.record for item in batch.entries],
+                            [item.plan.state.call for item in batch.entries],
+                            batch.call,
+                            observed,
+                        )
+                    ),
+                    group.check_local,
+                    model=model,
+                )
+                if future is None:
+                    continue
+            except BaseException as exc:
+                for owner in dict.fromkeys(entry.plan.state for entry in selected):
+                    self._fail(owner, exc)
+                continue
+            for entry in selected:
+                assert entry.plan.state.ready[model].popleft() is entry
+                entry.plan.http_active += 1
+            for owner in distinct:
+                owner.pending += 1
+            self._http_active += 1
+            self._peak_http_active = max(self._peak_http_active, self._http_active)
+            future.add_done_callback(
+                lambda done, batch=batch: self._event("http", None, batch, done)
+            )
 
     def _complete(self, state):
         failure = state.call.failure
@@ -759,7 +874,9 @@ class PersistentEmbeddingEngine:
                         )
                 for plan in state.plans:
                     if plan.admitted and not plan.preparing and not plan.http_active:
-                        self._plans -= 1
+                        if plan.preparation_lease:
+                            self._plans -= 1
+                            plan.preparation_lease = False
                         self._descriptor_count -= sum(
                             len(positions) for _, positions in plan.groups
                         )
@@ -776,11 +893,13 @@ class PersistentEmbeddingEngine:
                 count = sum(len(positions) for _, positions in plan.groups)
                 if (
                     not plan.admitted
-                    and self._plans < self.capacity
+                    and (not plan.groups or self._plans < self.capacity)
                     and self._descriptor_count + count <= max(1, self.max_bytes // 1024)
                 ):
                     plan.admitted = True
-                    self._plans += 1
+                    if plan.groups:
+                        self._plans += 1
+                        plan.preparation_lease = True
                     self._descriptor_count += count
 
     def _finish_future(self, state, result):
@@ -825,6 +944,12 @@ class PersistentEmbeddingEngine:
             ):
                 continue
             for plan in tuple(state.plans):
+                # Lookahead controls preparation, not the size of a source
+                # window's retained ready rows. Those remain owned and charged
+                # until their shared HTTP lease really drains.
+                if plan.preparation_lease and not plan.groups and not plan.preparing:
+                    self._plans -= 1
+                    plan.preparation_lease = False
                 if state.call.failure is not None or plan.finished == plan.size:
                     if not plan.preparing and (
                         state.call.failure is None or not state.pending
@@ -833,7 +958,7 @@ class PersistentEmbeddingEngine:
                         if plan.seeded:
                             self._unknown_seeds -= 1
                             plan.seeded = False
-                        if plan.admitted:
+                        if plan.preparation_lease:
                             self._plans -= 1
             failed = state.call.failure is not None
             exhausted = state.cursor == len(state.inputs) and not state.descriptors
@@ -859,6 +984,8 @@ class PersistentEmbeddingEngine:
             "pending_tokens": self._tokens,
             "peak_pending_tokens": self._peak_tokens,
             "active_plans": self._plans,
+            "active_preparation_plans": self._plans,
+            "retained_plans": sum(len(state.plans) for state in self._states),
             "peak_active_plans": self._peak_plans,
             "tokenization_in_flight": self._token_active,
             "peak_tokenization_in_flight": self._peak_token_active,
@@ -909,7 +1036,9 @@ class PersistentEmbeddingEngine:
                 states = states[offset:] + states[:offset]
                 self._rotation += 1
             for state in self._states:
-                if state.call.failure is None:
+                if state.call.failure is not None:
+                    self._fail(state, state.call.failure)
+                else:
                     try:
                         state.call.check_local()
                     except BaseException as exc:

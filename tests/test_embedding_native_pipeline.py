@@ -196,7 +196,7 @@ def test_preparation_of_next_window_overlaps_current_http_with_bounded_lookahead
         adapter.close()
 
 
-def test_prepared_lookahead_budget_is_global_and_retained_until_quota_drain():
+def test_preparation_credit_releases_while_charged_http_rows_bound_lookahead():
     client = ContractClient(1)
     second_tokenized, cancel = Event(), Event()
     original = client.tokenize
@@ -213,6 +213,7 @@ def test_prepared_lookahead_budget_is_global_and_retained_until_quota_drain():
         batch_size=1,
         embedding_request_parallelism=1,
         embedding_queue_size=0,
+        embedding_max_pending_bytes=1024,
         timeout=5,
     )
     try:
@@ -224,17 +225,24 @@ def test_prepared_lookahead_budget_is_global_and_retained_until_quota_drain():
             try:
                 assert client.embed_started.wait(2)
                 eventually(lambda: len(adapter._calls) == 8)
-                assert not second_tokenized.wait(0.15)
+                eventually(lambda: adapter._engine.snapshot()["retained_plans"] >= 2)
+                pressure = adapter._engine.snapshot()
+                # The completed preparation plan released its phase credit;
+                # its HTTP rows still consume bytes until real transport drain.
+                assert pressure["active_preparation_plans"] <= 1
+                assert pressure["retained_plans"] > pressure["active_preparation_plans"]
+                assert 0 < pressure["pending_bytes"] <= 1024
+                assert pressure["peak_pending_bytes"] <= 1024
+                assert not second_tokenized.is_set()
                 assert len(client.token_calls) == 1
             finally:
                 cancel.set()
-                client.embed_gate.set()
             for future in pending:
-                try:
+                with pytest.raises(LLMCancelledError):
                     future.result(timeout=3)
-                except LLMCancelledError:
-                    pass
         assert adapter._scheduler.snapshot()["in_flight"] == 0
+        assert len(client.embedding_calls) == 1
+        assert adapter._engine.snapshot()["pending_bytes"] == 0
     finally:
         cancel.set()
         client.embed_gate.set()
