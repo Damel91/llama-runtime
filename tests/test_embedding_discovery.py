@@ -460,15 +460,17 @@ def test_alias_reused_for_different_weights_never_changes_pinned_identity():
         runtime.close()
 
 
-def test_identity_change_between_discovery_and_job_is_rejected_before_props():
+def test_identity_change_at_dispatch_is_rejected_before_selected_props_and_post():
     client = Client()
     original_models = client.models
     calls = 0
+    at_change = None
 
     def changing_catalog(**kwargs):
-        nonlocal calls
+        nonlocal calls, at_change
         calls += 1
         if calls == 2:
+            at_change = (len(client.props_calls), len(client.tokens))
             client.catalog = [
                 entry("embed_0", content=OTHER),
                 entry("embed_1", content=OTHER),
@@ -480,7 +482,12 @@ def test_identity_change_between_discovery_and_job_is_rejected_before_props():
     try:
         with pytest.raises(LLMBackendError, match="identity_changed"):
             runtime.embed_query("test")
-        assert not client.props_calls and not client.tokens and not client.requests
+        # The admission catalog is shared with its properties, so the second
+        # catalog now observes dispatch. Nothing contacts the changed model
+        # after that observation: neither selected properties nor inference.
+        assert at_change is not None
+        assert (len(client.props_calls), len(client.tokens)) == at_change
+        assert not client.requests
     finally:
         runtime.close()
 

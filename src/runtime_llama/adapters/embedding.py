@@ -33,6 +33,7 @@ from runtime_llama.embedding_preparation import (
     issue_preparation,
     valid_preparation,
 )
+from runtime_llama.embedding_preparation_cache import PreparationCache, PreparationKey
 from runtime_llama.embedding_stream import (
     EmbeddingWindowStream,
     _EmbeddingWindowBridge,
@@ -274,6 +275,8 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
 
     _BATCH_RECOVERY_SUCCESS_WINDOW = 32
     _BATCH_RECOVERY_MAX_WINDOW = 1024
+    _PREPARATION_CACHE_ENTRIES = 1024
+    _PREPARATION_CACHE_BYTES = 8 * 1024 * 1024
 
     def __init__(
         self, profile: AdapterProfile, *, client: LlamaCppClient | None = None
@@ -348,6 +351,16 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         self._async_window_bridge = None
         self._tokenizer_permits = BoundedSemaphore(self.token_count_parallelism)
         self._preparation_key = secrets.token_bytes(32)
+        self._preparation_cache = PreparationCache(
+            max_entries=self._PREPARATION_CACHE_ENTRIES,
+            max_bytes=max(
+                0,
+                min(
+                    self._PREPARATION_CACHE_BYTES,
+                    self.embedding_max_pending_bytes // 4,
+                ),
+            ),
+        )
         self._dimension_lock = Lock()
         self.embedding_request_parallelism = int(
             getattr(profile, "embedding_request_parallelism", 1)
@@ -404,8 +417,15 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         self, call: _Call, timeout: float, *, wait_for_drain: bool = True
     ) -> bool | None:
         """Observe before admission; replace topology only after old calls drain."""
+        joined, _catalog = self._join_pool_snapshot(
+            call, timeout, wait_for_drain=wait_for_drain
+        )
+        return joined
+
+    def _join_pool_snapshot(self, call, timeout, *, wait_for_drain=True):
+        """Return the catalog that actually governed this admission."""
         if not self._discovery_enabled:
-            return False
+            return False, None
         deadline = time.monotonic() + timeout
 
         def check_wait():
@@ -415,7 +435,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
 
         if not wait_for_drain:
             if not self._discovery_lock.acquire(blocking=False):
-                return None
+                return None, None
         else:
             while not self._discovery_lock.acquire(timeout=0.05):
                 check_wait()
@@ -446,7 +466,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                     waited = False
                     while self._pool_users:
                         if not wait_for_drain:
-                            return None
+                            return None, None
                         check_wait()
                         self._pool_condition.wait(0.05)
                         waited = True
@@ -510,18 +530,26 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                         self._fallback_alias = pool.fallback_alias
                 self._pool_users += 1
                 self._discovery_error = None
-            return True
+            return True, catalog
         except (LLMBackendError, LLMTimeoutError, LLMCancelledError) as exc:
             self._discovery_error = type(exc).__name__
             raise
         finally:
             self._discovery_lock.release()
+            # Public readiness/discovery calls do not produce engine events.
+            # A failed internal nonblocking attempt must not wake itself into
+            # a repeated health/catalog loop while the same pool stays busy.
+            if wait_for_drain:
+                self._engine.metadata_available()
 
     def _leave_pool(self, joined: bool) -> None:
         if joined:
             with self._pool_condition:
                 self._pool_users -= 1
+                drained = self._pool_users == 0
                 self._pool_condition.notify_all()
+            if drained:
+                self._engine.metadata_available()
 
     def _verify_discovered_replica(
         self, replica: _Replica, *, timeout, cancel, catalog=None
@@ -907,17 +935,53 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         call.check()
         if isinstance(item, PreparedEmbeddingInput):
             text, input_type = item.text, item.input_type
-            if self._can_reuse(item, replica, observation):
-                count, token_ids = item.token_count, item._token_ids
-            else:
-                token_ids = self._tokenize_input(text, replica, call)
-                count = len(token_ids)
         else:
             text, input_type = item
-            token_ids = self._tokenize_input(text, replica, call)
-            count = len(token_ids)
         identity = replica.identity
+        computed = False
+        cache_key = (
+            PreparationKey(
+                text=text,
+                input_type=input_type,
+                policy=self._policy(input_type),
+                content_sha256=identity.content_sha256,
+                embedding_sha256=identity.embedding_sha256,
+                tokenizer_build=observation.tokenizer_build,
+                vocab_size=observation.vocab_size,
+            )
+            if identity is not None
+            and observation.identity_key == identity.key
+            and type(text) is str
+            and type(input_type) is str
+            and type(observation.tokenizer_build) is str
+            and bool(observation.tokenizer_build)
+            and (observation.vocab_size is None or type(observation.vocab_size) is int)
+            else None
+        )
+        if isinstance(item, PreparedEmbeddingInput) and self._can_reuse(
+            item, replica, observation
+        ):
+            count, token_ids = item.token_count, item._token_ids
+            if token_ids is None and cache_key is not None:
+                token_ids = self._preparation_cache.get(cache_key)
+                if token_ids is not None and len(token_ids) != count:
+                    raise LLMBackendError(
+                        "llamacpp_embedding_preparation_cache_mismatch"
+                    )
+        else:
+            token_ids = (
+                self._preparation_cache.get(cache_key)
+                if cache_key is not None
+                else None
+            )
+            if token_ids is None:
+                token_ids = self._tokenize_input(text, replica, call)
+                computed = True
+            count = len(token_ids)
+        call.check()
         self._validate_vocab(token_ids, observation)
+        if computed and cache_key is not None:
+            self._preparation_cache.put(cache_key, token_ids)
         retained = (
             token_ids
             if identity is not None
@@ -1179,28 +1243,45 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             raise ValueError("input_type must be document, query or raw")
 
     def _engine_start(self, call):
-        call.check()
-        for item in getattr(call, "prepared_inputs", ()):
+        contexts = self._engine_start_shared((call,))
+        if contexts is None:
+            return None
+        if contexts[0] is None:
             call.check()
-            if not valid_preparation(self._preparation_key, item):
-                raise LLMBackendError("llamacpp_embedding_invalid_preparation")
-        joined = self._join_pool(call, call.remaining(), wait_for_drain=False)
+        return contexts[0]
+
+    def _engine_start_shared(self, calls):
+        """Observe one frozen admission cohort; each returned context owns a ref."""
+        calls = tuple(calls)
+        if len(set(calls)) != len(calls):
+            raise LLMBackendError("llamacpp_embedding_duplicate_admission_owner")
+        for call in calls:
+            if call.failure is not None:
+                continue
+            try:
+                call.check()
+                for item in getattr(call, "prepared_inputs", ()):
+                    call.check()
+                    if not valid_preparation(self._preparation_key, item):
+                        raise LLMBackendError("llamacpp_embedding_invalid_preparation")
+            except BaseException as exc:
+                call.fail(exc)
+        active = tuple(call for call in calls if call.failure is None)
+        if not active:
+            return (None,) * len(calls)
+        group = self._engine_batch_call(active)
+        joined, catalog = self._join_pool_snapshot(
+            group, group.remaining(), wait_for_drain=False
+        )
         if joined is None:
             return None
+        staging = joined
         try:
-            models = getattr(self._client, "models", None)
-            catalog = None
-            if callable(models):
-                catalog = (
-                    self._discovery_catalog(timeout=call.remaining(), cancel=call.probe)
-                    if self._discovery_enabled
-                    else models(
-                        timeout=call.remaining(), cancel=call.probe, cancel_wait=True
-                    )
-                )
+            if catalog is None:
+                catalog = self._engine_catalog_shared(active)
             observations = {
                 model: self._observe_replica(
-                    replica=replica, cancel=call.probe, call=call, catalog=catalog
+                    replica=replica, cancel=group.probe, call=group, catalog=catalog
                 )
                 for model, replica in tuple(self._replicas.items())
             }
@@ -1212,14 +1293,50 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                     *(item.batch_token_limit for item in observations.values())
                 ),
             )
-            return EngineContext(joined, observations, conservative)
-        except BaseException:
-            self._leave_pool(joined)
-            raise
+            contexts = []
+            for call in calls:
+                if call.failure is None:
+                    try:
+                        call.check()
+                    except BaseException as exc:
+                        call.fail(exc)
+                contexts.append(
+                    None
+                    if call.failure is not None
+                    else EngineContext(joined, dict(observations), conservative)
+                )
+            contexts = tuple(contexts)
+            accepted = sum(context is not None for context in contexts)
+            if joined:
+                # The staging ref kept this generation alive during HTTP.
+                # Transfer it atomically to the independently drained owners.
+                with self._pool_condition:
+                    self._pool_users += accepted - 1
+                    self._pool_condition.notify_all()
+                staging = False
+            return contexts
+        finally:
+            if staging:
+                self._leave_pool(True)
 
-    def _engine_observe(self, model, call):
+    def _engine_catalog_shared(self, calls):
+        """One fresh catalog for members fixed before the request starts."""
+        group = self._engine_batch_call(calls)
+        models = getattr(self._client, "models", None)
+        if not callable(models):
+            return None
+        group.check()
+        catalog = (
+            self._discovery_catalog(timeout=group.remaining(), cancel=group.probe)
+            if self._discovery_enabled
+            else models(timeout=group.remaining(), cancel=group.probe, cancel_wait=True)
+        )
+        group.check()
+        return catalog
+
+    def _engine_observe(self, model, call, *, catalog=None):
         return self._observe_replica(
-            replica=self._replicas[model], cancel=call.probe, call=call
+            replica=self._replicas[model], cancel=call.probe, call=call, catalog=catalog
         )
 
     def _engine_validate(self, record, model, observation):
@@ -1357,7 +1474,25 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
 
     def _execute(self, inputs, *, operation, timeout, cancel, call=None):
         call = _Call(self, cancel, timeout) if call is None else call
-        return self._submit_execute(inputs, operation=operation, call=call).result()
+        future = self._submit_execute(inputs, operation=operation, call=call)
+        try:
+            return future.result()
+        except BaseException:
+            # An interrupted waiter still owns its call until the actual
+            # worker/HTTP lease drains. Retire only this owner; peers in a
+            # shared POST retain their independent cancellation and deadline.
+            while True:
+                try:
+                    if future.done():
+                        break
+                    call.stop.set()
+                    self._engine.wake()
+                    future.result()
+                except BaseException:
+                    # Repeated interrupts cannot abandon cleanup or replace
+                    # the original exception. Worker failures imply done().
+                    continue
+            raise
 
     def embed_texts(
         self,
@@ -1704,6 +1839,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             "embedding_replica_discovery": self._discovery_status(),
             "scheduler": self._scheduler.snapshot(),
             "engine": self._engine.snapshot(),
+            "preparation_cache": self._preparation_cache.snapshot(),
             "replicas": replicas,
         }
 
@@ -1717,6 +1853,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 bridge = self._async_window_bridge
                 for call in self._calls:
                     call.stop.set()
+            self._preparation_cache.close()
             if bridge is not None:
                 bridge.signal_close()
             self._engine.close()

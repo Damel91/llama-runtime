@@ -151,8 +151,27 @@ class Budget:
             Counter(),
         )
         self.records, self.ids, self.raw = [], {}, {}
+        self.phase_raw = {"pipeline": self.raw}
         self.source_positions = {}
+        self.phase_positions = {}
+        self.compatible_aliases = frozenset()
         self.phase = "preflight"
+
+    def text_for_ids(self, model, ids):
+        key = model, tuple(ids)
+        if key in self.ids:
+            return self.ids[key]
+        # An audit lookup, not authorization to run inference: the adapter
+        # independently verifies reuse. Only the pinned equivalent aliases
+        # with an equal observed tokenizer build may share this correlation.
+        require(model in self.compatible_aliases, "uncorrelated token IDs")
+        candidates = {
+            text
+            for (alias, tokens), text in self.ids.items()
+            if alias in self.compatible_aliases and tokens == key[1]
+        }
+        require(len(candidates) == 1, "ambiguous or uncorrelated token IDs")
+        return candidates.pop()
 
     def remaining(self):
         remaining = self.deadline - time.monotonic()
@@ -247,7 +266,7 @@ def observed_client_type(base):
                         texts = [
                             row
                             if isinstance(row, str)
-                            else budget.ids[model, tuple(row)]
+                            else budget.text_for_ids(model, row)
                             for row in rows
                         ]
                     vectors = raw_vectors(result, len(rows))
@@ -261,37 +280,37 @@ def observed_client_type(base):
                         if rows and isinstance(rows[0], str)
                         else "tokens",
                     )
-                    if budget.phase == "pipeline":
+                    phase = record["phase"]
+                    if phase in budget.phase_raw:
                         with budget.lock:
+                            positions = budget.phase_positions.get(
+                                phase, budget.source_positions
+                            )
                             record["source_windows"] = sorted(
                                 {
-                                    budget.source_positions[text][0]
+                                    positions[text][0]
                                     for text in texts
-                                    if text in budget.source_positions
+                                    if text in positions
                                 }
                             )
-                            if budget.source_positions:
+                            if positions:
                                 require(
-                                    all(
-                                        text in budget.source_positions
-                                        for text in texts
-                                    ),
+                                    all(text in positions for text in texts),
                                     "unknown source-window input",
                                 )
+                            raw = budget.phase_raw[phase]
                             for text, vector in zip(texts, vectors):
                                 require(
-                                    text not in budget.raw,
-                                    "duplicate pipeline inference",
+                                    text not in raw,
+                                    "duplicate phase inference",
                                 )
-                                budget.raw[text] = {
+                                raw[text] = {
                                     "model": model,
                                     "vector": vector,
                                     "input_format": record["input_format"],
                                 }
-                                if text in budget.source_positions:
-                                    budget.raw[text]["source_position"] = (
-                                        budget.source_positions[text]
-                                    )
+                                if text in positions:
+                                    raw[text]["source_position"] = positions[text]
                 return result
             except BaseException as exc:
                 record["error_type"] = type(exc).__name__
@@ -418,6 +437,126 @@ def oversize_canary(adapter, budget, text, backend_error):
     }
 
 
+def phase_counts(budget, phase):
+    return dict(
+        Counter(record["kind"] for record in budget.records if record["phase"] == phase)
+    )
+
+
+def qualify_reuse(runtime, config, client, budget, report, artifacts):
+    """A fresh adapter after cold qualification, never a cold-cache benchmark."""
+    from runtime_llama.adapters import embedding as embedding_module
+
+    texts = [
+        f"Reuse document {i}: whitespace \t Unicode città 🔬 end {i}." for i in range(8)
+    ]
+    adapter = runtime.build_embedding_adapter(config, client=client)
+    report.update(
+        mode="separate prepared/raw reuse; fresh adapter; not cold timing", phases={}
+    )
+    artifacts.update(texts=texts, phases={})
+    cache = adapter._preparation_cache
+    report["cache_before"] = cache.snapshot()
+    require(report["cache_before"]["entries"] == 0, "reuse adapter was not fresh")
+    hook_costs = {}
+
+    def measured(original, name):
+        def invoke(*args, **kwargs):
+            phase, started = budget.phase, time.monotonic()
+            try:
+                return original(*args, **kwargs)
+            finally:
+                with budget.lock:
+                    costs = hook_costs.setdefault(phase, {}).setdefault(
+                        name, {"calls": 0, "sum_worker_wall_sec": 0.0}
+                    )
+                    costs["calls"] += 1
+                    costs["sum_worker_wall_sec"] += time.monotonic() - started
+
+        return invoke
+
+    original_prepare = adapter._engine_prepare
+    originals = {
+        name: getattr(embedding_module, name)
+        for name in ("issue_preparation", "valid_preparation")
+    }
+    adapter._engine_prepare = measured(original_prepare, "_engine_prepare")
+    for name, original in originals.items():
+        setattr(embedding_module, name, measured(original, name))
+    try:
+        budget.phase = "reuse_prepare"
+        before = budget.counts["tokenize"]
+        started = time.monotonic()
+        prepared = adapter.prepare_texts(
+            texts, input_type="raw", timeout=min(60, budget.remaining())
+        )
+        require(len(prepared) == 8, "reuse preparation cardinality mismatch")
+        require(
+            budget.counts["tokenize"] - before == 8,
+            "fresh reuse preparation did not tokenize exactly eight inputs",
+        )
+        report["prepare_wall_sec"] = time.monotonic() - started
+        report["prepare_request_counts"] = phase_counts(budget, budget.phase)
+        require(
+            report["prepare_request_counts"].get("embedding", 0) == 0,
+            "public preparation sent embedding HTTP",
+        )
+        artifacts["token_counts"] = [item.token_count for item in prepared]
+        reference = None
+        for phase, public_records in (
+            ("reuse_prepared_1", True),
+            ("reuse_prepared_2", True),
+            ("reuse_raw_1", False),
+            ("reuse_raw_2", False),
+        ):
+            budget.phase = phase
+            raw = budget.phase_raw[phase] = {}
+            budget.phase_positions[phase] = {
+                text: (0, i) for i, text in enumerate(texts)
+            }
+            before, started = budget.counts["tokenize"], time.monotonic()
+            outputs = (
+                adapter.embed_prepared(prepared, timeout=min(60, budget.remaining()))
+                if public_records
+                else adapter.embed_texts(
+                    texts, input_type="raw", timeout=min(60, budget.remaining())
+                )
+            )
+            require(
+                budget.counts["tokenize"] == before,
+                "prepared/raw reuse repeated tokenization",
+            )
+            result = validate_pipeline(texts, outputs, raw)
+            comparisons = [compare(a, b) for a, b in zip(reference or outputs, outputs)]
+            require(
+                all(item["passed"] for item in comparisons),
+                "reuse numerical thresholds failed",
+            )
+            reference = outputs if reference is None else reference
+            result.update(
+                wall_sec=time.monotonic() - started,
+                request_counts=phase_counts(budget, phase),
+                comparisons=comparisons,
+            )
+            report["phases"][phase] = result
+            artifacts["phases"][phase] = {"outputs": outputs, "raw_by_text": raw}
+        report["cache_after_reuse"] = cache.snapshot()
+    finally:
+        adapter._engine_prepare = original_prepare
+        for name, original in originals.items():
+            setattr(embedding_module, name, original)
+        adapter.close()
+        report["cache_after_close"] = cache.snapshot()
+        require(
+            report["cache_after_close"]["closed"]
+            and report["cache_after_close"]["entries"]
+            == report["cache_after_close"]["bytes"]
+            == 0,
+            "reuse cache did not drain on close",
+        )
+        report["hook_costs"] = hook_costs
+
+
 def run(args):
     import runtime_llama
     from runtime_llama.client import LlamaCppClient
@@ -443,6 +582,9 @@ def run(args):
         "started_at": datetime.now(timezone.utc).isoformat(),
         "version": runtime_llama.__version__,
         "distribution_version": distribution.version,
+        "installed_archive_sha256": direct.get("archive_info", {})
+        .get("hashes", {})
+        .get("sha256"),
         "thresholds": {
             "dimension": DIMENSION,
             "max_abs": MAX_ABS,
@@ -482,6 +624,12 @@ def run(args):
             "embedding_sha256": pool.identity.embedding_sha256,
         }
         report["before"] = snapshot(client, aliases, catalog)
+        builds = {
+            digest(item["build"]) if item["build"] is not None else None
+            for item in report["before"]["models"].values()
+        }
+        if len(builds) == 1 and None not in builds:
+            budget.compatible_aliases = frozenset(aliases)
         budget.phase = "canary"
         canaries = []
         for alias in aliases:
@@ -545,6 +693,10 @@ def run(args):
                     prep["sum_worker_wall_sec"] += time.monotonic() - started
 
         setattr(adapter, name, prepare)
+        if hasattr(adapter, "_preparation_cache"):
+            report["preparation_cache_before_pipeline"] = (
+                adapter._preparation_cache.snapshot()
+            )
         budget.phase = "pipeline"
 
         async def ingest():
@@ -567,6 +719,21 @@ def run(args):
         report["pipeline_wall_sec"] = time.monotonic() - started
         report["preparation"] = {"hook": name, **prep}
         report["pipeline"] = validate_pipeline(data, outputs, budget.raw)
+        comparisons = [compare(a, b) for a, b in zip(reference, outputs[:8])]
+        require(
+            all(item["passed"] for item in comparisons),
+            "pipeline/canary numerical thresholds failed",
+        )
+        report["pipeline"]["canary_comparisons"] = comparisons
+        report["pipeline"]["request_counts"] = phase_counts(budget, "pipeline")
+        require(
+            report["pipeline"]["request_counts"].get("tokenize", 0) == 511,
+            "cold pipeline did not tokenize exactly 511 unique inputs",
+        )
+        require(
+            report["pipeline"]["request_counts"].get("metadata", 0) < 50,
+            "cold pipeline metadata did not improve below baseline 50",
+        )
         report["pipeline"].update(
             audit_windows(windows, delivered_sizes, budget.records)
         )
@@ -577,6 +744,19 @@ def run(args):
         if hasattr(adapter, "_engine"):
             report["engine"] = adapter._engine.snapshot()
         report["scheduler"] = adapter._scheduler.snapshot()
+        if hasattr(adapter, "_preparation_cache"):
+            report["preparation_cache"] = adapter._preparation_cache.snapshot()
+        report["cold_counts_before_reuse"] = dict(budget.counts)
+        if getattr(args, "qualify_reuse", False):
+            report["reuse"], artifacts["reuse"] = {}, {}
+            qualify_reuse(
+                runtime_llama,
+                config,
+                client,
+                budget,
+                report["reuse"],
+                artifacts["reuse"],
+            )
         report["result"] = "passed"
     except Exception as exc:
         report.update(
@@ -619,6 +799,11 @@ def main(argv=None):
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--prefix", default="")
+    parser.add_argument(
+        "--qualify-reuse",
+        action="store_true",
+        help="after cold 511, separately verify prepared and raw ID reuse",
+    )
     parser.add_argument("--wall-timeout", type=float, default=180)
     args = parser.parse_args(argv)
     if not args.allow_live:

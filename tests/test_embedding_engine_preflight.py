@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from runtime_llama.embedding_engine import PersistentEmbeddingEngine, _State
+from runtime_llama.embedding_engine import PersistentEmbeddingEngine, _Preflight, _State
 
 
 class ImmediateScheduler:
@@ -16,6 +16,9 @@ class ImmediateScheduler:
 
     def has_capacity(self, model):
         return self.available
+
+    def snapshot(self):
+        return {"in_flight": int(not self.available)}
 
     def try_dispatch(self, run, check, *, model):
         check()
@@ -40,8 +43,8 @@ def test_completed_preflight_wins_rotation_before_another_owner_probes(owner_sta
     )
     engine = PersistentEmbeddingEngine(adapter)
     observations = []
-    engine._task = lambda executor, kind, state, model, run: observations.append(
-        (kind, state, model)
+    engine._shared_task = lambda kind, owners, metadata, run: observations.append(
+        (kind, owners, metadata)
     )
     engine._pack = lambda model, observed, states: (
         [
@@ -52,7 +55,11 @@ def test_completed_preflight_wins_rotation_before_another_owner_probes(owner_sta
         ],
         True,
     )
-    engine._eligible = lambda model, selected, bounded, states: True
+    engine._eligible = lambda model, selected, bounded, states: bool(selected)
+    engine._ready = lambda model, observed, states: any(
+        engine._owner_eligible(owner, model) and owner.ready.get(model)
+        for owner in states
+    )
 
     def state():
         call = SimpleNamespace(failure=None, check_local=lambda: None)
@@ -71,10 +78,11 @@ def test_completed_preflight_wins_rotation_before_another_owner_probes(owner_sta
                 )
             ]
         )
+        result.cursor = 1
         return result
 
     requesting, observed = state(), state()
-    observed.preflight["replica"] = object()
+    engine._preflights["replica"] = _Preflight(object(), (observed,))
     if owner_status == "failed":
         observed.call.failure = RuntimeError("already failed")
     elif owner_status == "contextless":
@@ -92,6 +100,12 @@ def test_completed_preflight_wins_rotation_before_another_owner_probes(owner_sta
         assert observations == []
         assert scheduler.dispatched == ["replica"]
         assert not observed.ready["replica"]
+        # A newly registered owner cannot join the already observed round.
+        assert len(requesting.ready["replica"]) == 1
     else:
-        assert observations == [("observe", requesting, "replica")]
+        assert len(observations) == 1
+        kind, members, metadata = observations[0]
+        assert kind == "catalog_shared"
+        assert members == (requesting,)
+        assert metadata.members == {"replica": (requesting,)}
         assert scheduler.dispatched == []

@@ -47,7 +47,7 @@ class Block(importlib.abc.MetaPathFinder):
             raise AssertionError('forbidden import: ' + fullname)
 sys.meta_path.insert(0, Block())
 import runtime_llama
-assert runtime_llama.__version__ == '0.10.1'
+assert runtime_llama.__version__ == '0.10.2'
 """
     environment = dict(os.environ)
     environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")

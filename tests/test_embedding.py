@@ -190,6 +190,7 @@ def test_preflight_and_embedding_are_progressive_by_item_batch():
                     pressure = adapter._engine.snapshot()
                     if (
                         pressure["pending_tokens"] == 8
+                        and pressure["embedding_in_flight"] == 1
                         and pressure["preparation_results_waiting"] > 0
                     ):
                         break

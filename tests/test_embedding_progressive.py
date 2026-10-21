@@ -577,7 +577,8 @@ def test_prepared_ids_follow_fresh_topology_identity_and_tokenizer_observation(c
         adapter.close()
 
 
-def test_count_only_prepared_record_can_use_only_a_safe_compatible_path():
+@pytest.mark.parametrize("retain_cache", [True, False])
+def test_count_only_prepared_record_uses_verified_cached_ids_or_text(retain_cache):
     client = TokenClient(1)
     adapter = adapter_for(client)
     try:
@@ -586,10 +587,17 @@ def test_count_only_prepared_record_can_use_only_a_safe_compatible_path():
         fields.pop("_seal")
         fields["_token_ids"] = None
         legacy = issue_preparation(adapter._preparation_key, **fields)
+        if not retain_cache:
+            adapter._preparation_cache.close()
         counted = len(client.token_calls)
         assert adapter.embed_prepared([legacy]) == [vector("legacy-count")]
         if wire_kind(client.wire_calls[0][1]) == "tokens":
-            assert len(client.token_calls) > counted
+            assert retain_cache
+            assert client.wire_calls[0][1] == [list(record._token_ids)]
+        else:
+            assert not retain_cache
+            assert client.wire_calls[0][1] == [record.text]
+        assert len(client.token_calls) == counted
     finally:
         adapter.close()
 

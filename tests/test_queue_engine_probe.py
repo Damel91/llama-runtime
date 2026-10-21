@@ -226,6 +226,35 @@ def test_request_cap_is_atomic_across_threads_and_never_replays():
     assert not any(budget.active.values())
 
 
+def test_phase_maps_do_not_treat_later_reuse_as_duplicate_inference():
+    budget = probe.Budget()
+    budget.ids["replica", (1, 2)] = "first"
+    client = probe.observed_client_type(FixtureClient)(budget=budget)
+    for phase in ("pipeline", "reuse_raw_1"):
+        budget.phase = phase
+        budget.phase_raw[phase] = {}
+        budget.phase_positions[phase] = {"first": (0, 0)}
+        client.request(
+            "POST", "/v1/embeddings", {"model": "replica", "input": [[1, 2]]}
+        )
+    assert all(len(rows) == 1 for rows in budget.phase_raw.values())
+    assert probe.phase_counts(budget, "pipeline") == {"embedding": 1}
+    assert probe.phase_counts(budget, "reuse_raw_1") == {"embedding": 1}
+
+
+def test_id_audit_cross_alias_lookup_requires_pinned_and_unambiguous_text():
+    budget = probe.Budget()
+    budget.ids["a", (1, 2)] = "first"
+    budget.compatible_aliases = frozenset({"a", "b", "c"})
+    assert budget.text_for_ids("b", [1, 2]) == "first"
+    with pytest.raises(ValueError, match="uncorrelated"):
+        budget.text_for_ids("unknown", [1, 2])
+    budget.ids["a", (3, 4)] = "first"
+    budget.ids["b", (3, 4)] = "second"
+    with pytest.raises(ValueError, match="ambiguous"):
+        budget.text_for_ids("c", [3, 4])
+
+
 def test_observer_audits_mixed_source_positions_and_response_reordering():
     class MixedClient(FixtureClient):
         def request(self, method, path, body=None, **kwargs):
@@ -278,7 +307,10 @@ def test_oversize_oracle_requires_remote_exact_count_and_zero_embedding_posts():
         probe.oversize_canary(Adapter(), budget, "oversize", BackendError)
 
 
-def test_complete_probe_runs_against_offline_native_fixture(monkeypatch, tmp_path):
+@pytest.mark.parametrize("reuse", [False, True])
+def test_complete_probe_runs_against_offline_native_fixture(
+    monkeypatch, tmp_path, reuse
+):
     import runtime_llama
     import runtime_llama.client
     from runtime_llama.client import LlamaCppClient
@@ -333,7 +365,7 @@ def test_complete_probe_runs_against_offline_native_fixture(monkeypatch, tmp_pat
                 text = (
                     row if isinstance(row, str) else self.text_by_ids[model, tuple(row)]
                 )
-                position = int(text.split("Queue document ", 1)[1][:3])
+                position = int(text.split("document ", 1)[1].split(":", 1)[0])
                 values = vector(0, 3)
                 values[1] = position + 1
                 data.append({"index": index, "embedding": values})
@@ -354,6 +386,7 @@ def test_complete_probe_runs_against_offline_native_fixture(monkeypatch, tmp_pat
         model="fixture.gguf",
         prefix="",
         wall_timeout=30,
+        qualify_reuse=reuse,
         output=tmp_path / "report.json",
     )
     report, artifacts = probe.run(args)
@@ -364,7 +397,17 @@ def test_complete_probe_runs_against_offline_native_fixture(monkeypatch, tmp_pat
     assert report["pipeline"]["mixed_source_window_posts"] > 0
     assert report["effective_batch_wait_sec"] == 0
     assert report["oversize"]["exact_token_count"] > 2048
-    assert report["request_counts"]["tokenize"] == 528
+    assert report["request_counts"]["tokenize"] == 528 + (8 if reuse else 0)
+    assert report["pipeline"]["request_counts"]["tokenize"] == 511
+    assert report["pipeline"]["request_counts"]["metadata"] < 50
+    assert all(item["passed"] for item in report["pipeline"]["canary_comparisons"])
+    if reuse:
+        assert report["reuse"]["prepare_request_counts"]["tokenize"] == 8
+        assert len(report["reuse"]["phases"]) == 4
+        assert report["reuse"]["cache_after_close"]["entries"] == 0
+        for result in report["reuse"]["phases"].values():
+            assert result["correlations"] == 8
+            assert result["request_counts"].get("tokenize", 0) == 0
     assert not any(report["active_at_finish"].values())
     assert len(artifacts["outputs"]) == len(artifacts["raw_by_text"]) == 511
     assert "/private/fixture/model.gguf" not in str(report)
