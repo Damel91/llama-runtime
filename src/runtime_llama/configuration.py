@@ -31,6 +31,12 @@ def _positive_int(value: Any, name: str) -> int | None:
     return value
 
 
+def _nonnegative_int(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a nonnegative integer")
+    return value
+
+
 def _finite(
     value: Any, name: str, *, minimum: float = 0.0, positive: bool = False
 ) -> float:
@@ -283,6 +289,9 @@ class AdapterProfile:
     embedding_max_pending_bytes: int = 64 * 1024 * 1024
     embedding_max_pending_tokens: int = 1024 * 1024
     embedding_max_request_bytes: int = 8 * 1024 * 1024
+    embedding_max_response_bytes: int = 8 * 1024 * 1024
+    embedding_preparation_cache_entries: int = 1024
+    embedding_preparation_cache_bytes: int = 8 * 1024 * 1024
 
     def __post_init__(self) -> None:
         if self.adapter_type not in {"llm", "embedding"}:
@@ -306,9 +315,15 @@ class AdapterProfile:
             "embedding_max_pending_bytes",
             "embedding_max_pending_tokens",
             "embedding_max_request_bytes",
+            "embedding_max_response_bytes",
         ):
             if _positive_int(getattr(self, name), name) is None:
                 raise ValueError(f"{name} must be a positive integer")
+        for name in (
+            "embedding_preparation_cache_entries",
+            "embedding_preparation_cache_bytes",
+        ):
+            _nonnegative_int(getattr(self, name), name)
         object.__setattr__(
             self,
             "embedding_batch_wait_sec",
@@ -459,6 +474,9 @@ class AdapterProfile:
                 "embedding_max_pending_bytes",
                 "embedding_max_pending_tokens",
                 "embedding_max_request_bytes",
+                "embedding_max_response_bytes",
+                "embedding_preparation_cache_entries",
+                "embedding_preparation_cache_bytes",
             )
             if name in merged
         }

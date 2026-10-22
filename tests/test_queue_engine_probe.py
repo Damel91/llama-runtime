@@ -51,6 +51,7 @@ def test_help_and_missing_optin_need_no_runtime_or_output(tmp_path):
     )
     assert help_result.returncode == 0
     assert "--allow-live" in help_result.stdout
+    assert "--connection-policy" in help_result.stdout
     result = subprocess.run(
         [
             sys.executable,
@@ -308,16 +309,20 @@ def test_oversize_oracle_requires_remote_exact_count_and_zero_embedding_posts():
 
 
 @pytest.mark.parametrize("reuse", [False, True])
+@pytest.mark.parametrize("connection_policy", ["close", "reuse"])
 def test_complete_probe_runs_against_offline_native_fixture(
-    monkeypatch, tmp_path, reuse
+    monkeypatch, tmp_path, reuse, connection_policy
 ):
     import runtime_llama
     import runtime_llama.client
     from runtime_llama.client import LlamaCppClient
 
+    observed_policies = []
+
     class NativeFixture(LlamaCppClient):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
+            observed_policies.append(self.connection_policy)
             self.text_by_ids = {}
 
         def request(self, method, path, body=None, **kwargs):
@@ -387,10 +392,13 @@ def test_complete_probe_runs_against_offline_native_fixture(
         prefix="",
         wall_timeout=30,
         qualify_reuse=reuse,
+        connection_policy=connection_policy,
         output=tmp_path / "report.json",
     )
     report, artifacts = probe.run(args)
     assert report["result"] == "passed", report.get("failure")
+    assert report["http_connection_policy"] == connection_policy
+    assert observed_policies == [connection_policy]
     assert report["profiles_unchanged"]
     assert report["pipeline"]["correlations"] == 511
     assert report["pipeline"]["source_window_sizes"] == [64] * 7 + [63]

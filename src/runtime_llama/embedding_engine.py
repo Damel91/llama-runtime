@@ -239,6 +239,11 @@ class PersistentEmbeddingEngine:
         self._vector_dim = adapter.embedding_dim or None
         self._progress = self._rotation = 0
         self._metadata_availability = 0
+        self._notification = 0
+        self._plan_counts = Counter()
+        self._preparing_by_model = Counter()
+        self._retained_plan_count = 0
+        self._view_signature = None
         self._packing_candidate_visits = 0
         self._view = {}
         self._update_view()
@@ -268,13 +273,19 @@ class PersistentEmbeddingEngine:
                     daemon=True,
                 )
                 self._thread.start()
-            self._condition.notify_all()
+            self._notify_locked()
         return future
+
+    def _notify_locked(self):
+        # Remember notifications delivered while the coordinator is working,
+        # not just those delivered after it has entered Condition.wait().
+        self._notification += 1
+        self._condition.notify_all()
 
     def wake(self):
         """Notify cancellation without introducing a polling coordinator per call."""
         with self._condition:
-            self._condition.notify_all()
+            self._notify_locked()
 
     def metadata_available(self):
         """Publish external pool/gate availability without metadata polling."""
@@ -282,14 +293,14 @@ class PersistentEmbeddingEngine:
             if self._closed:
                 return
             self._metadata_availability += 1
-            self._condition.notify_all()
+            self._notify_locked()
 
     def release_result(self, call):
         with self._condition:
             if self._closed and (self._thread is None or not self._thread.is_alive()):
                 return
             self._release_results.append(call)
-            self._condition.notify_all()
+            self._notify_locked()
 
     @staticmethod
     def _resource(name):
@@ -298,7 +309,7 @@ class PersistentEmbeddingEngine:
     def _event(self, kind, state, payload, future):
         with self._condition:
             self._events.append((kind, state, payload, future))
-            self._condition.notify_all()
+            self._notify_locked()
 
     def _task(self, executor, kind, state, payload, run):
         state.pending += 1
@@ -366,6 +377,9 @@ class PersistentEmbeddingEngine:
                 self._token_active -= 1
                 plan, positions, raw_cost = payload
                 plan.preparing -= 1
+                self._preparing_by_model[plan.model] -= 1
+                if not self._preparing_by_model[plan.model]:
+                    del self._preparing_by_model[plan.model]
                 self._raw_bytes -= raw_cost
                 self._bytes -= raw_cost
             else:
@@ -573,11 +587,7 @@ class PersistentEmbeddingEngine:
         descriptors = list(state.descriptors)
         selected = min(
             range(len(descriptors)),
-            key=lambda index: sum(
-                plan.model == descriptors[index][0]
-                for owner in self._states
-                for plan in owner.plans
-            ),
+            key=lambda index: self._plan_counts[descriptors[index][0]],
         )
         model, offset, remaining, cap = descriptors.pop(selected)
         state.descriptors = deque(descriptors)
@@ -591,16 +601,24 @@ class PersistentEmbeddingEngine:
         deduplicate = (
             observed.identity_key is not None and observed.tokenizer_build is not None
         )
-        groups, keys = [], {}
-        for index in range(offset, offset + size):
-            key = self._borrowed_key(state.inputs, index)
-            if deduplicate and key in keys:
-                groups[keys[key]][1].append(index)
-            else:
-                keys[key] = len(groups)
-                groups.append((index, [index]))
+        if deduplicate:
+            groups, keys = [], {}
+            for index in range(offset, offset + size):
+                key = self._borrowed_key(state.inputs, index)
+                if key in keys:
+                    groups[keys[key]][1].append(index)
+                else:
+                    keys[key] = len(groups)
+                    groups.append((index, [index]))
+        else:
+            groups = [(index, [index]) for index in range(offset, offset + size)]
         plan = _Plan(state, model, offset, size, cap, deque(groups))
         state.plans.append(plan)
+        # Descriptor balancing counts retained plans, including suspended ones,
+        # exactly as the former scan over owner.plans did. Preparation leases
+        # are an independent resource and do not alter this ownership ledger.
+        self._plan_counts[model] += 1
+        self._retained_plan_count += 1
         self._plans += 1
         self._descriptor_count += size
         self._peak_plans = max(self._peak_plans, self._plans)
@@ -670,15 +688,12 @@ class PersistentEmbeddingEngine:
         ):
             self._preparation_blocked = True
             return
+        owner_rotation = 0
         while self._token_active < self.tokenizers:
             selected = None
-            choices, preparing = [], {}
-            for owner in self._states:
-                for plan in owner.plans:
-                    preparing[plan.model] = (
-                        preparing.get(plan.model, 0) + plan.preparing
-                    )
-            for state in states:
+            choices = []
+            for offset in range(len(states)):
+                state = states[(owner_rotation + offset) % len(states)]
                 if state.context is None or state.call.failure is not None:
                     continue
                 if state.retain_result:
@@ -690,18 +705,19 @@ class PersistentEmbeddingEngine:
                     ):
                         continue
                 start = state.plan_rotation % max(1, len(state.plans))
-                plans = state.plans[start:] + state.plans[:start]
-                for plan in plans:
+                for offset in range(len(state.plans)):
+                    index = (start + offset) % len(state.plans)
+                    plan = state.plans[index]
                     if not plan.groups or not plan.admitted:
                         continue
                     if state.retain_result and self._vector_dim is None and plan.seeded:
                         continue
-                    choices.append((state, plan))
+                    choices.append((state, plan, index))
             # A fast worker continues feeding a lane that has no tokenizer
             # active instead of joining another lane's slow in-flight inputs.
             # The stable owner order still rotates fairly within each lane.
-            choices.sort(key=lambda item: preparing.get(item[1].model, 0))
-            for state, plan in choices:
+            choices.sort(key=lambda item: self._preparing_by_model[item[1].model])
+            for state, plan, index in choices:
                 if state.call.failure is not None:
                     continue
                 item_index, positions = plan.groups[0]
@@ -729,7 +745,7 @@ class PersistentEmbeddingEngine:
                     continue
                 if self._bytes + raw_cost <= self.max_bytes:
                     selected = state, plan, item_index, positions, raw_cost
-                    state.plan_rotation = state.plans.index(plan) + 1
+                    state.plan_rotation = index + 1
                     break
                 self._preparation_blocked = True
             if selected is None:
@@ -741,6 +757,7 @@ class PersistentEmbeddingEngine:
                 plan.seeded = True
                 self._unknown_seeds += 1
             plan.preparing += 1
+            self._preparing_by_model[plan.model] += 1
             self._bytes += raw_cost
             self._raw_bytes += raw_cost
             self._peak_bytes = max(self._peak_bytes, self._bytes)
@@ -758,7 +775,7 @@ class PersistentEmbeddingEngine:
                     state.context.conservative,
                 ),
             )
-            states = states[1:] + states[:1]
+            owner_rotation += 1
 
     def _owner_eligible(self, state, model):
         return (
@@ -1307,6 +1324,11 @@ class PersistentEmbeddingEngine:
                         state.call.failure is None or not state.pending
                     ):
                         state.plans.remove(plan)
+                        self._progress += 1
+                        self._retained_plan_count -= 1
+                        self._plan_counts[plan.model] -= 1
+                        if not self._plan_counts[plan.model]:
+                            del self._plan_counts[plan.model]
                         if plan.seeded:
                             self._unknown_seeds -= 1
                             plan.seeded = False
@@ -1400,6 +1422,37 @@ class PersistentEmbeddingEngine:
             )
 
     def _update_view(self):
+        ready = tuple(
+            (model, sum(len(queue) for queue in owners.values()))
+            for model, owners in self._lanes.items()
+        )
+        signature = (
+            self._bytes,
+            self._peak_bytes,
+            self._tokens,
+            self._peak_tokens,
+            self._plans,
+            self._retained_plan_count,
+            self._peak_plans,
+            self._token_active,
+            self._peak_token_active,
+            self._http_active,
+            self._peak_http_active,
+            self._control_active,
+            len(self._observing),
+            len(self._preflights),
+            len(self._metadata_rounds),
+            self._packing_candidate_visits,
+            len(self._publications),
+            len(self._http_publications),
+            self._result_bytes,
+            self._peak_result_bytes,
+            self._result_reserved,
+            self._peak_result_reserved,
+            ready,
+        )
+        if signature == self._view_signature:
+            return
         view = {
             "pending_bytes": self._bytes,
             "peak_pending_bytes": self._peak_bytes,
@@ -1407,7 +1460,7 @@ class PersistentEmbeddingEngine:
             "peak_pending_tokens": self._peak_tokens,
             "active_plans": self._plans,
             "active_preparation_plans": self._plans,
-            "retained_plans": sum(len(state.plans) for state in self._states),
+            "retained_plans": self._retained_plan_count,
             "peak_active_plans": self._peak_plans,
             "tokenization_in_flight": self._token_active,
             "peak_tokenization_in_flight": self._peak_token_active,
@@ -1426,13 +1479,11 @@ class PersistentEmbeddingEngine:
             "http_parallelism_bound": self.parallelism
             + self.tokenizers
             + self.control_workers,
-            "ready_by_replica": {
-                model: sum(len(queue) for queue in owners.values())
-                for model, owners in self._lanes.items()
-            },
+            "ready_by_replica": dict(ready),
         }
         with self._condition:
             self._view = view
+            self._view_signature = signature
 
     def snapshot(self):
         with self._condition:
@@ -1441,9 +1492,58 @@ class PersistentEmbeddingEngine:
                 "ready_by_replica": dict(self._view["ready_by_replica"]),
             }
 
+    def _next_wait(self):
+        """Only unnotifiable consumer callbacks and actual deadlines need timers.
+
+        Worker completions, stop, metadata availability and result credits all
+        carry a remembered notification. Custom coalescing clocks are probed
+        finitely because advancing one cannot notify this condition itself.
+        """
+        now = time.monotonic()
+        wakeups = []
+        for state in self._states:
+            if state.finishing or state.call.failure is not None:
+                continue
+            wakeups.append(max(0.0, state.call.deadline - now))
+            if (
+                state.call.cancel is not None
+                and not state.checking
+                and self._control_active < self.control_workers
+            ):
+                wakeups.append(max(0.0, state.checked_at + 0.05 - now))
+        wait = self.adapter.embedding_batch_wait_sec
+        if wait and self._control_active < self.control_workers:
+            clock = self.adapter._batch_now
+            normal_clock = (
+                getattr(getattr(clock, "__func__", None), "__qualname__", "")
+                == "LlamaCppEmbeddingAdapter._batch_now"
+            )
+            batch_now = clock()
+            for model, owners in self._lanes.items():
+                if (
+                    model in self._observing
+                    or model in self._preflights
+                    or not self.adapter._scheduler.has_capacity(model)
+                ):
+                    continue
+                oldest = min(
+                    (queue[0].ready_at for queue in owners.values() if queue),
+                    default=None,
+                )
+                if oldest is None:
+                    continue
+                remaining = wait - (batch_now - oldest)
+                if remaining > 0:
+                    wakeups.append(remaining if normal_clock else min(remaining, 0.05))
+                # An elapsed timer was already handled in this cycle. If it
+                # cannot progress, a resource/metadata event must unblock it.
+        return min(wakeups, default=None)
+
     def _run(self):
         while True:
             with self._condition:
+                notification = self._notification
+                progress = self._progress
                 self._states.extend(self._incoming)
                 self._incoming.clear()
                 events, self._events = self._events, deque()
@@ -1497,21 +1597,30 @@ class PersistentEmbeddingEngine:
                     self._task(self._control, "check", state, None, state.call.check)
             self._start_cohorts(states)
             self._update_view()
+            # A local transition can release admission without scheduling a
+            # worker (for example retiring a seed plan). Settle that transition
+            # once more before waiting for external work.
+            changed = progress != self._progress
+            timeout = self._next_wait()
             with self._condition:
                 if self._closed and not self._states and not self._incoming:
                     return
-                if self._events or self._incoming or self._release_results:
+                if (
+                    self._events
+                    or self._incoming
+                    or self._release_results
+                    or notification != self._notification
+                    or changed
+                ):
                     continue
-                # One bounded poll is needed for arbitrary caller probes and
-                # opt-in coalescing clocks, never one polling thread per window.
-                self._condition.wait(0.01 if self._states else None)
+                self._condition.wait(timeout)
 
     def close(self):
         with self._condition:
             self._closed = True
             for state in (*self._incoming, *self._states):
                 state.call.stop.set()
-            self._condition.notify_all()
+            self._notify_locked()
             coordinator = self._thread
         if coordinator is not None:
             if coordinator is current_thread():

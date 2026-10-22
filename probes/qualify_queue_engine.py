@@ -582,6 +582,7 @@ def run(args):
         "started_at": datetime.now(timezone.utc).isoformat(),
         "version": runtime_llama.__version__,
         "distribution_version": distribution.version,
+        "http_connection_policy": getattr(args, "connection_policy", "close"),
         "installed_archive_sha256": direct.get("archive_info", {})
         .get("hashes", {})
         .get("sha256"),
@@ -600,7 +601,10 @@ def run(args):
     }
     budget = Budget(args.wall_timeout)
     client = observed_client_type(LlamaCppClient)(
-        args.base_url, timeout=20, budget=budget
+        args.base_url,
+        timeout=20,
+        budget=budget,
+        connection_policy=getattr(args, "connection_policy", "close"),
     )
     adapter, outputs, aliases, data = None, [], [], corpus(args.prefix)
     windows = source_windows(data)
@@ -658,6 +662,7 @@ def run(args):
         config = {
             "base_url": args.base_url,
             "model": args.model,
+            "http_connection_policy": getattr(args, "connection_policy", "close"),
             "embedding_replica_discovery": True,
             "batch_size": 256,
             "embedding_request_parallelism": 2,
@@ -799,6 +804,12 @@ def main(argv=None):
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--prefix", default="")
+    parser.add_argument(
+        "--connection-policy",
+        choices=("close", "reuse"),
+        default="close",
+        help="qualify the selected HTTP policy without fallback or changing defaults",
+    )
     parser.add_argument(
         "--qualify-reuse",
         action="store_true",

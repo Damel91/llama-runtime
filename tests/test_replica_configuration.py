@@ -97,6 +97,9 @@ def test_persistent_queue_defaults_are_finite_without_a_required_timer():
     assert parsed.embedding_max_pending_bytes == 64 * 1024 * 1024
     assert parsed.embedding_max_pending_tokens == 1024 * 1024
     assert parsed.embedding_max_request_bytes == 8 * 1024 * 1024
+    assert parsed.embedding_max_response_bytes == 8 * 1024 * 1024
+    assert parsed.embedding_preparation_cache_entries == 1024
+    assert parsed.embedding_preparation_cache_bytes == 8 * 1024 * 1024
 
 
 @pytest.mark.parametrize(
@@ -105,6 +108,7 @@ def test_persistent_queue_defaults_are_finite_without_a_required_timer():
         "embedding_max_pending_bytes",
         "embedding_max_pending_tokens",
         "embedding_max_request_bytes",
+        "embedding_max_response_bytes",
     ],
 )
 @pytest.mark.parametrize("value", [None, 0, -1, True, 1.5, "1024"])
@@ -133,6 +137,9 @@ def test_queue_budgets_are_configurable_without_changing_model_identity(monkeypa
         "embedding_max_pending_bytes": 2 * 1024 * 1024,
         "embedding_max_pending_tokens": 32768,
         "embedding_max_request_bytes": 256 * 1024,
+        "embedding_max_response_bytes": 16 * 1024 * 1024,
+        "embedding_preparation_cache_entries": 32,
+        "embedding_preparation_cache_bytes": 512 * 1024,
         "embedding_batch_wait_sec": 0.75,
     }
     parsed = profile(**settings)
@@ -142,3 +149,35 @@ def test_queue_budgets_are_configurable_without_changing_model_identity(monkeypa
         parsed.model_config.physical_identity
         == profile().model_config.physical_identity
     )
+
+
+@pytest.mark.parametrize(
+    "name", ["embedding_preparation_cache_entries", "embedding_preparation_cache_bytes"]
+)
+@pytest.mark.parametrize("value", [None, -1, True, 1.5, "1024", float("inf")])
+def test_preparation_cache_budgets_require_nonnegative_integers(name, value):
+    with pytest.raises(ValueError, match=name):
+        profile(**{name: value})
+
+
+def test_response_and_cache_configuration_inherits_defaults_with_role_overrides():
+    defaults = {
+        "embedding_max_response_bytes": 4096,
+        "embedding_preparation_cache_entries": 20,
+        "embedding_preparation_cache_bytes": 8192,
+    }
+    parsed = AdapterProfile.from_config(
+        "ingest",
+        {
+            "adapter_type": "embedding",
+            "model": "embed_0",
+            "embedding_preparation_cache_entries": 0,
+            "embedding_max_request_bytes": 256,
+        },
+        defaults,
+    )
+    assert parsed.embedding_max_response_bytes == 4096
+    assert parsed.embedding_preparation_cache_entries == 0
+    assert parsed.embedding_preparation_cache_bytes == 8192
+    assert parsed.embedding_max_request_bytes == 256
+    assert defaults["embedding_preparation_cache_entries"] == 20

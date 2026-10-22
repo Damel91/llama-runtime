@@ -14,7 +14,13 @@ from typing import Any, AsyncIterable, Literal, Sequence
 
 from runtime_llama.client import ClientHTTPError, LlamaCppClient
 from runtime_llama._proxy import assert_client_proxy
-from runtime_llama.configuration import AdapterProfile, EmbeddingPrefixes, _finite
+from runtime_llama.configuration import (
+    AdapterProfile,
+    EmbeddingPrefixes,
+    _finite,
+    _nonnegative_int,
+    _positive_int,
+)
 from runtime_llama.contracts import CancellationProbe, EmbeddingAdapter
 from runtime_llama.errors import LLMBackendError, LLMCancelledError, LLMTimeoutError
 from runtime_llama.replica_discovery import (
@@ -217,6 +223,7 @@ class _BatchCall:
         self.deadline = max(call.deadline for call in self.calls)
         self._validated_records = ()
         self._validated_observation = None
+        self._record_owners = ()
 
     def _live(self, *, local=False):
         live = []
@@ -275,8 +282,6 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
 
     _BATCH_RECOVERY_SUCCESS_WINDOW = 32
     _BATCH_RECOVERY_MAX_WINDOW = 1024
-    _PREPARATION_CACHE_ENTRIES = 1024
-    _PREPARATION_CACHE_BYTES = 8 * 1024 * 1024
 
     def __init__(
         self, profile: AdapterProfile, *, client: LlamaCppClient | None = None
@@ -309,6 +314,24 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         )
         self.embedding_max_request_bytes = getattr(
             profile, "embedding_max_request_bytes", 8 * 1024 * 1024
+        )
+        self.embedding_max_response_bytes = getattr(
+            profile, "embedding_max_response_bytes", 8 * 1024 * 1024
+        )
+        if (
+            _positive_int(
+                self.embedding_max_response_bytes, "embedding_max_response_bytes"
+            )
+            is None
+        ):
+            raise ValueError("embedding_max_response_bytes must be a positive integer")
+        self.embedding_preparation_cache_entries = _nonnegative_int(
+            getattr(profile, "embedding_preparation_cache_entries", 1024),
+            "embedding_preparation_cache_entries",
+        )
+        self.embedding_preparation_cache_bytes = _nonnegative_int(
+            getattr(profile, "embedding_preparation_cache_bytes", 8 * 1024 * 1024),
+            "embedding_preparation_cache_bytes",
         )
         self.embedding_input_format = getattr(profile, "embedding_input_format", "auto")
         if self.embedding_input_format not in ("auto", "text", "tokens"):
@@ -352,11 +375,11 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         self._tokenizer_permits = BoundedSemaphore(self.token_count_parallelism)
         self._preparation_key = secrets.token_bytes(32)
         self._preparation_cache = PreparationCache(
-            max_entries=self._PREPARATION_CACHE_ENTRIES,
+            max_entries=self.embedding_preparation_cache_entries,
             max_bytes=max(
                 0,
                 min(
-                    self._PREPARATION_CACHE_BYTES,
+                    self.embedding_preparation_cache_bytes,
                     self.embedding_max_pending_bytes // 4,
                 ),
             ),
@@ -872,11 +895,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
     def _engine_response_options(self):
         # Custom clients own decoding and may not expose the native bound.
         return (
-            {
-                "max_response_bytes": min(
-                    self.embedding_max_request_bytes, self.embedding_max_pending_bytes
-                )
-            }
+            {"max_response_bytes": self.embedding_max_response_bytes}
             if isinstance(self._client, LlamaCppClient)
             else {}
         )
@@ -1121,83 +1140,108 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         records: Sequence[_CountedInput] | None = None,
         wire_input: list | None = None,
     ) -> list[list[float]]:
-        # Recovery shares one pending set. A newly observed constraint applies
-        # to unsent siblings before the first child has an avoidable effect.
+        # Recovery shares one pending set. A fresh observation is authoritative
+        # for every unsent record, while historical limits remain record-local.
         pending = set(range(len(texts)))
         admitted = None
-        context_limit = http_limit = None
+        results = [None] * len(texts)
+        owners = call._record_owners if isinstance(call, _BatchCall) else ()
 
-        def send(start, stop, recovering, observed=None):
-            nonlocal admitted, context_limit, http_limit
+        def live(index):
+            return not owners or owners[index].failure is None
+
+        def send(indices, recovering, observed=None):
+            nonlocal admitted
             current_timeout = timeout
+            http_limit = None
             if call is not None:
                 call.check()
+                indices = tuple(index for index in indices if live(index))
+                if not indices:
+                    return
                 if observed is None:
                     observed = self._observe_replica(
                         replica=replica, cancel=call.probe, call=call
                     )
                 current_timeout = call.remaining()
                 if records is not None:
-                    context_limit = self._minimum(
-                        context_limit,
-                        observed.context_token_limit,
-                        *(records[i].context_token_limit for i in pending),
-                    )
-                    http_limit = self._minimum(
-                        http_limit,
-                        observed.batch_token_limit,
-                        *(records[i].batch_token_limit for i in pending),
-                    )
-                    key = (observed.tokenizer_build, context_limit, http_limit)
-                    if key != admitted:
+                    # The complete immutable snapshot includes vocabulary and
+                    # identity. A sibling's smaller historical limit must not
+                    # hide a server-side reduction or tokenizer change.
+                    if observed != admitted:
                         prevalidated = isinstance(
                             call, _BatchCall
                         ) and call.prevalidated(records, observed)
                         for index in () if prevalidated else pending:
+                            if not live(index):
+                                continue
                             record = records[index]
-                            self._validate_vocab(record._token_ids, observed)
-                            if record._tokenizer_build != observed.tokenizer_build:
-                                raise LLMBackendError(
-                                    "llamacpp_embedding_tokenizer_policy_changed"
-                                )
-                            self._admit(
-                                record,
-                                _Observation(
-                                    observed.context_length,
-                                    context_limit,
-                                    http_limit,
-                                    observed.tokenizer_build,
-                                ),
-                            )
-                        admitted = key
+                            try:
+                                if (
+                                    record.identity_verified
+                                    and observed.identity_key
+                                    != (
+                                        record.content_sha256,
+                                        record.embedding_sha256,
+                                    )
+                                ):
+                                    raise LLMBackendError(
+                                        "llamacpp_embedding_content_identity_changed"
+                                    )
+                                self._engine_validate(record, replica.model, observed)
+                            except BaseException as exc:
+                                if not owners:
+                                    raise
+                                owners[index].fail(exc)
+                        admitted = observed
+                    call.check()
+                    indices = tuple(index for index in indices if live(index))
+                    if not indices:
+                        return
+                    http_limit = self._minimum(
+                        observed.batch_token_limit,
+                        *(records[i].batch_token_limit for i in indices),
+                    )
                     if (
                         http_limit is not None
-                        and sum(item.token_count for item in records[start:stop])
+                        and sum(records[index].token_count for index in indices)
                         > http_limit
                     ):
-                        vectors, cursor = [], start
-                        while cursor < stop:
+                        cursor = 0
+                        while cursor < len(indices):
                             end, tokens = cursor, 0
-                            while end < stop:
-                                count = records[end].token_count
-                                if end > cursor and tokens + count > http_limit:
+                            child_limit = observed.batch_token_limit
+                            while end < len(indices):
+                                record = records[indices[end]]
+                                limit = self._minimum(
+                                    child_limit, record.batch_token_limit
+                                )
+                                count = record.token_count
+                                if (
+                                    end > cursor
+                                    and limit is not None
+                                    and tokens + count > limit
+                                ):
                                     break
                                 tokens += count
+                                child_limit = limit
                                 end += 1
-                            vectors.extend(send(cursor, end, True))
+                            send(indices[cursor:end], True)
                             cursor = end
-                        return vectors
+                        return
             if cancel is not None and cancel():
                 raise LLMCancelledError()
             with replica.lock:
                 generation = replica.generation
             try:
                 payload = self._client.embeddings(
-                    wire_input[start:stop]
+                    [wire_input[index] for index in indices]
                     if wire_input is not None
                     else self._embedding_input(
-                        texts[start:stop],
-                        None if records is None else records[start:stop],
+                        [texts[index] for index in indices],
+                        None
+                        if records is None
+                        else [records[index] for index in indices],
                         replica,
                         observed,
                     ),
@@ -1208,7 +1252,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                     **self._engine_response_options(),
                 )
             except ClientHTTPError as exc:
-                size = stop - start
+                size = len(indices)
                 if (
                     getattr(self._client, "supports_embedding_token_ids", None) is True
                     or exc.status_code != 400
@@ -1216,18 +1260,24 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                     or size <= 1
                 ):
                     raise
-                midpoint = start + size // 2
+                midpoint = size // 2
                 self._tighten_adaptive_batch_size(
-                    max(midpoint - start, stop - midpoint), replica=replica
+                    max(midpoint, size - midpoint), replica=replica
                 )
-                return send(start, midpoint, True) + send(midpoint, stop, True)
-            vectors = self._parse_batch_response(payload, expected_count=stop - start)
-            pending.difference_update(range(start, stop))
+                send(indices[:midpoint], True)
+                send(indices[midpoint:], True)
+                return
+            vectors = self._parse_batch_response(payload, expected_count=len(indices))
+            for index, vector in zip(indices, vectors):
+                results[index] = vector
+            pending.difference_update(indices)
             if not recovering:
-                self._record_batch_success(stop - start, generation, replica)
-            return vectors
+                self._record_batch_success(len(indices), generation, replica)
 
-        return send(0, len(texts), recovery_child, observation)
+        send(tuple(range(len(texts))), recovery_child, observation)
+        # A withdrawn shared owner has no result. Its empty internal row is
+        # discarded by _engine_run_shared and never published to a consumer.
+        return [vector if vector is not None else [] for vector in results]
 
     def _batch_now(self):
         """Clock isolated from cancellation/deadline clocks for deterministic checks."""
@@ -1418,6 +1468,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         active_records = [record for _, record, _ in sent]
         group._validated_records = tuple(id(record) for record in active_records)
         group._validated_observation = observation
+        group._record_owners = tuple(call for _, _, call in sent)
         vectors = self._engine_run(model, active_records, group, observation)
         if len(vectors) != len(sent):
             raise LLMBackendError("llamacpp_embedding_count_or_response_mismatch")
@@ -1432,7 +1483,9 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 call.validate_dimensions(owner_vectors)
             except BaseException as exc:
                 call.fail(exc)
-        return [(index, vector) for (index, _, _), vector in zip(sent, vectors)]
+        return [
+            (index, vector) for (index, _, _), vector in zip(sent, vectors) if vector
+        ]
 
     def _engine_result(self, call, operation, outputs):
         call.check()

@@ -9,6 +9,7 @@ import pytest
 
 from runtime_llama.client import ClientHTTPError
 from runtime_llama.errors import LLMBackendError, LLMCancelledError, LLMTimeoutError
+from runtime_llama.adapters.embedding import LlamaCppEmbeddingAdapter
 
 from test_embedding_contracts import (
     NAME,
@@ -62,6 +63,101 @@ def assert_native_rows(client):
         for request in client.wire_inputs
         for row in request
     )
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [
+        {"embedding_preparation_cache_entries": 0},
+        {"embedding_preparation_cache_bytes": 0},
+        {
+            "embedding_preparation_cache_entries": 0,
+            "embedding_preparation_cache_bytes": 0,
+        },
+    ],
+)
+def test_configured_zero_cache_retains_no_tokens_and_preserves_exact_outputs(limits):
+    client = ReuseClient(1)
+    adapter = runtime(client, **limits)
+    try:
+        assert (
+            adapter.embed_query("same") == adapter.embed_query("same") == vector("same")
+        )
+        assert len(client.token_calls) == 2
+        view = adapter.health_status()["preparation_cache"]
+        assert view["entries"] == view["bytes"] == view["hits"] == 0
+        assert_native_rows(client)
+    finally:
+        adapter.close()
+
+
+def test_configured_small_lru_evicts_exact_tokens_and_close_drains_storage():
+    client = ReuseClient(1)
+    adapter = runtime(client, embedding_preparation_cache_entries=1)
+    try:
+        for text in ("a", "b", "b", "a"):
+            assert adapter.embed_query(text) == vector(text)
+        assert [text for text, _ in client.token_calls] == ["a", "b", "a"]
+        view = adapter.health_status()["preparation_cache"]
+        assert view["entries"] == 1 and view["evictions"] == 2
+        assert view["max_entries"] == 1 and view["hits"] == 1
+    finally:
+        adapter.close()
+    view = adapter._preparation_cache.snapshot()
+    assert view["closed"] and view["entries"] == view["bytes"] == 0
+
+
+@pytest.mark.parametrize(
+    "configured_bytes,pending_bytes,expected",
+    [(4096, 65536, 4096), (32768, 65536, 16384), (0, 65536, 0)],
+)
+def test_configured_cache_bytes_are_separate_and_clipped_to_pending_fraction(
+    configured_bytes, pending_bytes, expected
+):
+    client = ReuseClient(1)
+    adapter = runtime(
+        client,
+        embedding_preparation_cache_bytes=configured_bytes,
+        embedding_max_pending_bytes=pending_bytes,
+        embedding_max_response_bytes=1024,
+    )
+    try:
+        assert adapter._preparation_cache.snapshot()["max_bytes"] == expected
+        assert adapter.embedding_preparation_cache_bytes == configured_bytes
+        assert adapter.embedding_max_response_bytes == 1024
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("embedding_max_response_bytes", None),
+        ("embedding_max_response_bytes", 0),
+        ("embedding_max_response_bytes", True),
+        ("embedding_preparation_cache_entries", -1),
+        ("embedding_preparation_cache_entries", True),
+        ("embedding_preparation_cache_bytes", None),
+        ("embedding_preparation_cache_bytes", 1.5),
+    ],
+)
+def test_direct_adapter_validation_rejects_invalid_bypassed_profiles_before_client(
+    monkeypatch, name, value
+):
+    client = ReuseClient(1)
+    adapter = runtime(client)
+    profile = adapter.profile
+    adapter.close()
+    # Defend the direct constructor even if a consumer bypasses the frozen
+    # profile's own validation or supplies a structurally compatible object.
+    object.__setattr__(profile, name, value)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("invalid budgets must fail before creating HTTP clients")
+
+    monkeypatch.setattr("runtime_llama.adapters.embedding.LlamaCppClient", forbidden)
+    with pytest.raises(ValueError, match=name):
+        LlamaCppEmbeddingAdapter(profile)
 
 
 def test_raw_and_prepared_public_calls_reuse_tokens_across_verified_aliases():
