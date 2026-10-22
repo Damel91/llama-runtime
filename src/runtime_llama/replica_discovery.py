@@ -31,6 +31,28 @@ def is_loaded(entry: dict[str, Any]) -> bool:
     return (status.get("value") if isinstance(status, dict) else status) == "loaded"
 
 
+def attest_single_model_catalog(catalog: Any, props: Any):
+    """Attest one statusless entry using root props without selecting an alias.
+
+    This establishes loaded state only. Content-identity requirements remain
+    the caller's responsibility; router and sleeping responses cannot attest.
+    """
+    entries = catalog.get("data") if isinstance(catalog, dict) else None
+    if (
+        isinstance(entries, list)
+        and len(entries) == 1
+        and isinstance(entries[0], dict)
+        and "status" not in entries[0]
+        and isinstance(props, dict)
+        and props.get("role") != "router"
+        and props.get("is_sleeping") is not True
+        and isinstance(props.get("model_alias"), str)
+        and props["model_alias"] in catalog_aliases(entries[0])
+    ):
+        return {**catalog, "data": [{**entries[0], "status": {"value": "loaded"}}]}
+    return catalog
+
+
 @dataclass(frozen=True)
 class ReplicaIdentity:
     content_sha256: str

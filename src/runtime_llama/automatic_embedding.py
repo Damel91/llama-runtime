@@ -16,7 +16,7 @@ import json
 import os
 from pathlib import Path
 import sys
-from threading import Condition, Event, Lock
+from threading import Condition, Event, Lock, local
 import time
 
 from runtime_llama._proxy import normalize_proxy_url
@@ -46,6 +46,7 @@ from runtime_llama.errors import (
     sanitize_diagnostic,
 )
 from runtime_llama.replica_discovery import (
+    attest_single_model_catalog,
     discover_embedding_pool,
     is_loaded,
     parse_replica,
@@ -109,6 +110,11 @@ class AutomaticEmbeddingConfig:
     verify_ssl: bool = True
     proxy_url: str | None = field(default=None, repr=False)
     trust_env: bool = False
+    embedding_max_pending_bytes: int = 64 * 1024 * 1024
+    embedding_max_pending_tokens: int = 1024 * 1024
+    embedding_max_request_bytes: int = 8 * 1024 * 1024
+    embedding_max_response_bytes: int = 8 * 1024 * 1024
+    http_connection_policy: str = "close"
 
     def __post_init__(self):
         if not isinstance(self.base_url, str) or any(
@@ -139,6 +145,18 @@ class AutomaticEmbeddingConfig:
         if self.calibration_workers > 32:
             raise ValueError("calibration_workers must not exceed 32")
         _nonnegative_int(self.queue_size, "queue_size")
+        for name in (
+            "embedding_max_pending_bytes",
+            "embedding_max_pending_tokens",
+            "embedding_max_request_bytes",
+            "embedding_max_response_bytes",
+        ):
+            if _positive_int(getattr(self, name), name) is None:
+                raise ValueError(f"{name} must be a positive integer")
+        if not isinstance(
+            self.http_connection_policy, str
+        ) or self.http_connection_policy not in ("close", "reuse"):
+            raise ValueError("http_connection_policy must be close or reuse")
         for name in ("normalize", "verify_ssl", "trust_env"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be a boolean")
@@ -162,6 +180,13 @@ class AutomaticEmbeddingStatus:
     calibration_id: str | None
 
 
+class _ReentrantCloseError(LLMBackendError):
+    """A consumer callback cannot synchronously drain its own operation."""
+
+    def __init__(self):
+        super().__init__("llamacpp_automatic_embedding_close_from_cancel_callback")
+
+
 class _Operation:
     def __init__(self, service, timeout, cancel):
         _finite(timeout, "timeout", positive=True)
@@ -183,7 +208,9 @@ class _Operation:
             raise LLMTimeoutError("llamacpp_automatic_embedding_timeout")
         if self.cancel is not None:
             try:
-                cancelled = self.cancel()
+                cancelled = self.service._invoke_cancel(self.cancel)
+            except _ReentrantCloseError:
+                raise
             except Exception as exc:
                 raise LLMBackendError(
                     "llamacpp_automatic_embedding_cancel_probe_failed"
@@ -226,6 +253,19 @@ class AutomaticEmbeddingService:
         self._closed = False
         self._operations = set()
         self._streams = set()
+        self._callback_state = local()
+
+    def _invoke_cancel(self, callback):
+        depth = getattr(self._callback_state, "depth", 0)
+        self._callback_state.depth = depth + 1
+        try:
+            return bool(callback())
+        finally:
+            self._callback_state.depth = depth
+
+    def _check_close_reentrancy(self):
+        if getattr(self._callback_state, "depth", 0):
+            raise _ReentrantCloseError()
 
     @contextmanager
     def _operation(self, timeout, cancel):
@@ -256,7 +296,7 @@ class AutomaticEmbeddingService:
                     verify_ssl=self.config.verify_ssl,
                     proxy_url=self.config.proxy_url,
                     trust_env=self.config.trust_env,
-                    connection_policy="close",
+                    connection_policy=self.config.http_connection_policy,
                 )
             return self._client
 
@@ -330,6 +370,27 @@ class AutomaticEmbeddingService:
             cancel_wait=True,
         )
         operation.check()
+        entries = catalog.get("data") if isinstance(catalog, dict) else None
+        if (
+            isinstance(entries, list)
+            and len(entries) == 1
+            and isinstance(entries[0], dict)
+            and "status" not in entries[0]
+        ):
+            # Require proven content before a statusless compatibility probe.
+            # Root props cannot select or auto-load a router model. The same
+            # loaded-state authority is used by the existing exact adapter.
+            if parse_replica(entries[0]).identity is None:
+                raise LLMBackendError(
+                    "llamacpp_automatic_embedding_identity_unverified"
+                )
+            props = client.props(
+                timeout=min(self.config.timeout, operation.remaining()),
+                cancel=operation.probe,
+                cancel_wait=True,
+            )
+            operation.check()
+            catalog = attest_single_model_catalog(catalog, props)
         pool = self._select_pool(catalog)
         prefixes = self._select_prefixes(pool)
         profile = AdapterProfile.from_config(
@@ -355,6 +416,11 @@ class AutomaticEmbeddingService:
                 "proxy_url": self.config.proxy_url,
                 "api_key": self.config.api_key,
                 "api_key_env": self.config.api_key_env,
+                "http_connection_policy": self.config.http_connection_policy,
+                "embedding_max_pending_bytes": self.config.embedding_max_pending_bytes,
+                "embedding_max_pending_tokens": self.config.embedding_max_pending_tokens,
+                "embedding_max_request_bytes": self.config.embedding_max_request_bytes,
+                "embedding_max_response_bytes": self.config.embedding_max_response_bytes,
             },
         )
         with self._condition:
@@ -724,6 +790,7 @@ class AutomaticEmbeddingService:
 
     def close(self):
         """Stop admission and drain calibration and shared inference ownership."""
+        self._check_close_reentrancy()
         with self._close_lock:
             with self._condition:
                 if self._closed:
@@ -743,6 +810,8 @@ class AutomaticEmbeddingService:
                 self._condition.notify_all()
 
     async def aclose(self):
+        self._check_close_reentrancy()
+
         async def cleanup():
             with self._condition:
                 self._closing.set()
@@ -805,6 +874,7 @@ class _AutomaticEmbeddingStream:
         self._stop = Event()
         self._loop = self._initialization = self._delegate = None
         self._closed = self._next_active = False
+        self._callback_failure = None
 
     def __aiter__(self):
         return self
@@ -816,7 +886,25 @@ class _AutomaticEmbeddingStream:
         return loop
 
     def _cancelled(self):
-        return self._stop.is_set() or bool(self.cancel and self.cancel())
+        if self._stop.is_set() or self._callback_failure is not None:
+            return True
+        if self.cancel is None:
+            return False
+        try:
+            return self.service._invoke_cancel(self.cancel)
+        except _ReentrantCloseError as exc:
+            # Native adapter probes are boolean and deliberately sanitize
+            # arbitrary callback failures. Preserve this facade policy error
+            # until the stream's owned request has actually drained.
+            self._callback_failure = exc
+            return True
+
+    def _primary_failure(self, exc):
+        return (
+            exc
+            if isinstance(exc, asyncio.CancelledError)
+            else self._callback_failure or exc
+        )
 
     def _initialize(self):
         timeout = self.service.config.timeout if self.timeout is None else self.timeout
@@ -863,7 +951,7 @@ class _AutomaticEmbeddingStream:
                 raise StopAsyncIteration
             return await anext(self._delegate)
         except BaseException as exc:
-            await _drain(self.aclose(), primary=exc)
+            await _drain(self.aclose(), primary=self._primary_failure(exc))
         finally:
             self._next_active = False
 
@@ -872,7 +960,7 @@ class _AutomaticEmbeddingStream:
             await self._start()
             return self
         except BaseException as exc:
-            await _drain(self.aclose(), primary=exc)
+            await _drain(self.aclose(), primary=self._primary_failure(exc))
 
     async def __aexit__(self, exc_type, exc, traceback):
         await _drain(self.aclose(), primary=exc)

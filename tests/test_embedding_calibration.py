@@ -18,9 +18,11 @@ from runtime_llama.embedding_calibration import (
     CALIBRATION_CATEGORIES,
     CATEGORY_SAFETY_FACTOR,
     MIXED_SAFETY_FACTOR,
+    CalibrationProfile,
+    CalibrationStats,
     load_or_calibrate,
 )
-from runtime_llama.errors import LLMBackendError, LLMCancelledError
+from runtime_llama.errors import LLMBackendError, LLMCancelledError, LLMTimeoutError
 
 
 def binding(**changes):
@@ -565,3 +567,265 @@ def test_cached_binding_checks_json_types_not_python_boolean_integer_equality(
         == original
     )
     assert len(calls) == 15
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_existing_file_cache_parent_fails_before_any_tokenization(
+    tmp_path, small_corpus, nested
+):
+    parent = tmp_path / "ordinary-file"
+    parent.write_text("preserve this file")
+    cache = parent / "nested-cache" if nested else parent
+    calls = []
+    with pytest.raises(LLMBackendError, match="cache_write_failed"):
+        load_or_calibrate(
+            cache,
+            binding(),
+            lambda text: calls.append(text) or fake_tokens(text),
+            check,
+        )
+    assert not calls
+    assert parent.read_text() == "preserve this file"
+    assert list(tmp_path.iterdir()) == [parent]
+    assert not module._FLIGHTS
+
+
+def test_denied_temporary_creation_fails_before_any_tokenization(
+    tmp_path, small_corpus, monkeypatch
+):
+    def denied(*args, **kwargs):
+        raise PermissionError("cache directory does not permit writes")
+
+    monkeypatch.setattr(module.tempfile, "mkstemp", denied)
+    calls = []
+    with pytest.raises(LLMBackendError, match="cache_write_failed"):
+        load_or_calibrate(
+            tmp_path,
+            binding(),
+            lambda text: calls.append(text) or fake_tokens(text),
+            check,
+        )
+    assert not calls and not list(tmp_path.iterdir())
+    assert not module._FLIGHTS
+
+
+def test_failed_probe_flush_cleans_up_before_any_tokenization(
+    tmp_path, small_corpus, monkeypatch
+):
+    def failed_flush(descriptor):
+        raise OSError("no space available")
+
+    monkeypatch.setattr(module.os, "fsync", failed_flush)
+    calls = []
+    with pytest.raises(LLMBackendError, match="cache_write_failed"):
+        load_or_calibrate(
+            tmp_path,
+            binding(),
+            lambda text: calls.append(text) or fake_tokens(text),
+            check,
+        )
+    assert not calls and not list(tmp_path.iterdir())
+    assert not module._FLIGHTS
+
+
+def test_existing_directory_profile_destination_fails_before_any_tokenization(
+    tmp_path, small_corpus
+):
+    original = load_or_calibrate(tmp_path, binding(), fake_tokens, check)
+    destination = tmp_path / (original.profile_id + ".json")
+    destination.unlink()
+    destination.mkdir()
+    calls = []
+    with pytest.raises(LLMBackendError, match="cache_write_failed"):
+        load_or_calibrate(
+            tmp_path,
+            binding(),
+            lambda text: calls.append(text) or fake_tokens(text),
+            check,
+        )
+    assert not calls and list(tmp_path.iterdir()) == [destination]
+    assert not list(destination.iterdir()) and not module._FLIGHTS
+
+
+@pytest.mark.parametrize(
+    "failure", [LLMCancelledError, LLMTimeoutError, KeyboardInterrupt]
+)
+def test_interrupted_preflight_cleans_private_probe_and_never_tokenizes(
+    tmp_path, small_corpus, monkeypatch, failure
+):
+    original = module.tempfile.mkstemp
+    created = []
+
+    def capture(*args, **kwargs):
+        descriptor, name = original(*args, **kwargs)
+        created.append((descriptor, Path(name)))
+        return descriptor, name
+
+    def interrupted():
+        if created and created[-1][1].exists():
+            raise failure("owner stopped before calibration")
+
+    monkeypatch.setattr(module.tempfile, "mkstemp", capture)
+    calls = []
+    with pytest.raises(failure, match="owner stopped"):
+        load_or_calibrate(
+            tmp_path,
+            binding(),
+            lambda text: calls.append(text) or fake_tokens(text),
+            interrupted,
+        )
+    assert len(created) == 1
+    assert not calls and not list(tmp_path.iterdir()) and not module._FLIGHTS
+    with pytest.raises(OSError):
+        os.fstat(created[0][0])
+
+
+@pytest.mark.parametrize("failure", [LLMCancelledError, LLMTimeoutError])
+def test_stop_after_final_flush_cleans_cache_temp_and_preserves_typed_failure(
+    tmp_path, small_corpus, monkeypatch, failure
+):
+    original = module.os.fsync
+    flushes = []
+
+    def capture(descriptor):
+        original(descriptor)
+        flushes.append(descriptor)
+
+    def interrupted():
+        # The first flush belongs to preflight, the second to the final cache.
+        if len(flushes) == 2:
+            raise failure("owner stopped before cache publication")
+
+    monkeypatch.setattr(module.os, "fsync", capture)
+    calls = []
+    with pytest.raises(failure, match="owner stopped"):
+        load_or_calibrate(
+            tmp_path,
+            binding(),
+            lambda text: calls.append(text) or fake_tokens(text),
+            interrupted,
+        )
+    assert len(calls) == 15 and len(flushes) == 2
+    assert not list(tmp_path.iterdir()) and not module._FLIGHTS
+
+
+def test_complete_readable_cache_does_not_require_directory_write_permission(
+    tmp_path, small_corpus, monkeypatch
+):
+    directory = tmp_path / "readable-cache"
+    original = load_or_calibrate(directory, binding(), fake_tokens, check)
+    path = directory / (original.profile_id + ".json")
+    before, modified = path.read_bytes(), path.stat().st_mtime_ns
+
+    def denied(*args, **kwargs):
+        pytest.fail("a complete cache must not attempt a persistence preflight")
+
+    monkeypatch.setattr(module.tempfile, "mkstemp", denied)
+    path.chmod(0o400)
+    directory.chmod(0o500)
+    try:
+        warm = load_or_calibrate(
+            directory,
+            binding(),
+            lambda text: pytest.fail("warm cache tokenized"),
+            check,
+        )
+        assert warm == original
+        assert path.read_bytes() == before and path.stat().st_mtime_ns == modified
+        assert list(directory.iterdir()) == [path]
+    finally:
+        directory.chmod(0o700)
+        path.chmod(0o600)
+
+
+@pytest.mark.parametrize("failure", [LLMCancelledError, LLMTimeoutError])
+def test_stopped_warm_cache_read_never_rewrites_complete_profile(
+    tmp_path, small_corpus, monkeypatch, failure
+):
+    original = load_or_calibrate(tmp_path, binding(), fake_tokens, check)
+    path = tmp_path / (original.profile_id + ".json")
+    before, modified = path.read_bytes(), path.stat().st_mtime_ns
+    load = module._load_cached
+    observed = []
+
+    def cached(*args, **kwargs):
+        result = load(*args, **kwargs)
+        observed.append(result)
+        return result
+
+    def interrupted():
+        if observed:
+            raise failure("owner stopped after cache read")
+
+    monkeypatch.setattr(module, "_load_cached", cached)
+    with pytest.raises(failure, match="owner stopped"):
+        load_or_calibrate(
+            tmp_path,
+            binding(),
+            lambda text: pytest.fail("warm cache tokenized"),
+            interrupted,
+        )
+    assert observed == [original]
+    assert path.read_bytes() == before and path.stat().st_mtime_ns == modified
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_preflight_writes_private_generic_probe_and_removes_it_before_remote_work(
+    tmp_path, small_corpus, monkeypatch
+):
+    original = module.os.fsync
+    flushed = []
+
+    def capture(descriptor):
+        value = os.fstat(descriptor)
+        flushed.append((value.st_size, stat.S_IMODE(value.st_mode)))
+        original(descriptor)
+
+    def tokenize(text):
+        assert flushed and flushed[0][0] > 0
+        assert not list(tmp_path.glob(".calibration-preflight-*"))
+        return fake_tokens(text)
+
+    monkeypatch.setattr(module.os, "fsync", capture)
+    profile = load_or_calibrate(tmp_path, binding(), tokenize, check)
+    assert len(flushed) == 2
+    if os.name != "nt":
+        assert all(mode == 0o600 for _, mode in flushed)
+    path = tmp_path / (profile.profile_id + ".json")
+    assert list(tmp_path.iterdir()) == [path]
+    assert b"write-probe" not in path.read_bytes()
+
+
+def test_mixed_mean_character_recommendation_does_not_guarantee_code_category_fit():
+    # Aggregate counts retained in the public 0.11.0 qualification. This is a
+    # mathematical cross-category example, not a claim about any specific input.
+    code_ratio = 946784 / 344037
+    mixed_ratio = 6838911 / 2088271
+    statistics = {
+        "code": CalibrationStats(
+            2000,
+            946784,
+            344037,
+            code_ratio,
+            2.790804390271928,
+            2.350515463917526,
+            3.256637168141593,
+        ),
+        "mixed": CalibrationStats(
+            10000,
+            6838911,
+            2088271,
+            mixed_ratio,
+            3.356641988786965,
+            1.2115384615384615,
+            4.882352941176471,
+        ),
+    }
+    profile = CalibrationProfile("math-example", binding(), "c" * 64, statistics)
+    code_budget = profile.max_input_chars(512, "code")
+    mixed_budget = profile.max_input_chars(512, "mixed")
+    assert code_budget == 1127 and mixed_budget == 1509
+    assert mixed_budget / code_ratio == pytest.approx(548.3318613326799)
+    assert mixed_budget / code_ratio > 512
+    assert code_budget / code_ratio < 512
+    assert CATEGORY_SAFETY_FACTOR == 0.80 and MIXED_SAFETY_FACTOR == 0.90

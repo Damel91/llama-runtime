@@ -844,3 +844,186 @@ def test_waiting_budget_owner_refreshes_context_after_shared_calibration(
         assert second.result(3).max_input_chars == math.floor(128 * 4 * 0.80)
     assert len(calibration) == 1 and len(client.token_calls) == 2
     assert not service._profile_flights and not service._operations
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "embedding_max_pending_bytes",
+        "embedding_max_pending_tokens",
+        "embedding_max_request_bytes",
+        "embedding_max_response_bytes",
+    ],
+)
+@pytest.mark.parametrize("value", [0, -1, None, True, 1.5, "1024"])
+def test_automatic_resource_budgets_reject_nonpositive_or_noninteger(name, value):
+    with pytest.raises(ValueError, match=name):
+        AutomaticEmbeddingConfig("http://runtime.example:8080", **{name: value})
+
+
+def test_automatic_resource_defaults_and_overrides_reach_existing_engine(make_service):
+    defaults = AutomaticEmbeddingConfig("http://runtime.example:8080")
+    assert defaults.embedding_max_pending_bytes == 64 * 1024 * 1024
+    assert defaults.embedding_max_pending_tokens == 1024 * 1024
+    assert defaults.embedding_max_request_bytes == 8 * 1024 * 1024
+    assert defaults.embedding_max_response_bytes == 8 * 1024 * 1024
+    configured = {
+        "embedding_max_pending_bytes": 2 * 1024 * 1024,
+        "embedding_max_pending_tokens": 8192,
+        "embedding_max_request_bytes": 4096,
+        "embedding_max_response_bytes": 16384,
+    }
+    service, _ = make_service(**configured)
+    assert service.initialize().available
+    for name, value in configured.items():
+        assert getattr(service._adapter.profile, name) == value
+        assert getattr(service._adapter, name) == value
+    assert (
+        service._adapter._engine.max_bytes == configured["embedding_max_pending_bytes"]
+    )
+    assert (
+        service._adapter._engine.max_tokens
+        == configured["embedding_max_pending_tokens"]
+    )
+    assert (
+        service._adapter._engine.max_request_bytes
+        == configured["embedding_max_request_bytes"]
+    )
+
+
+@pytest.mark.parametrize("value", [None, False, 0, [], "auto", "REUSE"])
+def test_automatic_http_connection_policy_validation(value):
+    with pytest.raises(ValueError, match="http_connection_policy"):
+        AutomaticEmbeddingConfig(
+            "http://runtime.example:8080", http_connection_policy=value
+        )
+
+
+@pytest.mark.parametrize("selected", ["close", "reuse"])
+def test_owned_client_receives_selected_http_policy(monkeypatch, selected):
+    client = remote()
+    constructed = []
+
+    def create(base_url, **kwargs):
+        constructed.append((base_url, kwargs))
+        return client
+
+    monkeypatch.setattr(module, "LlamaCppClient", create)
+    service = AutomaticEmbeddingService(
+        {
+            "base_url": "http://runtime.example:8080",
+            "http_connection_policy": selected,
+        }
+    )
+    try:
+        assert service.initialize().available
+        assert constructed[0][1]["connection_policy"] == selected
+        assert service._adapter.profile.model_config.http_connection_policy == selected
+        assert client.closed is False
+    finally:
+        service.close()
+    assert client.closed is True
+
+
+def test_injected_client_keeps_its_own_policy_and_ownership(make_service):
+    client = remote()
+    client.connection_policy = "reuse"
+    service, _ = make_service(client, http_connection_policy="close")
+    assert service.embed_texts(["source"]) == [vector("search_document: source")]
+    assert client.connection_policy == "reuse"
+    service.close()
+    assert client.closed is False
+
+
+@pytest.mark.parametrize("selector", [None, "embed_0", NAME, "sha256:" + CONTENT])
+def test_verified_statusless_single_model_uses_root_props_attestation(
+    make_service, selector
+):
+    client = remote(replicas=1)
+    del client.catalog[0]["status"]
+    service, _ = make_service(client, model=selector)
+    assert service.initialize().available
+    assert None in client.props_calls
+    assert service.embed_texts(["body"]) == [vector("search_document: body")]
+    assert not client.token_calls
+    # The shared authority normalizes its observation, never the server fixture.
+    assert "status" not in client.catalog[0]
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"role": "router"},
+        {"is_sleeping": True},
+        {"model_alias": "different"},
+        {"model_alias": None},
+    ],
+)
+def test_statusless_router_sleeping_or_wrong_alias_never_selects_model(
+    make_service, monkeypatch, changes
+):
+    client = remote(replicas=1)
+    del client.catalog[0]["status"]
+    native = client.props
+
+    def props(*args, **kwargs):
+        result = native(*args, **kwargs)
+        result.update(changes)
+        return result
+
+    monkeypatch.setattr(client, "props", props)
+    service, _ = make_service(client)
+    assert not service.status().available
+    assert client.props_calls == [None]
+    assert not client.embedding_calls and not client.token_calls
+
+
+def test_statusless_ambiguous_catalog_never_probes_any_model(make_service):
+    client = remote()
+    for item in client.catalog:
+        del item["status"]
+    service, _ = make_service(client)
+    assert not service.status().available
+    assert (
+        not client.props_calls and not client.token_calls and not client.embedding_calls
+    )
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+def test_statusless_unverified_or_malformed_identity_never_probes_props(
+    make_service, malformed
+):
+    client = remote(replicas=1, verified=malformed)
+    del client.catalog[0]["status"]
+    if malformed:
+        client.catalog[0]["tags"] = [
+            tag
+            for tag in client.catalog[0]["tags"]
+            if not tag.startswith("noxi-embedding-sha256-v1:")
+        ]
+    service, _ = make_service(client, model="embed_0")
+    assert not service.status().available
+    assert not client.props_calls and not client.embedding_calls
+
+
+@pytest.mark.parametrize("old", [CONTENT, SEMANTIC])
+def test_statusless_identity_drift_after_root_props_fails_before_inference(
+    make_service, monkeypatch, old
+):
+    client = remote(replicas=1)
+    del client.catalog[0]["status"]
+    native = client.props
+
+    def props(*args, **kwargs):
+        result = native(*args, **kwargs)
+        if kwargs.get("model") is None:
+            client.catalog[0]["tags"] = [
+                tag.replace(old, "d" * 64) for tag in client.catalog[0]["tags"]
+            ]
+        return result
+
+    monkeypatch.setattr(client, "props", props)
+    service, _ = make_service(client)
+    with pytest.raises(LLMBackendError):
+        service.embed_texts(["source"])
+    assert not client.embedding_calls and not client.token_calls

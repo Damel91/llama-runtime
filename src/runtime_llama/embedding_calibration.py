@@ -24,7 +24,7 @@ from threading import Event, Lock
 from types import MappingProxyType
 from typing import Callable, Mapping
 
-from runtime_llama.errors import LLMBackendError
+from runtime_llama.errors import LLMBackendError, LLMTimeoutError
 
 CALIBRATION_CATEGORIES = (
     "code",
@@ -365,11 +365,55 @@ def _save_cached(path, profile, binding, check):
         finally:
             if descriptor is not None:
                 os.close(descriptor)
+    except LLMTimeoutError:
+        raise
     except OSError as exc:
         raise LLMBackendError(
             "llamacpp_embedding_calibration_cache_write_failed"
         ) from exc
     finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _preflight_cache(path, check):
+    """Reject predictable cold-cache failures before remote tokenization.
+
+    This tests real create/write/flush permission, not ``os.access``. It is
+    deliberately separate from cache reads: complete readable profiles remain
+    usable without write access. Filesystem state can still change afterwards,
+    so the final validated atomic write remains authoritative.
+    """
+    check()
+    temporary = None
+    descriptor = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if path.is_dir():
+            raise IsADirectoryError("calibration profile destination is a directory")
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=".calibration-preflight-", dir=path.parent
+        )
+        os.chmod(temporary, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            check()
+            stream.write(b"runtime-llama-calibration-write-probe\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        check()
+    except LLMTimeoutError:
+        raise
+    except OSError as exc:
+        raise LLMBackendError(
+            "llamacpp_embedding_calibration_cache_write_failed"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
         if temporary is not None:
             try:
                 os.unlink(temporary)
@@ -449,6 +493,8 @@ def load_or_calibrate(
     calibration per cache path/key in this process. Waiting callers retain
     their own cancellation/deadline scopes. Separate processes may repeat a
     cold calibration; atomic replacement prevents partial cache publication.
+    Cold persistence is checked before any remote tokenization; a complete
+    readable cache does not require write permission.
     """
     if type(workers) is not int or not 1 <= workers <= 32:
         raise ValueError("calibration workers must be between 1 and 32")
@@ -467,7 +513,12 @@ def load_or_calibrate(
             }
         )
     ).hexdigest()
-    path = Path(cache_dir).expanduser().resolve() / (profile_id + ".json")
+    try:
+        path = Path(cache_dir).expanduser().resolve() / (profile_id + ".json")
+    except OSError as exc:
+        raise LLMBackendError(
+            "llamacpp_embedding_calibration_cache_write_failed"
+        ) from exc
     flight_key = (str(path.parent), profile_id)
     while True:
         check()
@@ -491,6 +542,7 @@ def load_or_calibrate(
             if cached is not None:
                 check()
                 return cached
+            _preflight_cache(path, check)
             statistics = _calibrate(records, tokenize, check, workers)
             profile = CalibrationProfile(
                 profile_id, normalized_binding, manifest["corpus_sha256"], statistics

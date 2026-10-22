@@ -26,7 +26,7 @@ from runtime_llama.errors import LLMBackendError, LLMCancelledError, LLMTimeoutE
 from runtime_llama.replica_discovery import (
     EmbeddingPool,
     ReplicaIdentity,
-    catalog_aliases,
+    attest_single_model_catalog,
     discover_embedding_pool,
     verify_loaded_replica,
 )
@@ -670,17 +670,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             # Native single-model servers omit status. Root /props does not
             # select a router model and cannot request an unloaded alias.
             props = self._client.props(timeout=timeout, cancel=cancel, cancel_wait=True)
-            if (
-                isinstance(props, dict)
-                and props.get("role") != "router"
-                and props.get("is_sleeping") is not True
-                and isinstance(props.get("model_alias"), str)
-                and props["model_alias"] in catalog_aliases(entries[0])
-            ):
-                return {
-                    **catalog,
-                    "data": [{**entries[0], "status": {"value": "loaded"}}],
-                }
+            return attest_single_model_catalog(catalog, props)
         return catalog
 
     @classmethod
