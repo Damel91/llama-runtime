@@ -45,7 +45,7 @@ when its deployment profile changes.
 
 The public methods are:
 
-```python
+```text
 initialize(*, input_type="document", timeout=None, cancel=None)
 status(*, input_type="document", timeout=None, cancel=None)
 character_budget(*, category=None, input_type="document", timeout=None, cancel=None)
