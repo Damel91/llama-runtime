@@ -1,8 +1,11 @@
-# Exact overflow recovery: local 0.12.0a1 candidate
+# Exact overflow recovery: 0.12.0a1 candidate
 
 Status: **deterministic and functional checks passed; full live numerical
-qualification remains blocked**. No new stable release or consumer deployment
-is authorized by this record. Published 0.11.1 is unchanged.
+qualification remains blocked**. Subsequent explicit stakeholder directions
+authorized a diagnostic consumer ingestion and public prerelease delivery,
+recorded below and in the [prerelease record](PUBLIC-RELEASE-0.12.0a1.md).
+These directions do not close numerical qualification or promote a stable release.
+Published stable 0.11.1 is unchanged.
 
 Flower authority: `REQ-000040`, `GOAL-000022`, `MILE-000023`, `BOOT-000023`,
 `CHANGE-000025`, `PACKET-000026` specification 4 / plan 2. Open finding
@@ -103,11 +106,34 @@ condition; it does not by itself identify its hardware/kernel root cause.
 
 The scheduler, pool size and thresholds were not altered to hide the difference.
 An operator/stakeholder must resolve the runtime condition or explicitly decide
-the intended numerical contract before complete qualification and consumer
-deployment can proceed. No broader performance or retrieval-quality claim is
+the intended numerical contract before complete numerical qualification can
+be claimed. Diagnostic consumer use was separately authorized with the finding
+open. No broader performance or retrieval-quality claim is
 made from these bounded checks.
 
 Raw source payloads, internal endpoints, vectors and detailed HTTP events remain
-in private qualification artifacts. The local wheel/manifest carries hashes,
-source provenance and separate functional/numerical statuses; it is not a new
-public release or a claim of application acceptance.
+in private qualification artifacts. The qualification wheel/manifest carries
+hashes, source provenance and separate functional/numerical statuses. The
+original local manifest remains historical; the public release manifest records
+the subsequent authorized publication. Neither is a claim of complete numerical
+or application acceptance.
+
+## Subsequent consumer diagnostic evidence
+
+The stakeholder explicitly authorized a clean CodingCastle ingestion while
+leaving the numerical finding open. The consumer installed the exact delivered
+0.12.0a1 wheel, preserving its preceding runtime. Its separately managed campaign
+reported 81,153 AST originals, 126,045 published vectors, 493 publication batches,
+one atomic vector commit and no corpus errors or overflow recoveries. The exact
+original 531-token overflow had independently passed through the consumer with
+512/25-token lossless fragments; its absence in the corpus run is not used as
+proof of recovery.
+
+Application wall time to job closure was 707.626 seconds. Structural readiness
+occurred at 365.950 seconds and semantic readiness at 706.901 seconds. Summed
+embedding API wall time was 479.777 seconds; index build was 101.543 seconds.
+These overlapping application phases must not be added or described as pure
+GPU time. Pending-semantic gating, final semantic search, graph-to-complete-source
+navigation, zero active jobs and no graph recovery requirement were checked.
+This is consumer-host-reported functional diagnostic evidence, read back from
+its campaign/receipts; it does not change the producer's open numerical result.

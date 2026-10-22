@@ -5,7 +5,7 @@ This optional path is governed by Flower `REQ-000038`, `GOAL-000020`,
 adapter and its exact `prepare_*` / `embed_prepared` contracts remain available.
 Version 0.11.1 hardening is governed by Flower `REQ-000039`, `GOAL-000021`,
 `MILE-000022`, `CHANGE-000024` and `PACKET-000025`.
-The local 0.12.0a1 minimum-budget and overflow-recovery candidate is governed by
+The 0.12.0a1 minimum-budget and overflow-recovery candidate is governed by
 `REQ-000040`, `GOAL-000022`, `MILE-000023`, `CHANGE-000025`, `PACKET-000026`.
 
 The automatic service discovers one unambiguous, verified, loaded embedding
@@ -317,8 +317,10 @@ authorized for this cycle; it is run only through an explicit budget request.
 Stable publication is recorded separately in the
 [0.11.1 release record](verification/PUBLIC-RELEASE-0.11.1.md).
 Consumer migration remains a separate task.
-The local [0.12.0a1 qualification](verification/EXACT-OVERFLOW-0.12.0a1.md)
+The [0.12.0a1 qualification](verification/EXACT-OVERFLOW-0.12.0a1.md)
 records the new minimum policy, exact correction and installed-wheel evidence;
-this candidate does not authorize a new stable publication or deployment.
+its numerical finding remains open. The separately authorized
+[public prerelease](verification/PUBLIC-RELEASE-0.12.0a1.md) retains the exact
+tested wheel without claiming full numerical qualification or stable promotion.
 The [0.11.0a1 qualification](verification/AUTOMATIC-EMBEDDING-0.11.0a1.md)
 records deterministic coverage, live HTTP counts, timings and category budgets.

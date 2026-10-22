@@ -57,7 +57,7 @@ against the forwarded JSON Schema. Splitting source documents and tracking their
 fragments belong to the consuming application. The server's own auto-loading
 policy is supported.
 
-## Development candidate 0.12.0a1
+## Prerelease 0.12.0a1
 
 The automatic character recommendation uses the worst observed ratio across
 the existing 10,000 calibration samples, with the same 80% category and 90%
@@ -72,8 +72,12 @@ overflow preserves the original 500. The existing scheduler is unchanged.
 
 `refresh_character_budget()` observes current limits and reads completed
 calibration/learned state without starting calibration. See the
-[automatic API](docs/AUTOMATIC-EMBEDDING.md). This candidate is a local
-qualification artifact; stable 0.11.1 remains the published release.
+[automatic API](docs/AUTOMATIC-EMBEDDING.md) and
+[prerelease record](docs/verification/PUBLIC-RELEASE-0.12.0a1.md).
+This is a public prerelease with an open numerical finding between the observed
+replicas. Stable 0.11.1 remains the latest stable release. A separately authorized
+consumer diagnostic ingestion completed with 126,045 vectors; that functional
+result does not close numerical qualification.
 
 ## Release 0.11.1
 
