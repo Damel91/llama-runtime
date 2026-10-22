@@ -41,6 +41,7 @@ The project's engineering lifecycle is managed with
 | Async embedding windows | Async text or prepared-input sources, ordered complete windows, bounded intake and buffered results, with the same scheduler and limits used by synchronous callers. |
 | Persistent embedding queues | Prepared records accumulate in adapter-owned queues for each verified replica; batches are formed when execution capacity is available, with the same engine for synchronous and async callers. |
 | Native token inputs | Reuses exact retained token IDs with verified weights, tokenizer build and prefix/special policy, avoiding a second string tokenization in the native embedding handler. |
+| Optional automatic embeddings | Verified loaded-model discovery and direct text inputs using the existing scheduler; an explicit character-budget helper calibrates 10,000 packaged texts by category when requested. |
 | Lifecycle and errors | Typed backend, timeout, cancellation and runaway errors; cooperative cancellation, repetition protection and drained embedding shutdown. Embedding calls have overall deadlines; generation supports bounded HTTP and stream-idle waits. |
 | Optional stream idle | Explicit `stream_idle_timeout_sec=None` waits through quiet prefill; connection/JSON budgets remain finite, with per-request socket interruption for Stop and drained close. |
 | Diagnostics | Optional bounded thinking capture, invocation correlation and final diagnostic sinks, including interrupted calls. |
@@ -55,6 +56,25 @@ server build, model and chat template. Responses are not locally validated
 against the forwarded JSON Schema. Splitting source documents and tracking their
 fragments belong to the consuming application. The server's own auto-loading
 policy is supported.
+
+## Development candidate 0.11.0a1
+
+The optional [automatic embedding service](docs/AUTOMATIC-EMBEDDING.md)
+reports availability and sends strings directly. The library owns replica
+discovery, prefixes and dispatch. Only an explicit character-budget request can
+start calibration over 10,000 original texts in five categories; `mixed` uses all
+categories. Individual categories apply 80% of their
+measured characters/token ratio; `mixed` applies 90%. Raw measurements persist
+independently of these safety factors.
+
+Ordinary inputs go directly to the server without per-input `/tokenize` or any
+calibration prerequisite. The consumer owns chunking and may persist its budget.
+These statistical budgets do not guarantee that every input fits;
+native overflow remains an explicit error. The declared-model exact API stays
+available with its original counting and preparation contracts.
+
+This is a local development candidate, separate from the published stable
+0.10.3 release. Consumer migration and publication require their own work.
 
 ## Release 0.10.3
 
