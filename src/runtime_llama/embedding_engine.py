@@ -8,13 +8,14 @@ from __future__ import annotations
 
 from collections import Counter, deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from threading import Condition, Thread, current_thread
 import sys
 import time
 from typing import Any
 
 from runtime_llama.errors import LLMBackendError
+from runtime_llama.embedding_recovery import _FailedDirectPost, _FailedOwnerPost
 
 
 @dataclass(frozen=True)
@@ -532,7 +533,26 @@ class PersistentEmbeddingEngine:
                 indexed[index] = vector
         except BaseException as exc:
             for owner in batch.owners:
-                self._fail(owner, exc)
+                failure = exc
+                if isinstance(exc, _FailedDirectPost):
+                    rows = tuple(
+                        replace(row, owner=None)
+                        for row in exc.rows
+                        if row.owner is owner.call
+                    )
+                    failure = (
+                        _FailedOwnerPost(
+                            exc.original,
+                            exc.model,
+                            exc.observation,
+                            rows,
+                            deadline=owner.call.deadline,
+                            window_index=getattr(owner.call, "_window_index", None),
+                        )
+                        if rows
+                        else exc.original
+                    )
+                self._fail(owner, failure)
             return
         destinations = {owner: [] for owner in batch.owners}
         vectors = {owner: [] for owner in batch.owners}
@@ -1076,6 +1096,13 @@ class PersistentEmbeddingEngine:
                 distinct = tuple(dict.fromkeys(entry.plan.state for entry in selected))
                 group = self.adapter._engine_batch_call(
                     tuple(owner.call for owner in distinct)
+                )
+                # Occurrence positions belong to the source window. Identical
+                # texts can share prepared records while retaining distinct
+                # owner-local positions. A lightweight scheduler test shim may
+                # omit positions; missing provenance must never be invented.
+                group._input_positions = tuple(
+                    getattr(entry, "index", None) for entry in selected
                 )
                 batch = _Batch(selected, distinct, group)
                 future = scheduler.try_dispatch(

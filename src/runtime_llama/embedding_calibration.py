@@ -94,9 +94,12 @@ class CalibrationProfile:
         return self.statistics[category]
 
     def safe_chars_per_token(self, category: str = "mixed") -> float:
-        statistics = self.stats_for(category)
+        self.stats_for(category)
+        # Category selects headroom, never a narrower corpus subset. Every
+        # initial recommendation uses the minimum of all 10,000 observations.
+        minimum = self.stats_for("mixed").min_chars_per_token
         factor = MIXED_SAFETY_FACTOR if category == "mixed" else CATEGORY_SAFETY_FACTOR
-        return statistics.chars_per_token * factor
+        return minimum * factor
 
     def max_input_chars(self, context_tokens: int, category: str = "mixed") -> int:
         if type(context_tokens) is not int or not 0 < context_tokens <= 2**31 - 1:
@@ -122,8 +125,8 @@ def _read_bounded(resource, limit):
     return result
 
 
-def _load_corpus(check: Callable[[], None]):
-    """Verify every shipped byte and source record before remote work starts."""
+def _load_manifest(check: Callable[[], None]):
+    """Read the packaged identity of the original calibration observations."""
     check()
     directory = resources.files("runtime_llama").joinpath("calibration_corpus")
     try:
@@ -146,7 +149,6 @@ def _load_corpus(check: Callable[[], None]):
             ).hexdigest()
         ):
             raise _corpus_error()
-        records, seen_ids, seen_texts = [], set(), set()
         for category in CALIBRATION_CATEGORIES:
             check()
             description = categories[category]
@@ -163,6 +165,21 @@ def _load_corpus(check: Callable[[], None]):
                 or description["total_characters"] <= 0
             ):
                 raise _corpus_error()
+        return directory, manifest
+    except LLMTimeoutError:
+        raise
+    except (OSError, UnicodeError, KeyError, TypeError, ValueError) as exc:
+        raise _corpus_error() from exc
+
+
+def _load_corpus(check: Callable[[], None]):
+    """Verify every shipped byte and source record before remote work starts."""
+    directory, manifest = _load_manifest(check)
+    try:
+        records, seen_ids, seen_texts = [], set(), set()
+        for category in CALIBRATION_CATEGORIES:
+            check()
+            description = manifest["categories"][category]
             payload = _read_bounded(
                 directory.joinpath(description["file"]), _MAX_CORPUS_FILE_BYTES
             )
@@ -199,6 +216,8 @@ def _load_corpus(check: Callable[[], None]):
             if characters != description["total_characters"]:
                 raise _corpus_error()
         return manifest, tuple(records)
+    except LLMTimeoutError:
+        raise
     except (OSError, UnicodeError, KeyError, TypeError, ValueError) as exc:
         raise _corpus_error() from exc
 
@@ -473,6 +492,48 @@ def _calibrate(records, tokenize, check, workers):
         executor.shutdown(wait=True, cancel_futures=True)
 
 
+def _profile_location(cache_dir, manifest, binding):
+    profile_id = hashlib.sha256(
+        _canonical(
+            {
+                "schema": _PROFILE_SCHEMA,
+                "corpus_sha256": manifest["corpus_sha256"],
+                "binding": binding,
+            }
+        )
+    ).hexdigest()
+    try:
+        path = Path(cache_dir).expanduser().resolve() / (profile_id + ".json")
+    except OSError as exc:
+        raise LLMBackendError(
+            "llamacpp_embedding_calibration_cache_write_failed"
+        ) from exc
+    return profile_id, path
+
+
+def load_existing_calibration(
+    cache_dir: str | os.PathLike,
+    binding: dict,
+    check: Callable[[], None],
+) -> CalibrationProfile | None:
+    """Read complete existing raw statistics; never tokenize or create files.
+
+    The packaged manifest identifies the observations, including each corpus
+    file hash. Loading those historical scalar statistics does not materialize
+    or retokenize the 10,000 source records. Missing/invalid profiles return
+    ``None``. The caller supplies a freshly verified tokenizer binding.
+    """
+    if not callable(check):
+        raise TypeError("calibration requires a check callback")
+    check()
+    normalized_binding = _binding_payload(binding)
+    _, manifest = _load_manifest(check)
+    profile_id, path = _profile_location(cache_dir, manifest, normalized_binding)
+    profile = _load_cached(path, manifest, normalized_binding, profile_id)
+    check()
+    return profile
+
+
 def load_or_calibrate(
     cache_dir: str | os.PathLike,
     binding: dict,
@@ -504,21 +565,7 @@ def load_or_calibrate(
         raise TypeError("calibration validate must be a callable or None")
     normalized_binding = _binding_payload(binding)
     manifest, records = _load_corpus(check)
-    profile_id = hashlib.sha256(
-        _canonical(
-            {
-                "schema": _PROFILE_SCHEMA,
-                "corpus_sha256": manifest["corpus_sha256"],
-                "binding": normalized_binding,
-            }
-        )
-    ).hexdigest()
-    try:
-        path = Path(cache_dir).expanduser().resolve() / (profile_id + ".json")
-    except OSError as exc:
-        raise LLMBackendError(
-            "llamacpp_embedding_calibration_cache_write_failed"
-        ) from exc
+    profile_id, path = _profile_location(cache_dir, manifest, normalized_binding)
     flight_key = (str(path.parent), profile_id)
     while True:
         check()

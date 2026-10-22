@@ -15,6 +15,7 @@ from runtime_llama.adapters.embedding import (
     _DirectInput,
 )
 from runtime_llama.client import ClientHTTPError
+from runtime_llama.embedding_recovery import _FailedOwnerPost
 from runtime_llama.errors import LLMBackendError, LLMCancelledError, LLMTimeoutError
 
 from test_embedding_async_stream import WindowSource, assert_drained, run, wait_thread
@@ -326,9 +327,14 @@ def test_native_rejection_is_typed_without_retry_or_truncation(
     adapter, client = make_adapter(ContractClient(1))
     error = ClientHTTPError(status, error_type=error_type)
     client.failure = lambda *_: error
-    with pytest.raises(ClientHTTPError) as raised:
+    expected = _FailedOwnerPost if status == 500 else ClientHTTPError
+    with pytest.raises(expected) as raised:
         adapter._embed_texts_direct(["one", "two"], policy=policy(adapter))
-    assert raised.value is error
+    if status == 500:
+        assert raised.value.original is error
+        assert [row.input_index for row in raised.value.rows] == [0, 1]
+    else:
+        assert raised.value is error
     assert client.embedding_calls == [("embed_0", ("one", "two"))]
     assert not client.token_calls
     assert_drained(adapter, client)

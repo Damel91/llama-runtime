@@ -30,6 +30,12 @@ from runtime_llama.embedding_calibration import (
     CalibrationProfile,
     CalibrationStats,
 )
+from runtime_llama.embedding_recovery import (
+    EmbeddingBudgetSnapshot,
+    EmbeddingVerifiedSpan,
+    EmbeddingOverflowInput,
+    EmbeddingInputOverflowError,
+)
 from runtime_llama.diagnostics import ThinkingDiagnostic, ThinkingDiagnosticsConfig
 from runtime_llama.errors import (
     LLMBackendError,
@@ -71,9 +77,13 @@ from runtime_llama.adapters.embedding import LlamaCppEmbeddingAdapter
 from runtime_llama.factory import build_adapter, build_embedding_adapter
 from runtime_llama.tailnet import TailnetConfig, TailnetError, TailnetHelper
 
-__version__ = "0.11.1"
+__version__ = "0.12.0a1"
 
 __all__ = [
+    "EmbeddingBudgetSnapshot",
+    "EmbeddingVerifiedSpan",
+    "EmbeddingOverflowInput",
+    "EmbeddingInputOverflowError",
     "AutomaticEmbeddingConfig",
     "AutomaticEmbeddingService",
     "AutomaticEmbeddingStatus",

@@ -189,6 +189,7 @@ class EmbeddingWindowStream:
         self._failure = None
         self._error_reported = self._closed = self._exhausted = False
         self._next_active = False
+        self._window_index = 0
 
     def __aiter__(self) -> EmbeddingWindowStream:
         return self
@@ -284,12 +285,16 @@ class EmbeddingWindowStream:
                 ):
                     raise ValueError("text windows must contain only strings")
                 call.check()
+                # Preserve source-window provenance without changing dispatch
+                # or result ordering. Recovery never guesses it from text.
+                call._window_index = self._window_index
                 future = self._bridge.submit(
                     copied,
                     prepared=self._prepared,
                     input_type=self._input_type,
                     call=call,
                 )
+                self._window_index += 1
                 wrapped = asyncio.wrap_future(future, loop=self._loop)
                 self._pending.append(_Window(call, wrapped))
                 self._pull_lease = False

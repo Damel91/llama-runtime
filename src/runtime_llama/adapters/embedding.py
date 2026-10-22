@@ -40,6 +40,7 @@ from runtime_llama.embedding_preparation import (
     valid_preparation,
 )
 from runtime_llama.embedding_preparation_cache import PreparationCache, PreparationKey
+from runtime_llama.embedding_recovery import _FailedDirectPost, _FailedPostRow
 from runtime_llama.embedding_stream import (
     EmbeddingWindowStream,
     _EmbeddingWindowBridge,
@@ -277,6 +278,8 @@ class _BatchCall:
         self._validated_records = ()
         self._validated_observation = None
         self._record_owners = ()
+        self._input_positions = ()
+        self._record_input_indices = ()
 
     def _live(self, *, local=False):
         live = []
@@ -1331,6 +1334,32 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                     **self._engine_response_options(),
                 )
             except ClientHTTPError as exc:
+                if (
+                    exc.status_code == 500
+                    and records is not None
+                    and owners
+                    and isinstance(call, _BatchCall)
+                    and len(call._record_input_indices) == len(records)
+                ):
+                    failed_rows = tuple(
+                        _FailedPostRow(
+                            owner=owners[index],
+                            input_index=call._record_input_indices[index],
+                            text=records[index].text[
+                                len(records[index]._direct_policy.prefix) :
+                            ],
+                            input_type=records[index].input_type,
+                            prefix=records[index]._direct_policy.prefix,
+                        )
+                        for index in indices
+                        if live(index) and isinstance(records[index], _DirectInput)
+                    )
+                    if failed_rows:
+                        # Preserve only actual rows of this failed POST. No
+                        # diagnostic tokenization or replay occurs on a worker.
+                        raise _FailedDirectPost(
+                            exc, replica.model, observed, failed_rows
+                        ) from None
                 if records is not None and any(
                     isinstance(records[index], _DirectInput) for index in indices
                 ):
@@ -1573,6 +1602,13 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         group._validated_records = tuple(id(record) for record in active_records)
         group._validated_observation = observation
         group._record_owners = tuple(call for _, _, call in sent)
+        positions = group._input_positions
+        group._record_input_indices = (
+            tuple(positions[index] for index, _, _ in sent)
+            if len(positions) == len(records)
+            and all(type(index) is int and index >= 0 for index in positions)
+            else ()
+        )
         vectors = self._engine_run(model, active_records, group, observation)
         if len(vectors) != len(sent):
             raise LLMBackendError("llamacpp_embedding_count_or_response_mismatch")

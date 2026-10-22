@@ -20,6 +20,7 @@ from runtime_llama.embedding_calibration import (
     MIXED_SAFETY_FACTOR,
     CalibrationProfile,
     CalibrationStats,
+    load_existing_calibration,
     load_or_calibrate,
 )
 from runtime_llama.errors import LLMBackendError, LLMCancelledError, LLMTimeoutError
@@ -72,6 +73,7 @@ def small_corpus(monkeypatch):
         return manifest, records
 
     monkeypatch.setattr(module, "_load_corpus", load)
+    monkeypatch.setattr(module, "_load_manifest", lambda check: (None, manifest))
     return manifest, records
 
 
@@ -153,8 +155,9 @@ def test_source_characters_and_full_native_token_count_are_not_double_adjusted(
         sum(len(record.text) / fake_tokens(record.text) for record in records)
         / len(records)
     )
-    assert profile.safe_chars_per_token() == weighted * 0.90
-    assert profile.max_input_chars(512) == math.floor(512 * weighted * 0.90)
+    minimum = min(len(record.text) / fake_tokens(record.text) for record in records)
+    assert profile.safe_chars_per_token() == minimum * 0.90
+    assert profile.max_input_chars(512) == math.floor(512 * minimum * 0.90)
     assert CATEGORY_SAFETY_FACTOR == 0.80
     assert MIXED_SAFETY_FACTOR == 0.90
     assert profile.corpus_sha256 == manifest["corpus_sha256"]
@@ -165,11 +168,9 @@ def test_source_characters_and_full_native_token_count_are_not_double_adjusted(
         assert statistics.chars_per_token == sum(
             len(row.text) for row in selected
         ) / sum(fake_tokens(row.text) for row in selected)
-        assert (
-            profile.safe_chars_per_token(category) == statistics.chars_per_token * 0.80
-        )
+        assert profile.safe_chars_per_token(category) == minimum * 0.80
         assert profile.max_input_chars(512, category) == math.floor(
-            512 * statistics.chars_per_token * 0.80
+            512 * minimum * 0.80
         )
     assert mixed.chars_per_token != pytest.approx(mixed.arithmetic_mean_chars_per_token)
 
@@ -250,10 +251,10 @@ def test_safety_policy_changes_reuse_raw_cached_measurements(
     assert warm == first
     assert warm.max_input_chars(512) > first_mixed_budget
     assert warm.max_input_chars(512, "code") < first_code_budget
-    assert warm.safe_chars_per_token() == warm.stats_for().chars_per_token * 0.95
+    assert warm.safe_chars_per_token() == warm.stats_for().min_chars_per_token * 0.95
     assert (
         warm.safe_chars_per_token("code")
-        == warm.stats_for("code").chars_per_token * 0.70
+        == warm.stats_for("mixed").min_chars_per_token * 0.70
     )
     assert (tmp_path / (warm.profile_id + ".json")).read_bytes() == cached_bytes
     assert b"SAFETY" not in cached_bytes and b"safety_factor" not in cached_bytes
@@ -822,10 +823,79 @@ def test_mixed_mean_character_recommendation_does_not_guarantee_code_category_fi
         ),
     }
     profile = CalibrationProfile("math-example", binding(), "c" * 64, statistics)
-    code_budget = profile.max_input_chars(512, "code")
-    mixed_budget = profile.max_input_chars(512, "mixed")
-    assert code_budget == 1127 and mixed_budget == 1509
-    assert mixed_budget / code_ratio == pytest.approx(548.3318613326799)
-    assert mixed_budget / code_ratio > 512
-    assert code_budget / code_ratio < 512
+    historical_code_budget = math.floor(512 * code_ratio * 0.80)
+    historical_mixed_budget = math.floor(512 * mixed_ratio * 0.90)
+    assert historical_code_budget == 1127 and historical_mixed_budget == 1509
+    assert historical_mixed_budget / code_ratio == pytest.approx(548.3318613326799)
+    assert historical_mixed_budget / code_ratio > 512
+    # New initial budgets use the minimum across all categories, not their
+    # means or a selected category's less conservative local minimum.
+    assert profile.max_input_chars(512, "code") == 496
+    assert profile.max_input_chars(512, "mixed") == 558
+    for category in ("code", "mixed"):
+        assert profile.max_input_chars(512, category) / code_ratio < 512
     assert CATEGORY_SAFETY_FACTOR == 0.80 and MIXED_SAFETY_FACTOR == 0.90
+
+
+def test_existing_profile_read_uses_only_manifest_and_never_materializes_corpus(
+    tmp_path, small_corpus, monkeypatch
+):
+    original = load_or_calibrate(tmp_path, binding(), fake_tokens, check)
+    path = tmp_path / (original.profile_id + ".json")
+    before = path.read_bytes()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("warm-only profile lookup materialized/calibrated source records")
+
+    monkeypatch.setattr(module, "_load_corpus", forbidden)
+    monkeypatch.setattr(module, "_calibrate", forbidden)
+    monkeypatch.setattr(module, "_preflight_cache", forbidden)
+    assert load_existing_calibration(tmp_path, binding(), check) == original
+    assert path.read_bytes() == before
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_existing_profile_lookup_is_inert_when_cache_missing(tmp_path, small_corpus):
+    missing = tmp_path / "never-created"
+    assert load_existing_calibration(missing, binding(), check) is None
+    assert not missing.exists()
+
+
+def test_existing_profile_lookup_does_not_repair_invalid_cache(tmp_path, small_corpus):
+    original = load_or_calibrate(tmp_path, binding(), fake_tokens, check)
+    path = tmp_path / (original.profile_id + ".json")
+    path.write_bytes(b"invalid cache")
+    assert load_existing_calibration(tmp_path, binding(), check) is None
+    assert path.read_bytes() == b"invalid cache"
+
+
+def test_existing_profile_lookup_does_not_load_a_different_binding(
+    tmp_path, small_corpus
+):
+    load_or_calibrate(tmp_path, binding(), fake_tokens, check)
+    assert (
+        load_existing_calibration(tmp_path, binding(input_type="query"), check) is None
+    )
+
+
+def test_existing_profile_lookup_checks_cancellation_without_creating_state(
+    tmp_path, small_corpus
+):
+    def stopped():
+        raise LLMCancelledError("stopped profile lookup")
+
+    with pytest.raises(LLMCancelledError, match="stopped profile lookup"):
+        load_existing_calibration(tmp_path, binding(), stopped)
+    assert not list(tmp_path.iterdir())
+
+
+def test_packaged_manifest_lookup_preserves_timeout_type():
+    calls = []
+
+    def expired():
+        calls.append(1)
+        if len(calls) > 1:
+            raise LLMTimeoutError("manifest deadline")
+
+    with pytest.raises(LLMTimeoutError, match="manifest deadline"):
+        module._load_manifest(expired)
