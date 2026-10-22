@@ -57,6 +57,24 @@ against the forwarded JSON Schema. Splitting source documents and tracking their
 fragments belong to the consuming application. The server's own auto-loading
 policy is supported.
 
+## Development candidate 0.12.0a1
+
+The automatic character recommendation uses the worst observed ratio across
+the existing 10,000 calibration samples, with the same 80% category and 90%
+mixed factors. Successful direct calls still perform no tokenization.
+
+After a direct HTTP 500 drains, bounded exact diagnostics inspect only the
+failed caller's actual POST inputs. A confirmed context overflow returns
+`EmbeddingInputOverflowError` with verified lossless source spans and a
+persisted absolute character ceiling. The consumer owns reprojection and an
+explicit retry; no embedding request is replayed automatically. Unproven
+overflow preserves the original 500. The existing scheduler is unchanged.
+
+`refresh_character_budget()` observes current limits and reads completed
+calibration/learned state without starting calibration. See the
+[automatic API](docs/AUTOMATIC-EMBEDDING.md). This candidate is a local
+qualification artifact; stable 0.11.1 remains the published release.
+
 ## Release 0.11.1
 
 The automatic embedding config now exposes the existing finite request,
