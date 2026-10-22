@@ -1,6 +1,6 @@
 # Progressive preparation and native token inputs
 
-Contract for version 0.10.2. Flower MCP governs requirements,
+Contract for development version 0.10.3. Flower MCP governs requirements,
 implementation and verification in project `llama-runtime`. `PACKET-000018`
 covers metadata and exact-ID reuse; complementary `PACKET-000019` covers
 interrupted blocking waits and incremental ready-queue accounting under adopted
@@ -65,8 +65,12 @@ The finite resource budgets are configurable:
 | `embedding_max_pending_bytes` | 67,108,864 bytes | Ceiling for the raw/counted queue pool and, separately, the completed async output pool |
 | `embedding_max_pending_tokens` | 1,048,576 tokens | Bound prepared tokens queued or active for inference |
 | `embedding_max_request_bytes` | 8,388,608 bytes | Bound individual request payloads |
+| `embedding_max_response_bytes` | 8,388,608 bytes | Bound each decoded native JSON body before materialization |
+| `embedding_preparation_cache_entries` | 1,024 entries | Bound completed exact-token retention; zero disables |
+| `embedding_preparation_cache_bytes` | 8,388,608 bytes | Cache ceiling, also capped by pending bytes / 4; zero disables |
 
-All three require positive integers. Oversized embedding inputs remain
+The first four budgets require positive integers. The two cache limits accept
+nonnegative integers; zero disables retention. Oversized embedding inputs remain
 measurable with `prepare_*` within the configured resource ceilings, but are
 not admitted for inference. The caller's original input and the complete
 result required by the synchronous API remain proportional to that call.
@@ -103,8 +107,10 @@ alias/path-only authorization. Unknown identity or build bypasses reuse.
 Public prepared records still require a valid same-adapter seal; cached IDs
 do not authorize oversized inputs or bypass fresh dispatch checks.
 
-The cache is a separate retained pool with at most 1,024 entries and
-`min(8 MiB, embedding_max_pending_bytes // 4)` bytes. LRU eviction and close
+The cache is a separate retained pool with configurable entry and byte limits
+(defaults 1,024 entries and 8 MiB). Effective bytes are
+`min(embedding_preparation_cache_bytes, embedding_max_pending_bytes // 4)`;
+zero entries or bytes disables retention. LRU eviction and close
 release entries. There is no TTL or singleflight: concurrent cold misses may
 each tokenize, and a failed tokenization does not publish a reusable entry.
 These bytes are additional to raw/ready and async-result budgets, not a total

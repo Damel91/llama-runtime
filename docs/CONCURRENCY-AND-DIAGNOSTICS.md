@@ -6,7 +6,7 @@ server, model or device configuration.
 
 ## Embedding and external replicas
 
-In version 0.10.2, `embedding_request_parallelism` limits active
+In development version 0.10.3, `embedding_request_parallelism` limits active
 embedding HTTP work across an adapter. Its default is 4 with automatic replica
 discovery and 1 otherwise. `embedding_queue_size` defaults to 16 and adds
 bounded preparation lookahead to the request-parallelism budget; zero retains
@@ -94,14 +94,20 @@ and a synchronous call's complete output still occupy proportional memory;
 these separate pools and transient handoffs do not claim a total process RSS
 ceiling. Async completed windows retain their admission until consumed.
 
-Completed exact IDs use an additional adapter-owned LRU pool, capped at 1,024
-entries and `min(8 MiB, embedding_max_pending_bytes // 4)` bytes. Entries require
+Completed exact IDs use an additional adapter-owned LRU pool. Its configurable
+entry/byte limits default to 1,024 and 8 MiB; effective retained bytes are
+`min(embedding_preparation_cache_bytes, embedding_max_pending_bytes // 4)`.
+Zero entries or bytes disables retention. Entries require
 verified identity, tokenizer build and task/prefix/special policy; raw text
 must match exactly. Unknown identity/build bypasses the cache. It has no TTL
 or singleflight, and concurrent cold misses can perform separate tokenizations.
 Eviction and adapter close release entries. `health_status` exposes cache
 occupancy, hits, misses and eviction counters; these bytes are separate from
 raw/ready and result reservations and are not a process RSS limit.
+`embedding_max_response_bytes` separately bounds each decoded native JSON body
+before materialization (default 8 MiB), independently of request and queue
+budgets. In-flight response bodies and materialized objects remain transient
+resources bounded by worker concurrency and per-response limits.
 Ready-record byte accounting also reserves a conservative extra 128 bytes per
 record for the finite-limit summary index. Dispatch removes ready references,
 but the record's byte/token credits stay held until actual HTTP drain. Fixed
@@ -113,6 +119,15 @@ limit alone is not a count of all HTTP requests. Metadata waits and HTTP run
 outside scheduler locks and do not block the coordinator thread.
 Coherent admission observations avoid duplicate catalog reads without removing
 fresh loaded identity, build and limit checks at actual dispatch boundaries.
+
+The coordinator records wake generations under its condition lock, including
+notifications received before entering a wait. It waits until a worker/resource
+event, owner deadline, optional coalescing deadline or the next required
+cancellation-probe check. Non-notifiable cancellation probes and custom clocks
+retain finite checks; there is no fixed global 10 ms poll. Diagnostic snapshots
+are republished only when their observable values change. Plan counts and
+preparing counts are maintained by that same coordinator, preserving the
+existing owner/model ordering and distinct preparation/result/HTTP lifetimes.
 
 Independent owners retain their cancellation, deadline, output indices and typed
 outcomes in a shared batch. Cancelling or expiring one owner removes its pending

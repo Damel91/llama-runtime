@@ -56,6 +56,30 @@ against the forwarded JSON Schema. Splitting source documents and tracking their
 fragments belong to the consuming application. The server's own auto-loading
 policy is supported.
 
+## Development 0.10.3
+
+This local candidate applies the incremental efficiency review. Recovery for
+eligible injected clients validates each pending input against its own limits
+and the fresh server snapshot, retaining owner isolation and original result
+indices. Native failed or ambiguous POSTs remain non-replayable.
+
+`embedding_max_response_bytes` independently bounds decoded native JSON bodies
+(default 8 MiB). `embedding_preparation_cache_entries` and
+`embedding_preparation_cache_bytes` configure exact-token retention (defaults
+1,024 and 8 MiB); zero disables retention. Effective cache bytes remain capped
+by `embedding_max_pending_bytes // 4`. Request, response, pending-record and
+result budgets describe different resources.
+
+The coordinator waits for events and relevant deadlines instead of waking
+every 10 ms. Arbitrary cancellation callbacks and custom coalescing clocks
+retain finite checks. Planning avoids unused deduplication keys, repeated
+plan-count scans, rotating list copies and index searches. Existing sync/async
+APIs, numerical thresholds, fairness, backpressure and drained ownership remain
+in force. Public installation links below continue to target release 0.10.2.
+
+See the [0.10.3 review qualification](docs/verification/REVIEW-EFFICIENCY-0.10.3.md)
+for regression coverage, package checks and the bounded HTTP-policy comparison.
+
 ## Release 0.10.2
 
 Version 0.10.2 reduces redundant metadata observations while preserving

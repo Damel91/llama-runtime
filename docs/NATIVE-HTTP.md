@@ -1,4 +1,4 @@
-# Native llama.cpp HTTP transport (0.7.0 candidate)
+# Native llama.cpp HTTP transport
 
 The client works with unpatched llama-server. Its default connection policy is
 `close`: each request uses an independent HTTP connection and sends
@@ -36,6 +36,18 @@ reusing the Session object, so a peer that omits the response header cannot
 cause a subsequent socket reuse. The policy is transport configuration, never an
 inference parameter. Authentication, TLS verification and explicit proxy routing
 remain in effect.
+
+For an already qualified persistent endpoint, configure
+`"http_connection_policy": "reuse"` in the adapter profile, or
+`connection_policy="reuse"` on a directly owned client. The opt-in queue probe
+accepts `--connection-policy close` or `--connection-policy reuse` to qualify
+the same corpus and count requests separately. It never retries a failed POST
+with the other policy. The default remains `close`.
+
+Local transport tests cover both policies: sequential and concurrent socket
+ownership, peer-close behavior, incomplete framing, cancellation, slow bodies
+and TLS. Those fixtures do not qualify a real HTTPS proxy or a Tailscale/
+Headscale deployment; each such route needs its own same-endpoint validation.
 
 Fresh connections have a TCP/TLS establishment cost. This policy avoids relying
 on broken persistence; it does not promise greater throughput than a correctly

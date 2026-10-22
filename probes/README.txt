@@ -181,6 +181,12 @@ Motore persistente: qualifica funzionale di un wheel installato
 
 Per verificare anche il riuso dopo il run principale, aggiungere --qualify-reuse.
 
+La policy HTTP e' selezionabile con --connection-policy close (default) oppure
+--connection-policy reuse. Eseguire su stesso endpoint/corpus/profili per
+qualificare il riuso; nessun retry/fallback passa automaticamente all'altra
+policy. Il report registra la policy selezionata. HTTP, HTTPS e route VPN vanno
+qualificati separatamente; una fixture locale non certifica un proxy remoto.
+
 Il probe richiede un wheel installato, due repliche verificate e dimensione768.
 Non imposta contesto, slot o caricamento. Esegue otto canary stringhe/ID per
 replica, un conteggio oversize con rifiuto prima dell'inferenza e511 documenti

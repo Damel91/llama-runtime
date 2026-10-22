@@ -1,6 +1,6 @@
 # Embedding contracts and public preparation
 
-This guide describes embedding semantics in version 0.10.2. The
+This guide describes embedding semantics in the development 0.10.3 candidate. The
 [progressive queue and native token contract](PROGRESSIVE-EMBEDDING.md) extends
 the scheduler shared by synchronous calls and async window sources. Local
 qualification, publication and consumer acceptance remain distinct; see
@@ -88,8 +88,11 @@ exact count, but fresh admission must still reject an input over that limit.
 Unknown identity/build bypasses this cache. Public records retain same-adapter
 seal validation; a cached count is not an inference permit.
 
-The cache holds at most 1,024 entries and
-`min(8 MiB, embedding_max_pending_bytes // 4)` bytes in a separate retained pool.
+The cache uses `embedding_preparation_cache_entries` (default 1,024) and
+`embedding_preparation_cache_bytes` (default 8 MiB), both nonnegative integers.
+Its effective byte budget is
+`min(embedding_preparation_cache_bytes, embedding_max_pending_bytes // 4)` in a
+separate retained pool. Zero in either configured limit disables retention.
 No TTL or singleflight is promised. Concurrent cold misses may each tokenize;
 eviction and close release entries. Errors and incomplete tokenizations do
 not become hits. Cache diagnostics include occupancy and hit/miss counters.
@@ -112,6 +115,15 @@ ceilings but remain invalid for inference. The caller's original input and
 complete synchronous result are outside any constant-memory claim. Async
 completed outputs remain bounded with their unconsumed windows.
 
+`embedding_max_response_bytes` is an independent positive integer, default
+8 MiB, bounding each decoded native JSON response for tokenization and
+embedding. It is enforced before JSON materialization, including decompressed
+bodies. It does not inherit the request or pending-record ceiling. Overflow or
+incomplete framing fails with a typed error and does not trigger replay or
+partial result publication. Concurrent responses can each reach their own
+bound; decoded JSON objects, worker handoffs and result reservations are
+separate allocations rather than an overall RSS guarantee.
+
 Tokenization and metadata have their own concurrency limits; total HTTP
 capacity is derived from embedding, tokenizer and control capacity. The
 embedding ceiling does not by itself count every tokenizer or metadata GET.
@@ -133,6 +145,11 @@ unverified identity or an unknown tokenizer build does not authorize reuse.
 Admission observes loaded identity and limits after waits and before each
 actual batch, including adaptive children. Local validation shares each
 boundary's observation rather than performing hidden duplicate catalog reads.
+Recovery compares the complete immutable observation, including vocabulary and
+identity. Each pending record keeps its own historical context/batch limits;
+another owner's smaller limit cannot mask a fresh change. Aggregate HTTP token
+packing remains separate. Retired or invalid owners are excluded from children
+without shifting surviving result indices. Successful children are not replayed.
 After a limit changes, remaining inputs are revalidated without invalidating
 already completed inputs. A changed tokenizer build rejects stale counts.
 These observations are not a server-side lease or atomic GET-and-POST
