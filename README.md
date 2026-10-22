@@ -57,7 +57,7 @@ against the forwarded JSON Schema. Splitting source documents and tracking their
 fragments belong to the consuming application. The server's own auto-loading
 policy is supported.
 
-## Development candidate 0.11.0a1
+## Release 0.11.0
 
 The optional [automatic embedding service](docs/AUTOMATIC-EMBEDDING.md)
 reports availability and sends strings directly. The library owns replica
@@ -73,10 +73,15 @@ These statistical budgets do not guarantee that every input fits;
 native overflow remains an explicit error. The declared-model exact API stays
 available with its original counting and preparation contracts.
 
-This is a local development candidate, separate from the published stable
-0.10.3 release. Consumer migration and publication require their own work.
+The [qualification](docs/verification/AUTOMATIC-EMBEDDING-0.11.0a1.md)
+records 1,730 passing tests and a bounded live comparison: 511 direct inputs in
+1.56 seconds, four embedding POSTs plus 16 metadata GETs, no tokenizer calls,
+both replicas used and vectors identical to the exact path. These are client
+wall times, not pure GPU timings or a general performance guarantee.
+See the [public release record](docs/verification/PUBLIC-RELEASE-0.11.0.md)
+for stable packaging and provenance. Consumer installations remain unchanged.
 
-## Release 0.10.3
+## Earlier release 0.10.3
 
 Version 0.10.3 applies the incremental efficiency review. Recovery for
 eligible injected clients validates each pending input against its own limits
@@ -192,10 +197,10 @@ results and deployment boundaries.
 With Python 3.11 or later, install the tagged source:
 
 ```bash
-python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.10.3'
+python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.11.0'
 ```
 
-Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.10.3),
+Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.11.0),
 or run the following from a checkout:
 
 ```bash
@@ -276,7 +281,7 @@ directory, hostname, enrollment credentials when needed, coordination server
 and inference endpoint. The Python wheel remains portable and contains no
 native binary. Importing or constructing the library never launches a VPN.
 
-The [release](https://github.com/Damel91/llama-runtime/releases/tag/v0.10.3)
+The [release](https://github.com/Damel91/llama-runtime/releases/tag/v0.11.0)
 provides separate helper archives for macOS ARM64, Linux AMD64 and Windows
 AMD64. Go is needed to build the helper from source, not to run a supplied
 binary. Both Tailscale's coordinator and an explicit HTTPS Headscale

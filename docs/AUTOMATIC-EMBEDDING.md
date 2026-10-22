@@ -131,6 +131,8 @@ the decision to rebuild an index after a representation change.
 Implementation, deterministic verification, live qualification and human
 acceptance are separate. Initial 10,000-text live calibration is explicitly
 authorized for this cycle; it is run only through an explicit budget request.
-Public release and consumer migration are outside this implementation scope.
+Stable publication is recorded separately in the
+[0.11.0 release record](verification/PUBLIC-RELEASE-0.11.0.md).
+Consumer migration remains a separate task.
 The [0.11.0a1 qualification](verification/AUTOMATIC-EMBEDDING-0.11.0a1.md)
 records deterministic coverage, live HTTP counts, timings and category budgets.
