@@ -5,7 +5,7 @@ backend-path = ["."]
 
 [project]
 name = "runtime-llama"
-version = "0.10.3"
+version = "0.11.0a1"
 description = "Python adapters for llama.cpp HTTP servers: streaming, tool calls, embeddings and replica discovery"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -27,7 +27,7 @@ where = ["src"]
 include = ["runtime_llama*"]
 
 [tool.setuptools.package-data]
-runtime_llama = ["py.typed", "_vendor/*.LICENSE"]
+runtime_llama = ["py.typed", "_vendor/*.LICENSE", "calibration_corpus/*.json", "calibration_corpus/*.jsonl", "calibration_corpus/*.md"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

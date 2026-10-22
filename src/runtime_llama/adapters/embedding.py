@@ -128,6 +128,59 @@ class _CountedInput:
     _tokens_wire_bytes: int | None = None
 
 
+@dataclass(frozen=True)
+class _DirectEmbeddingPolicy:
+    """Verified representation and task policy for direct string requests."""
+
+    content_sha256: str
+    embedding_sha256: str
+    tokenizer_build: str
+    policy: str
+    prefix: str
+
+    def __post_init__(self):
+        for name in ("content_sha256", "embedding_sha256"):
+            value = getattr(self, name)
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(char not in "0123456789abcdef" for char in value)
+            ):
+                raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+        for name in ("tokenizer_build", "policy"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{name} must be a nonempty string")
+        if not isinstance(self.prefix, str):
+            raise ValueError("prefix must be a string")
+
+
+@dataclass(frozen=True)
+class _DirectInput:
+    """Bounded queue reservation, not a measured or estimated input count."""
+
+    text: str
+    input_type: str
+    reserved_tokens: int
+    context_token_limit: int | None
+    batch_token_limit: int | None
+    max_input_tokens: int | None
+    identity_verified: bool
+    content_sha256: str
+    embedding_sha256: str
+    _tokenizer_build: str
+    _policy: str
+    _direct_policy: _DirectEmbeddingPolicy
+    _token_ids: None = None
+    _text_wire_bytes: int = 0
+    _tokens_wire_bytes: None = None
+
+    @property
+    def token_count(self):
+        """Use the original engine ledger without claiming exact token usage."""
+        return self.reserved_tokens
+
+
 class _Call:
     def __init__(self, adapter, cancel, timeout=None):
         self.adapter, self.cancel = adapter, cancel
@@ -385,6 +438,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             ),
         )
         self._dimension_lock = Lock()
+        self._direct_token_accounting = Event()
         self.embedding_request_parallelism = int(
             getattr(profile, "embedding_request_parallelism", 1)
         )
@@ -901,6 +955,10 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         )
 
     def _embedding_input(self, texts, records, replica, observation):
+        if records is not None and any(
+            isinstance(record, _DirectInput) for record in records
+        ):
+            return texts
         if records is not None and observation is not None:
             for record in records:
                 self._validate_vocab(record._token_ids, observation)
@@ -952,6 +1010,37 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         context_limit = self._minimum(observation.context_token_limit, conservative[0])
         batch_limit = self._minimum(observation.batch_token_limit, conservative[1])
         call.check()
+        direct = getattr(call, "_direct_policy", None)
+        if direct is not None:
+            if isinstance(item, PreparedEmbeddingInput):
+                raise LLMBackendError("llamacpp_embedding_invalid_direct_input")
+            text, input_type = item
+            self._validate_direct_observation(direct, input_type, replica, observation)
+            context_limit = self._minimum(
+                context_limit, observation.native_microbatch_tokens
+            )
+            if not text.startswith(direct.prefix):
+                raise LLMBackendError("llamacpp_embedding_direct_prefix_mismatch")
+            # The direct path never measures or estimates this input. Reserve
+            # a complete observed input allowance solely for bounded intake.
+            # The native server remains authoritative for actual token usage.
+            reservation = context_limit
+            call.check()
+            return _DirectInput(
+                text=text,
+                input_type=input_type,
+                reserved_tokens=reservation,
+                context_token_limit=context_limit,
+                batch_token_limit=batch_limit,
+                max_input_tokens=self._minimum(context_limit, batch_limit),
+                identity_verified=True,
+                content_sha256=direct.content_sha256,
+                embedding_sha256=direct.embedding_sha256,
+                _tokenizer_build=direct.tokenizer_build,
+                _policy=direct.policy,
+                _direct_policy=direct,
+                _text_wire_bytes=len(json.dumps(text, ensure_ascii=True)),
+            )
         if isinstance(item, PreparedEmbeddingInput):
             text, input_type = item.text, item.input_type
         else:
@@ -1252,6 +1341,12 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                     **self._engine_response_options(),
                 )
             except ClientHTTPError as exc:
+                if records is not None and any(
+                    isinstance(records[index], _DirectInput) for index in indices
+                ):
+                    # Direct requests leave actual token admission to the
+                    # native server. Never replay or silently truncate a reject.
+                    raise
                 size = len(indices)
                 if (
                     getattr(self._client, "supports_embedding_token_ids", None) is True
@@ -1390,11 +1485,30 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         )
 
     def _engine_validate(self, record, model, observation):
+        if isinstance(record, _DirectInput):
+            self._validate_direct_observation(
+                record._direct_policy,
+                record.input_type,
+                self._replicas[model],
+                observation,
+            )
+            if (
+                record._policy != record._direct_policy.policy
+                or not record.text.startswith(record._direct_policy.prefix)
+            ):
+                raise LLMBackendError("llamacpp_embedding_direct_policy_mismatch")
+            # A queue reservation is not evidence that the actual input is too
+            # long. Fresh smaller contexts remain authoritative at inference;
+            # retaining the older reservation only makes intake conservative.
+            return
         if record._tokenizer_build != observation.tokenizer_build:
             raise LLMBackendError("llamacpp_embedding_tokenizer_policy_changed")
         effective = _Observation(
             observation.context_length,
-            self._minimum(observation.context_token_limit, record.context_token_limit),
+            self._minimum(
+                observation.context_token_limit,
+                record.context_token_limit,
+            ),
             self._minimum(observation.batch_token_limit, record.batch_token_limit),
             observation.tokenizer_build,
             observation.identity_key,
@@ -1494,6 +1608,10 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         if operation == "prepare":
             result = []
             for record in outputs:
+                if isinstance(record, _DirectInput):
+                    raise LLMBackendError(
+                        "llamacpp_embedding_direct_preparation_not_exact"
+                    )
                 values = asdict(record)
                 values.pop("_text_wire_bytes", None)
                 values.pop("_tokens_wire_bytes", None)
@@ -1568,6 +1686,83 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             inputs, operation="embed", timeout=timeout, cancel=cancel, call=call
         )
 
+    def _validate_direct_policy(self, policy, input_type):
+        self._validate_task(input_type)
+        if type(policy) is not _DirectEmbeddingPolicy:
+            raise ValueError("policy must be a verified direct embedding policy")
+        prefix = (
+            "" if input_type == "raw" else getattr(self._embedding_prefixes, input_type)
+        )
+        if policy.policy != self._policy(input_type) or policy.prefix != prefix:
+            raise LLMBackendError("llamacpp_embedding_direct_policy_mismatch")
+        if self.embedding_input_format == "tokens":
+            raise LLMBackendError("llamacpp_embedding_direct_text_input_required")
+
+    def _validate_direct_observation(self, policy, input_type, replica, observation):
+        self._validate_direct_policy(policy, input_type)
+        identity = replica.identity
+        expected = (policy.content_sha256, policy.embedding_sha256)
+        if identity is None or observation.identity_key is None:
+            raise LLMBackendError("llamacpp_embedding_direct_identity_unverified")
+        if identity.key != expected or observation.identity_key != expected:
+            raise LLMBackendError("llamacpp_embedding_direct_identity_changed")
+        if observation.tokenizer_build != policy.tokenizer_build:
+            raise LLMBackendError("llamacpp_embedding_direct_tokenizer_changed")
+        if observation.context_token_limit is None:
+            raise LLMBackendError("llamacpp_embedding_direct_context_unknown")
+
+    def _embed_texts_direct(
+        self,
+        texts,
+        *,
+        policy: _DirectEmbeddingPolicy,
+        input_type="document",
+        timeout=None,
+        cancel=None,
+    ) -> list[list[float]]:
+        """Submit strings through the shared engine without local tokenization."""
+        self._validate_direct_policy(policy, input_type)
+        if isinstance(texts, (str, bytes)) or not isinstance(texts, Sequence):
+            raise ValueError("texts must be a sequence of strings")
+        if any(not isinstance(text, str) for text in texts):
+            raise ValueError("texts must contain only strings")
+        call = _Call(self, cancel, timeout)
+        call._direct_policy = policy
+        if not texts:
+            return []
+        self._direct_token_accounting.set()
+        return self._execute(
+            _TextInputs(texts, policy.prefix, input_type),
+            operation="embed",
+            timeout=timeout,
+            cancel=cancel,
+            call=call,
+        )
+
+    def _astream_texts_direct(
+        self,
+        windows,
+        *,
+        policy: _DirectEmbeddingPolicy,
+        input_type="document",
+        max_pending_windows=2,
+        timeout=None,
+        cancel=None,
+        close_source=False,
+    ) -> EmbeddingWindowStream:
+        """Create inert direct intake over the same async bridge and engine."""
+        self._validate_direct_policy(policy, input_type)
+        return EmbeddingWindowStream(
+            self,
+            windows,
+            input_type=input_type,
+            max_pending_windows=max_pending_windows,
+            timeout=timeout,
+            cancel=cancel,
+            close_source=close_source,
+            _direct_policy=policy,
+        )
+
     def _stream_bridge(self):
         with self._calls_lock:
             if self._closed or self._closing.is_set():
@@ -1581,6 +1776,12 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
 
     def _stream_submit(self, window, *, prepared, input_type, call):
         call.check()
+        direct = getattr(call, "_direct_policy", None)
+        if direct is not None:
+            if prepared:
+                raise LLMBackendError("llamacpp_embedding_invalid_direct_input")
+            self._validate_direct_policy(direct, input_type)
+            self._direct_token_accounting.set()
         if prepared:
             inputs = tuple(window)
             call.prepared_inputs = inputs
@@ -1790,6 +1991,14 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 self._invalidate_replica(replica)
         return result
 
+    def _engine_health_snapshot(self):
+        snapshot = self._engine.snapshot()
+        if self._direct_token_accounting.is_set():
+            snapshot = dict(snapshot)
+            snapshot["token_accounting"] = "may_include_context_reservations"
+            snapshot["preparation_work_includes_direct_reservations"] = True
+        return snapshot
+
     def health_status(self) -> dict[str, Any]:
         joined = False
         try:
@@ -1805,7 +2014,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 "embedding_replica_discovery": self._discovery_status(),
                 "replicas": {},
                 "scheduler": self._scheduler.snapshot(),
-                "engine": self._engine.snapshot(),
+                "engine": self._engine_health_snapshot(),
             }
         finally:
             self._leave_pool(joined)
@@ -1891,7 +2100,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             "embedding_queue_size": self.embedding_queue_size,
             "embedding_replica_discovery": self._discovery_status(),
             "scheduler": self._scheduler.snapshot(),
-            "engine": self._engine.snapshot(),
+            "engine": self._engine_health_snapshot(),
             "preparation_cache": self._preparation_cache.snapshot(),
             "replicas": replicas,
         }

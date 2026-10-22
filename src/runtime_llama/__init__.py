@@ -20,6 +20,16 @@ from runtime_llama.embedding_preparation import (
     PreparedEmbeddingInput,
 )
 from runtime_llama.embedding_stream import EmbeddingWindowStream
+from runtime_llama.automatic_embedding import (
+    AutomaticEmbeddingConfig,
+    AutomaticEmbeddingService,
+    AutomaticEmbeddingStatus,
+)
+from runtime_llama.embedding_calibration import (
+    CALIBRATION_CATEGORIES,
+    CalibrationProfile,
+    CalibrationStats,
+)
 from runtime_llama.diagnostics import ThinkingDiagnostic, ThinkingDiagnosticsConfig
 from runtime_llama.errors import (
     LLMBackendError,
@@ -61,9 +71,15 @@ from runtime_llama.adapters.embedding import LlamaCppEmbeddingAdapter
 from runtime_llama.factory import build_adapter, build_embedding_adapter
 from runtime_llama.tailnet import TailnetConfig, TailnetError, TailnetHelper
 
-__version__ = "0.10.3"
+__version__ = "0.11.0a1"
 
 __all__ = [
+    "AutomaticEmbeddingConfig",
+    "AutomaticEmbeddingService",
+    "AutomaticEmbeddingStatus",
+    "CALIBRATION_CATEGORIES",
+    "CalibrationProfile",
+    "CalibrationStats",
     "TailnetConfig",
     "TailnetError",
     "TailnetHelper",
