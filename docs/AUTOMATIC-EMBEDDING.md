@@ -3,6 +3,8 @@
 This optional path is governed by Flower `REQ-000038`, `GOAL-000020`,
 `MILE-000021`, `CHANGE-000022`, `PACKET-000023`. The existing declared-model
 adapter and its exact `prepare_*` / `embed_prepared` contracts remain available.
+Version 0.11.1 hardening is governed by Flower `REQ-000039`, `GOAL-000021`,
+`MILE-000022`, `CHANGE-000024` and `PACKET-000025`.
 
 The automatic service discovers one unambiguous, verified, loaded embedding
 identity group. It owns aliases, replica capacity, prefixes, preparation and
@@ -97,6 +99,14 @@ Characters mean Python Unicode code points, not UTF-8 bytes or grapheme clusters
 Mean-based safety margins are empirical. They do not prove that arbitrary
 source text fits a tokenizer's context. Native overflows remain explicit
 errors; the service never silently truncates or splits source text.
+In particular, `mixed` is an aggregate recommendation, not a conservative bound
+for every constituent category. In the qualified Nomic sample, the 512-token
+recommendations were 1,509 characters for `mixed` and 1,127 for `code`; applying
+the mixed recommendation to code at its category's average density would imply
+about 548 tokens. This arithmetic illustrates the limitation, not a measurement
+of a particular input. The factors remain 90% and 80% respectively. Select a
+category deliberately and retain explicit overflow handling; this release adds
+no quantile policy, automatic retry or implicit exact-count fallback.
 
 ## Persistent authority and resource limits
 
@@ -121,6 +131,70 @@ remain hard bounds. Prefixes are applied once, and ordering, owner cancellation,
 finite deadlines, backpressure and drained shutdown use the original engine.
 Exact public preparations are never populated with reservations or estimates.
 
+## Configurable transport and memory budgets
+
+The automatic config exposes the existing adapter limits without changing their
+defaults:
+
+| Setting | Default | Meaning |
+| --- | ---: | --- |
+| `embedding_max_request_bytes` | 8 MiB | Serialized embedding request bound. |
+| `embedding_max_response_bytes` | 8 MiB | Decoded HTTP JSON response bound, including decompressed gzip. |
+| `embedding_max_pending_bytes` | 64 MiB | Existing pending-data and retained-result credit limits. |
+| `embedding_max_pending_tokens` | 1,048,576 | Queue token-accounting bound; direct inputs reserve their observed allowance. |
+| `http_connection_policy` | `"close"` | Owned client uses independent connections; explicit `"reuse"` enables existing keep-alive policy. |
+
+Limits must be positive integers. A decoded JSON response and retained Python
+vector results are different resources. Raising the response bound does not
+raise result credit or remove request, pending-data, cardinality or concurrency
+bounds. These accounting budgets are not an exact operating-system RSS limit.
+High-dimensional vectors can require a response budget above 8 MiB even when
+their input strings are short. For example:
+
+```python
+config = AutomaticEmbeddingConfig(
+    base_url="http://inference.example:8080",
+    embedding_max_response_bytes=16 * 1024 * 1024,
+    embedding_max_pending_bytes=64 * 1024 * 1024,
+    http_connection_policy="reuse",
+)
+```
+
+For direct inputs, the token ledger reserves the smallest observed context and
+microbatch allowance per text. At a large allowance this can fill a pending
+token budget before `batch_size` texts accumulate. An operator can explicitly
+raise `embedding_max_pending_tokens` to accommodate the desired bounded intake;
+the library does not fabricate counts or silently enlarge memory limits. For
+an allowance of 65,536, accommodating 256 pending direct texts requires
+16,777,216 reservation units. This changes admission capacity, not the scheduler
+or the server's actual context checks. With multiple active owners, capacity is
+shared and the observed HTTP packing can differ.
+
+`http_connection_policy` applies to the service-owned client. An injected client
+retains its connection policy and remains owned by its caller. Reuse adds no
+retry, transport fallback or requirement for a patched llama-server.
+
+## Calibration and shutdown failures
+
+A valid complete calibration cache can be read without directory write access.
+For a cold explicit budget request, the library checks persistence feasibility
+before sending tokenizer requests, using a private temporary file which is
+removed after the check. Final validation and private atomic replacement still
+apply: permissions or storage can change after a successful preflight. Ordinary
+availability and embedding never perform this check or consult the cache.
+
+Cancellation callbacks must be side-effect free and safe across threads, such as
+`threading.Event.is_set`. Calling the same service's synchronous `close()` from
+inside its own callback raises a typed `LLMBackendError` with diagnostic
+`llamacpp_automatic_embedding_close_from_cancel_callback` before shutdown state
+changes. Set a cancellation event in the controlling thread, then call `close()`
+or await `aclose()` externally to stop and drain owned work.
+
+A single-model catalog without a loaded status is accepted only when verified
+identity tags and coherent root `/props` attest the loaded model. Router props,
+sleeping entries, ambiguous catalogs, unverified identity and inconsistent model
+proof are not promoted to loaded by assuming that missing status means ready.
+
 An opaque representation identity protects stored vector spaces. Automatic
 discovery must not silently replace an index's embedding model. A consumer
 still owns source splitting, UTF-8 fragment intervals, graph relationships and
@@ -132,7 +206,7 @@ Implementation, deterministic verification, live qualification and human
 acceptance are separate. Initial 10,000-text live calibration is explicitly
 authorized for this cycle; it is run only through an explicit budget request.
 Stable publication is recorded separately in the
-[0.11.0 release record](verification/PUBLIC-RELEASE-0.11.0.md).
+[0.11.1 release record](verification/PUBLIC-RELEASE-0.11.1.md).
 Consumer migration remains a separate task.
 The [0.11.0a1 qualification](verification/AUTOMATIC-EMBEDDING-0.11.0a1.md)
 records deterministic coverage, live HTTP counts, timings and category budgets.
