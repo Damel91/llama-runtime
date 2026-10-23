@@ -5,10 +5,12 @@ identity group. It owns aliases, replica scheduling, task prefixes and dispatch
 through the same persistent engine as the declared-model adapter. The operator
 owns model loading and server configuration.
 
-The current local 0.13.0a1 candidate is governed by Flower `REQ-000042`,
+The 0.13.0a1 contract is governed by Flower `REQ-000042`,
 `GOAL-000024`, `MILE-000025`, `CHANGE-000027`, `PACKET-000028`. It replaces the
 0.12.0a1 minimum-ratio and exact post-failure diagnostics contract. Historical
-qualification reports describe their historical versions.
+qualification reports describe their historical versions. Publication of the
+exact tested artifact is governed separately by `REQ-000043` / `PACKET-000029`;
+see the [prerelease record](verification/PUBLIC-RELEASE-0.13.0a1.md).
 
 ## Ordinary use
 

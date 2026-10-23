@@ -1,6 +1,6 @@
 # Consumer handoff: fixed budget and localized halving
 
-Applies to the local `runtime-llama==0.13.0a1` candidate. No consumer is modified
+Applies to the `runtime-llama==0.13.0a1` prerelease. No consumer is modified
 or upgraded by this change. The installed package remains `runtime-llama`, with
 Python imports from `runtime_llama`.
 

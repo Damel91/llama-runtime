@@ -57,7 +57,7 @@ against the forwarded JSON Schema. Splitting source documents and tracking their
 fragments belong to the consuming application. The server's own auto-loading
 policy is supported.
 
-## Local candidate 0.13.0a1
+## Prerelease 0.13.0a1
 
 The automatic embedding corpus contains the 500 densest measured texts from
 each of five categories, selected reproducibly from the original 10,000
@@ -75,11 +75,17 @@ halves and retains completed vectors. Halves carry Unicode and UTF-8 offsets;
 they make no exact token-fit promise and may need another split. Existing
 scheduling, cancellation, deadlines and backpressure remain in use.
 
-See the [automatic API](docs/AUTOMATIC-EMBEDDING.md) and
-[consumer recovery contract](docs/HALVING-CONSUMER.md). This candidate is local
-and has not been published. Stable **0.11.1** remains the latest stable release;
-the [published 0.12.0a1 prerelease record](docs/verification/PUBLIC-RELEASE-0.12.0a1.md)
-describes its earlier exact-recovery contract and open numerical finding.
+The [public prerelease](https://github.com/Damel91/llama-runtime/releases/tag/v0.13.0a1)
+retains the exact qualified wheel. Verification includes 2,031 tests and a
+single-replica live run of 511 texts in 2.60 seconds, using two embedding POSTs,
+ten metadata GETs and no tokenizer requests. These are client wall times, not
+pure GPU timings or a comparison against earlier two-replica runs.
+
+See the [automatic API](docs/AUTOMATIC-EMBEDDING.md),
+[consumer recovery contract](docs/HALVING-CONSUMER.md) and
+[publication record](docs/verification/PUBLIC-RELEASE-0.13.0a1.md).
+The earlier cross-replica numerical finding remains open; stable **0.11.1**
+remains the latest stable release. Publication does not update consumers.
 
 ## Release 0.11.1
 
