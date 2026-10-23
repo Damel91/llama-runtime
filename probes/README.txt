@@ -223,3 +223,42 @@ wall dei worker possono sovrapporsi e non sono elapsed, tempo CPU o tempo GPU.
 Il riuso non e' un benchmark a cache fredda. Il totale atteso e'536tokenize
 con riuso,528senza; restano i tetti globali550/600/1200e180secondi. La prova non
 installa wheel, migra consumer o pubblica una release.
+
+Corpus difficile e fallback per dimezzamento (0.13.0a1)
+------------------------------------------------------
+
+  /path/to/clean-env/bin/python probes/qualify_halving.py --allow-live \
+    --base-url http://SERVER:8080 --model MODEL_SELECTOR \
+    --cache /tmp/halving-empty-cache-01 --output /tmp/halving-live-01.json
+
+Richiede il wheel 0.13.0a1 installato, una sola replica Nomic v2 caricata e
+verificata con contesto512, una cache vuota e un nuovo file output. Non inserisce
+src nel percorso di import e non modifica server, modelli o consumer. Il probe
+non si avvia senza --allow-live. Default:180secondi totali,30secondi per call,
+massimo4000richieste HTTP; --timeout e --wall-timeout impostano limiti finiti.
+
+Verifica la calibrazione esplicita di2500testi difficili, riuso fra categorie
+senza tokenizzazioni, media con margini80%/90%,511testi diretti con batch256,
+un500nativo su tre input con isolamento e due vettori validi conservati,
+quindi ritenta soltanto le due meta' dell'input rifiutato. Il budget iniziale
+deve restare identico; nessuna tokenizzazione e' ammessa durante il fallback.
+Se anche una meta' viene rifiutata, il consumer del probe conserva i vettori
+gia' completati e dimezza nuovamente soltanto i frammenti isolati: massimo8
+round, con lo stesso limite temporale globale. Non assume che un dimezzamento
+sia sufficiente per qualsiasi testo o modello.
+Confronta i vettori conservati con due riferimenti e quattro stringhe con i
+rispettivi tokenID sullo stesso alias: maxabs1e-5,coseno0.999999,norma1e-6.
+Il report distingue esito funzionale e numerico; non chiude il finding fra
+repliche e non dimostra il parallelismo di due GPU con una sola replica.
+
+Registra profilo caricato prima/dopo in forma sanitizzata, metodi e percorsi
+HTTP senza query, status, conteggi, picchi di concorrenza, tempi client e somme
+dei worker di preparazione. Non conserva endpoint, path modello, testi o vettori
+grezzi. Le somme di intervalli sovrapposti non sono tempo GPU puro. Il probe
+non effettua installazioni, pubblicazioni o ingest applicativi.
+
+--reuse-calibration permette esplicitamente una cache gia' presente per una
+continuazione separata: verifica prima che il profilo sia valido senza avviare
+calibrazioni, richiede zero nuove tokenizzazioni del corpus e registra modalita'
+warm_calibration. Conservare il report cold originale; la continuazione warm
+non costituisce una nuova prova della calibrazione iniziale2500.

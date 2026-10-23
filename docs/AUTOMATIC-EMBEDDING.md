@@ -1,55 +1,45 @@
-# Automatic category-calibrated embeddings
+# Automatic embeddings and fixed character recommendations
 
-This optional path is governed by Flower `REQ-000038`, `GOAL-000020`,
-`MILE-000021`, `CHANGE-000022`, `PACKET-000023`. The existing declared-model
-adapter and its exact `prepare_*` / `embed_prepared` contracts remain available.
-Version 0.11.1 hardening is governed by Flower `REQ-000039`, `GOAL-000021`,
-`MILE-000022`, `CHANGE-000024` and `PACKET-000025`.
-The 0.12.0a1 minimum-budget and overflow-recovery candidate is governed by
-`REQ-000040`, `GOAL-000022`, `MILE-000023`, `CHANGE-000025`, `PACKET-000026`.
+The automatic service discovers one unambiguous verified loaded embedding
+identity group. It owns aliases, replica scheduling, task prefixes and dispatch
+through the same persistent engine as the declared-model adapter. The operator
+owns model loading and server configuration.
 
-The automatic service discovers one unambiguous, verified, loaded embedding
-identity group. It owns aliases, replica capacity, prefixes, preparation and
-dispatch. It uses the existing persistent embedding engine and scheduler.
-It never loads, restarts or administers remote models.
+The current local 0.13.0a1 candidate is governed by Flower `REQ-000042`,
+`GOAL-000024`, `MILE-000025`, `CHANGE-000027`, `PACKET-000028`. It replaces the
+0.12.0a1 minimum-ratio and exact post-failure diagnostics contract. Historical
+qualification reports describe their historical versions.
 
-Only the explicit `character_budget(...)` operation may start a cold calibration.
-Construction, `initialize()`, `status()`, `embed_texts()`, `embed_query()` and
-`astream_texts()` never start the 10,000-text pass. Successful ordinary calls do
-not consult calibration or learned state and can use an empty or unwritable
-cache. A confirmed failed-POST overflow uses completed state if present and
-requires writable storage to commit its learned ceiling. The consumer owns
-source splitting and may persist a requested character
-budget for subsequent runs. A stored budget is a snapshot of its model, task,
-category and observed limits; it is not an inference permit for a changed server.
-
-## Consumer API
+## Ordinary use
 
 ```python
 from runtime_llama import AutomaticEmbeddingConfig, AutomaticEmbeddingService
 
 with AutomaticEmbeddingService(AutomaticEmbeddingConfig(
     base_url="http://inference.example:8080",
+    batch_size=256,
 )) as embeddings:
-    availability = embeddings.status()  # No calibration or cache access.
-    if availability.available:
+    status = embeddings.status()
+    if status.available:
         vectors = embeddings.embed_texts(["A document to index."])
         query_vector = embeddings.embed_query("What does it describe?")
 
-    # Optional, explicit provisioning step. The consumer can save this snapshot.
+    # Optional explicit provisioning. Save the snapshot in consumer storage.
     budget = embeddings.character_budget(category="code")
-    saved_character_limit = budget.max_input_chars
-    saved_representation = budget.representation_id
 ```
 
-On later starts, a consumer can use its saved limit to split its source and send
-the strings directly. It does not need to call `character_budget()` again or
-provide the saved budget to the service. It should compare the current opaque
-`representation_id` before reusing an existing vector index. A changed context
-can also invalidate a stored character recommendation; request a fresh budget
-when its deployment profile changes.
+Construction, availability, ordinary embedding and asynchronous intake never
+start calibration, consult a calibration cache or require a saved character
+limit. Strings go directly to the server. The server tokenizes and enforces its
+context; the library preserves source order and validates cardinality, dimensions
+and finite values. Inputs are never silently truncated or split.
 
-The public methods are:
+Only `character_budget()` can start a cold calibration. A consumer may request
+its character recommendation once, save it and send later strings without
+supplying the recommendation back to the library. The consumer owns source
+splitting, fragment IDs, UTF-8 intervals, graph relationships and index storage.
+
+## Public methods
 
 ```text
 initialize(*, input_type="document", timeout=None, cancel=None)
@@ -64,123 +54,55 @@ close()
 await aclose()
 ```
 
-The four observation/budget methods return `AutomaticEmbeddingStatus`; ordinary
-availability has `max_input_chars`, `category`, `calibration_id` and `budget`
-set to `None`. `character_budget()` returns a completed budget snapshot.
-`refresh_character_budget()` never calibrates: it reuses valid completed
-statistics and/or learned state after fresh discovery. Without either, it
-returns available status, `max_input_chars=None`, `budget=None` and reason
-`character_budget_not_calibrated`. It does not create the cache.
-`input_type` accepts
-`document`, `query` or `raw`; query and document policies can have distinct
-calibrations. The asynchronous iterator yields an ordered `list[list[float]]`
-for each input window and has the same scheduler as synchronous calls.
+Observation methods return `AutomaticEmbeddingStatus`. Ordinary availability has
+`max_input_chars`, `category`, `calibration_id` and `budget` set to `None`.
+`refresh_character_budget()` uses completed matching calibration after fresh
+observation; it never calibrates. Without a complete profile it returns reason
+`character_budget_not_calibrated`, with no budget and no cache creation.
 
-`batch_size` is the total text budget, not a per-replica constant. A budget of
-256 can distribute up to 128 texts to each of two usable replicas or up to 64
-to each of four; native limits and hard request-byte bounds can require more
-HTTP requests. Global admission also respects `request_parallelism` and observed
-slots. Calibration uses the separate bounded `calibration_workers` setting.
-No compulsory accumulation timer is introduced.
+`input_type` is `document`, `query` or `raw`. Query and document prefixes are
+applied once by the selected model policy. Prefix/task policies have separate
+calibrations. A changed opaque `representation_id` requires consumer review
+before reusing an existing vector index.
 
-## Categories and explicit calibration
+## The 2,500 hard calibration texts
 
-The packaged `runtime_llama/calibration_corpus/` directory contains exactly
-10,000 original synthetic texts: 2,000 each in `code`, `documentation`, `prose`,
-`structured` and `multilingual`. `mixed` aggregates the complete corpus. The
-generator, category counts and manifest make the corpus reproducible; its
-purpose is calibration, not a universal or naturally sampled language benchmark.
+The packaged `runtime_llama/calibration_corpus/` contains exactly 500 original
+synthetic texts in each of `code`, `documentation`, `prose`, `structured` and
+`multilingual`. `mixed` aggregates all 2,500. One-off curation ranked the original
+2,000 texts per category using actual prepared Nomic token counts, choosing the
+500 smallest source-character/prepared-token ratios in each category. Stable
+original IDs break ties. This is a deliberately difficult sample for that
+Nomic tokenizer, not a universal worst case for every embedding model.
 
-An explicit initial budget request tokenizes the entire corpus, with the selected
-task prefix and native special-token policy. All category statistics are calculated in one
-pass. Changing category reuses that complete profile. A different prefix/task
-policy needs its own calibration, as do changed weights, semantic identity,
-tokenizer build or corpus revision. Equivalent replica aliases share profiles.
+`tools/calibration-hard-selection.json` records scalar measurements and source
+hashes; `tools/generate_calibration_corpus.py` reproduces the selected corpus
+offline. The curation receipt is in the source archive, outside the installed
+wheel. No consumer text, token IDs, private endpoint or model path is included.
 
-Raw statistics retain weighted/arithmetic averages and each category's minimum
-and maximum. Starting in 0.12.0a1, the operational coefficient uses the **global
-minimum** of `source Unicode characters / actual fully prepared tokens` across
-all 10,000 texts, for every category. Individual categories multiply that common
-minimum by 0.80; `mixed` multiplies it by 0.90. Categories and their measurements
-remain visible; choosing a category cannot bypass a denser corpus sample.
-Existing validated raw profiles contain this minimum and need no retokenization.
+A cold explicit request counts all 2,500 texts using the selected model's native
+tokenizer, task prefix and special-token policy. All categories are calculated
+in that pass. Changing category reuses it; changing weights, semantics,
+tokenizer build, task/prefix policy or corpus identity requires a matching new
+profile. Old 10,000-text profiles cannot supply this corpus's statistics.
 
-The initial ceiling is `floor(effective input token limit * coefficient)`.
-Prefix and special tokens are already counted in the denominator and are not
-subtracted again. Characters mean Python Unicode code points, not UTF-8 bytes
-or grapheme clusters. The qualified 512-token Nomic profile's global minimum is
-1.2115384615384615 characters/token: category ceilings are 496 and mixed is 558.
-The earlier mean-based 1,509-character mixed value belongs to 0.11.0/0.11.1.
-
-Even the worst corpus sample is empirical, not proof about arbitrary source
-text. Only an exact measured fragment is admitted as verified advice. Ordinary
-calls do not enforce the character recommendation and never silently split or
-truncate inputs.
-
-## Exact correction after a failed POST
-
-Only a direct HTTP 500 enters recovery. After the owner's normal embedding work
-has drained, the service counts the source rows actually sent in that failed
-POST, with the same verified prefix and native special-token policy. It does
-not tokenize successful POSTs, the entire ingestion, other owners' rows or the
-10,000-text corpus. Duplicate occurrences retain distinct original indices;
-equal diagnostic text can safely reuse a count in that one verified scope.
-
-No proven context overflow means the **same original `ClientHTTPError`** is
-raised, with no learned-state update. An unavailable/malformed diagnostic
-tokenizer also preserves that inference error. Cancellation, finite deadlines,
-callback shutdown guards and changed identity/limits keep their own failures.
-A microbatch reservation alone is not overflow proof: native pooling modes can
-differ in their ability to split computation.
-
-For proven overflow, the service computes a proper source partition and counts
-every proposed fragment exactly, including prefix/specials. Search probes do
-not assume monotonic BPE counts or establish a global maximum. Accepted spans
-cover the original source contiguously in both Unicode code points and UTF-8
-bytes. Every fragment fits the common effective limit of all usable replicas.
-Diagnostics allow at most 512 tokenizer measurements and 256 returned fragments,
-under the failed call/window's original deadline and cancellation. Incomplete
-advice is discarded, preserving the original 500.
-
-Fresh observations validate the actual failed alias's context and microbatch
-as well as the pool minimum, identity and tokenizer before persistence. A
-completed partition yields `EmbeddingInputOverflowError`, never vectors of
-changed cardinality or an automatic embedding retry. Public exports are:
+The operational ratio is the weighted mean `sum(source characters) /
+sum(prepared tokens)` of the selected category. A category uses 80% of that
+mean; `mixed` uses 90% of the weighted mean of all 2,500 texts:
 
 ```text
-EmbeddingVerifiedSpan(char_start, char_end, utf8_start, utf8_end, token_count)
-EmbeddingOverflowInput(input_index, text_sha256, char_count, utf8_count,
-                       token_count, token_limit, fragments)
-EmbeddingInputOverflowError(*, budget, inputs, failed_input_indices,
-                            window_index=None)
+max_input_chars = floor(effective_input_token_limit * weighted_mean_chars_per_token * factor)
+factor = 0.80 for a category, 0.90 for mixed
 ```
 
-`input_index` and `failed_input_indices` are zero-based in the owner's original
-logical window, not positions inferred from hashes or text identity.
-`window_index` is `None` for synchronous calls and a zero-based source ordinal
-for automatic async streams. `inputs` contains only confirmed oversized
-occurrences; hashes identify their unprefixed UTF-8 source. Texts, token arrays
-and other owners' provenance are not public fields.
+Source characters are Python Unicode code points. Prefix and special tokens
+are already in the denominator; do not subtract them a second time. The
+recommendation is empirical and does not prove that an arbitrary input fits.
+A failed embedding never changes these statistics or reduces the recommendation.
+Fresh observation of changed loaded limits can change a newly requested
+snapshot without retokenizing a still-valid profile.
 
-The consumer buffers its whole logical window until success. On correction it
-validates identity, hashes and coverage, applies the **exact returned spans**
-to affected inputs, preserves other inputs and source identities, then decides
-whether to retry that logical window. Do not heuristically split the verified
-fragments again: BPE at a new boundary can change counts. Graphs, parent/fragment
-IDs, byte/line intervals, publication and retry bounds belong to the consumer.
-Strict progress is a proper source partition; the reported character ceiling
-can remain unchanged when its initial value is already lower than the newly
-measured candidate.
-
-Shared POSTs still isolate owners: valid peer inputs retain the original 500;
-only the owner with proven overflow receives its correction. Async streams
-remain fail-stop and drain prefetched work; there is no automatic replay/resume
-or partial vector delivery from a failed logical window.
-
-## Budget snapshots and learned state
-
-`AutomaticEmbeddingStatus.budget` and `EmbeddingInputOverflowError.budget` expose
-the immutable public `EmbeddingBudgetSnapshot`:
+`AutomaticEmbeddingStatus.budget` is an immutable `EmbeddingBudgetSnapshot`:
 
 ```text
 policy_id, representation_id, context_scope_id, input_type, category,
@@ -188,139 +110,132 @@ calibration_id, max_input_chars, initial_max_input_chars, budget_revision,
 effective_context_tokens, source
 ```
 
-`calibration_id` and `initial_max_input_chars` are nullable for learned-only state
-without a completed 10,000-sample profile. All other snapshot fields are defined;
-`max_input_chars` is positive. `source` is `calibrated_minimum` or
-`learned_reduction`. Availability-only status has no snapshot. Consumers may
-serialize the snapshot using `dataclasses.asdict`; historical calibration
-provenance must not be presented as a current non-null SDK calibration ID.
+For this contract `source="calibrated_mean"`, `budget_revision=0` and
+`initial_max_input_chars=max_input_chars`. Old learned reductions are not read
+or written. A consumer's stored recommendation remains its responsibility.
 
-The learned candidate is the smallest, across offending inputs, of each complete
-partition's largest verified fragment character length. The absolute stored
-ceiling is the minimum of that candidate, the current calibrated recommendation
-if available, and any existing learned ceiling. **80%/90% are not applied again
-to this exact learned value.** It is a future character recommendation; the
-returned exact spans govern the current correction.
+## Recover only the rejected source
 
-Learned state is common across categories of the same verified model/task/
-prefix/tokenizer and exact effective-context scope. Different tasks, builds,
-weights, semantics or effective contexts have distinct scopes; lessons are not
-silently rescaled or moved between them. Revisions increase only on a real
-stored reduction. `representation_id` identifies vector semantics; a smaller
-character ceiling alone does not imply a new vector space.
+A direct HTTP 500 starts bounded isolation inside the existing scheduled HTTP
+lease. The library bisects the failed index set into smaller HTTP requests,
+retains each successful child's vectors and descends only into failed children.
+Successful subbatches are never sent again by isolation. Two identical strings
+remain separate source occurrences with separate original indices.
 
-Thread and cross-process locks enforce read/min/write convergence. Private
-atomic replacement publishes only complete scalar state; no network work runs
-under the store lock. Cancellation before commit leaves the preceding state;
-after atomic publication a valid reduction cannot be undone. Corrupt learned
-state fails closed rather than silently restoring a larger recommendation.
+An isolated rejected singleton of at least two Unicode code points produces
+`EmbeddingChunkSplitRequiredError`. It contains **all** successful original
+positions in `completed` and only the rejected positions in `inputs`. A generic
+500 is not proof of context overflow: these are recovery instructions, with no
+claimed token counts or token-admission guarantee. No `/tokenize` request,
+calibration, learned-store access or budget recalculation occurs during recovery.
 
-## Persistent authority and resource limits
+```text
+EmbeddingSourceSpan(char_start, char_end, utf8_start, utf8_end)
+EmbeddingHalvingInput(input_index, text_sha256, char_count, utf8_count, halves)
+EmbeddingCompletedInput(input_index, embedding)
+EmbeddingChunkSplitRequiredError(*, input_count, completed, inputs,
+                                 representation_id, input_type, window_index=None)
+```
 
-Only complete, validated raw statistics and learned scalar ceilings are persisted, outside the
-repository. No consumer texts, token arrays, credentials, IP addresses or model
-paths are stored. Cache identity includes verified weights and embedding
-semantics, corpus, tokenizer build and task/prefix/special-token policy.
-Atomic writes do not publish partial calibration or learned records after
-cancellation or timeout.
+Each rejected source has exactly two nonempty halves meeting at
+`len(source) // 2`, covering its original Unicode and UTF-8 intervals without
+loss. Its SHA-256 identifies the original unprefixed UTF-8 source. Completed
+vectors are immutable tuples. Completed and rejected indices partition the
+whole original logical window. `window_index` is `None` for synchronous calls,
+otherwise the zero-based source-window ordinal. Source text and token arrays
+are not fields of the error.
 
-Fresh runtime observations remain required. A changed context or microbatch
-updates the character budget without retokenizing an unchanged corpus/profile.
-Budget calculation conservatively respects the smallest observed input context
-and native microbatch; native computation sizes are not aggregate HTTP token
-budgets. Multiple unrelated embedding groups require explicit selection.
+The consumer retains `completed`, verifies identity and the rejected source
+hashes, creates child fragment identities from the returned intervals and sends
+only those halves. It must bound its own repeated splitting/retries and retain
+successful previous rounds. See the [consumer recovery example](HALVING-CONSUMER.md).
+The library does not embed halves automatically or return a changed result
+cardinality as ordinary success.
 
-Successful ordinary calls send strings directly, without per-input `/tokenize`, calibration
-lookups or statistical character admission. The server owns actual tokenization
-and context admission. Internal queue capacity can conservatively reserve one
-observed input context per text; these reservations are not measured token counts
-and do not determine whether a text fits. Byte, text-count and response bounds
-remain hard bounds. Prefixes are applied once, and ordering, owner cancellation,
-finite deadlines, backpressure and drained shutdown use the original engine.
-Exact public preparations are never populated with reservations or estimates.
+Non-500 responses retain their original error. Indivisible rejected sources
+(empty or one code point), invalid UTF-8, exhausted isolation allowance,
+identity changes, cancellation and deadlines are terminal errors. Failed exact
+adapter owners in a shared POST preserve their original error; only automatic
+direct owners take this isolation path. If isolation cannot complete safely,
+it does not claim a complete partial-result partition.
 
-## Configurable transport and memory budgets
+## Ordered asynchronous windows
 
-The automatic config exposes the existing adapter limits without changing their
-defaults:
+The asynchronous API shares the same engine, owner cancellation and HTTP
+limits as synchronous calls. Results and recoverable errors are delivered in
+source-window order. A later prefetched rejection cannot discard an earlier
+successful window. Catching `EmbeddingChunkSplitRequiredError` leaves the
+iterator usable; the next `anext()` delivers the next original window. Nothing
+is replayed automatically. If recovery should occur before later delivery,
+handle it before calling `anext()` again.
+
+Use an explicit `anext()` loop to continue after recoverable errors. An exception
+escaping an `async with` body closes and drains the stream normally. Other
+errors remain fail-stop. `timeout` bounds readiness and each individual window,
+not the whole stream. Source iterators are borrowed unless `close_source=True`.
+Paused successful or partial results remain covered by result credits until
+ordered delivery; closing drains all owned requests.
+
+## Batching, concurrency and bounds
+
+`batch_size` is the total text distribution budget. With budget 256, two usable
+replicas can each receive up to 128 texts; four can receive up to 64. These are
+text quotas, separate from per-input context, aggregate HTTP token limits and
+native computation batch/microbatch sizes. Quotas can require multiple HTTP
+requests. The existing scheduler respects global `request_parallelism`,
+per-replica configured limits and observed slots. No compulsory accumulation
+timer or second scheduler is introduced.
+
+Compatible admitted records accumulate across callers/windows. Source windows
+are delivery boundaries, not forced HTTP fragmentation boundaries. Isolation
+holds the original alias lease and serializes its own descendant calls; workers
+on other aliases remain able to run. A loaded single-slot replica permits one
+embedding HTTP call at a time. Adding an alias does not authorize parallel work
+unless identity and loaded capacity are verified.
 
 | Setting | Default | Meaning |
 | --- | ---: | --- |
 | `embedding_max_request_bytes` | 8 MiB | Serialized embedding request bound. |
-| `embedding_max_response_bytes` | 8 MiB | Decoded HTTP JSON response bound, including decompressed gzip. |
-| `embedding_max_pending_bytes` | 64 MiB | Existing pending-data and retained-result credit limits. |
-| `embedding_max_pending_tokens` | 1,048,576 | Queue token-accounting bound; direct inputs reserve their observed allowance. |
-| `http_connection_policy` | `"close"` | Owned client uses independent connections; explicit `"reuse"` enables existing keep-alive policy. |
+| `embedding_max_response_bytes` | 8 MiB | Decoded HTTP response bound, including decompressed gzip. |
+| `embedding_max_pending_bytes` | 64 MiB | Pending records and retained-result credit limits. |
+| `embedding_max_pending_tokens` | 1,048,576 | Queue reservation units for direct inputs; not measured tokens. |
+| `embedding_isolation_max_requests` | 512 | Maximum descendant POSTs per originally failed POST, excluding that root request. |
+| `http_connection_policy` | `"close"` | Independent connections for an owned client; `"reuse"` explicitly enables keep-alive. |
 
-Limits must be positive integers. A decoded JSON response and retained Python
-vector results are different resources. Raising the response bound does not
-raise result credit or remove request, pending-data, cardinality or concurrency
-bounds. These accounting budgets are not an exact operating-system RSS limit.
-High-dimensional vectors can require a response budget above 8 MiB even when
-their input strings are short. For example:
+These integer limits must be positive. There is also an overall finite original
+call/window deadline. Isolation checks cancellation and fresh model/limit
+observations before descendant calls. With N rows the full binary isolation
+tree has at most `2*N-1` POSTs including the root, before the configured cap.
+A descendant cancellation retires its participating owner; healthy sibling
+owners are not cancelled. Close waits for actual transport drain.
 
-```python
-config = AutomaticEmbeddingConfig(
-    base_url="http://inference.example:8080",
-    embedding_max_response_bytes=16 * 1024 * 1024,
-    embedding_max_pending_bytes=64 * 1024 * 1024,
-    http_connection_policy="reuse",
-)
-```
+Direct queue token accounting conservatively reserves the observed allowance
+per input without invoking the tokenizer. This is not an input token count or
+an admission guarantee. Large allowances may require a larger explicitly
+configured pending-token budget. Byte, text, result and HTTP limits remain
+independent; they are not a claim about total operating-system RSS.
 
-For direct inputs, the token ledger reserves the smallest observed context and
-microbatch allowance per text. At a large allowance this can fill a pending
-token budget before `batch_size` texts accumulate. An operator can explicitly
-raise `embedding_max_pending_tokens` to accommodate the desired bounded intake;
-the library does not fabricate counts or silently enlarge memory limits. For
-an allowance of 65,536, accommodating 256 pending direct texts requires
-16,777,216 reservation units. This changes admission capacity, not the scheduler
-or the server's actual context checks. With multiple active owners, capacity is
-shared and the observed HTTP packing can differ.
+## Persistence and failure handling
 
-`http_connection_policy` applies to the service-owned client. An injected client
-retains its connection policy and remains owned by its caller. Reuse adds no
-retry, transport fallback or requirement for a patched llama-server.
+Only complete validated scalar calibration profiles persist outside the repo.
+No consumer source, credentials, token arrays or model paths are stored. Cold
+calibration checks persistence before sending tokenizer requests, then validates
+identity before atomic publication. Cancellation does not publish a partial
+profile. A matching complete cache can be read without directory write access.
+Ordinary use and isolation require no writable cache.
 
-## Calibration and shutdown failures
+Cancellation callbacks must be thread-safe and side-effect free. Closing the
+same service inside its own cancellation callback raises
+`llamacpp_automatic_embedding_close_from_cancel_callback`; signal cancellation
+from the controlling thread, then close externally. A catalog entry without
+loaded status needs verified identity tags and coherent root properties;
+missing status is not assumed to mean loaded.
 
-A valid complete calibration cache can be read without directory write access.
-For a cold explicit budget request, the library checks persistence feasibility
-before sending tokenizer requests, using a private temporary file which is
-removed after the check. Final validation and private atomic replacement still
-apply: permissions or storage can change after a successful preflight. Ordinary
-availability and successful embedding never perform this check or consult the
-cache. Failed-POST recovery has its separately bounded persistence contract.
+## Qualification boundaries
 
-Cancellation callbacks must be side-effect free and safe across threads, such as
-`threading.Event.is_set`. Calling the same service's synchronous `close()` from
-inside its own callback raises a typed `LLMBackendError` with diagnostic
-`llamacpp_automatic_embedding_close_from_cancel_callback` before shutdown state
-changes. Set a cancellation event in the controlling thread, then call `close()`
-or await `aclose()` externally to stop and drain owned work.
-
-A single-model catalog without a loaded status is accepted only when verified
-identity tags and coherent root `/props` attest the loaded model. Router props,
-sleeping entries, ambiguous catalogs, unverified identity and inconsistent model
-proof are not promoted to loaded by assuming that missing status means ready.
-
-An opaque representation identity protects stored vector spaces. Automatic
-discovery must not silently replace an index's embedding model. A consumer
-still owns source splitting, UTF-8 fragment intervals, graph relationships and
-the decision to rebuild an index after a representation change.
-
-## Verification
-
-Implementation, deterministic verification, live qualification and human
-acceptance are separate. Initial 10,000-text live calibration is explicitly
-authorized for this cycle; it is run only through an explicit budget request.
-Stable publication is recorded separately in the
-[0.11.1 release record](verification/PUBLIC-RELEASE-0.11.1.md).
-Consumer migration remains a separate task.
-The [0.12.0a1 qualification](verification/EXACT-OVERFLOW-0.12.0a1.md)
-records the new minimum policy, exact correction and installed-wheel evidence;
-its numerical finding remains open. The separately authorized
-[public prerelease](verification/PUBLIC-RELEASE-0.12.0a1.md) retains the exact
-tested wheel without claiming full numerical qualification or stable promotion.
-The [0.11.0a1 qualification](verification/AUTOMATIC-EMBEDDING-0.11.0a1.md)
-records deterministic coverage, live HTTP counts, timings and category budgets.
+Deterministic tests, installed-wheel checks, live server qualification and
+consumer acceptance are separate. The current live server has one loaded Nomic;
+two-alias HTTP barrier fixtures prove scheduler overlap separately. Reported
+client wall times include networking, preparation and validation, not pure GPU
+time. The existing cross-replica numerical finding remains open; this contract
+does not relax its tolerances or modify consumers or loaded models.

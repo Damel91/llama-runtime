@@ -41,7 +41,7 @@ The project's engineering lifecycle is managed with
 | Async embedding windows | Async text or prepared-input sources, ordered complete windows, bounded intake and buffered results, with the same scheduler and limits used by synchronous callers. |
 | Persistent embedding queues | Prepared records accumulate in adapter-owned queues for each verified replica; batches are formed when execution capacity is available, with the same engine for synchronous and async callers. |
 | Native token inputs | Reuses exact retained token IDs with verified weights, tokenizer build and prefix/special policy, avoiding a second string tokenization in the native embedding handler. |
-| Optional automatic embeddings | Verified loaded-model discovery and direct text inputs using the existing scheduler; an explicit character-budget helper calibrates 10,000 packaged texts by category when requested. |
+| Optional automatic embeddings | Verified loaded-model discovery and direct text inputs using the existing scheduler; an explicit character-budget helper calibrates 2,500 selected hard texts by category when requested. Native 500s isolate rejected inputs through bounded subbatches and preserve successful indexed vectors. |
 | Lifecycle and errors | Typed backend, timeout, cancellation and runaway errors; cooperative cancellation, repetition protection and drained embedding shutdown. Embedding calls have overall deadlines; generation supports bounded HTTP and stream-idle waits. |
 | Optional stream idle | Explicit `stream_idle_timeout_sec=None` waits through quiet prefill; connection/JSON budgets remain finite, with per-request socket interruption for Stop and drained close. |
 | Diagnostics | Optional bounded thinking capture, invocation correlation and final diagnostic sinks, including interrupted calls. |
@@ -57,27 +57,29 @@ against the forwarded JSON Schema. Splitting source documents and tracking their
 fragments belong to the consuming application. The server's own auto-loading
 policy is supported.
 
-## Prerelease 0.12.0a1
+## Local candidate 0.13.0a1
 
-The automatic character recommendation uses the worst observed ratio across
-the existing 10,000 calibration samples, with the same 80% category and 90%
-mixed factors. Successful direct calls still perform no tokenization.
+The automatic embedding corpus contains the 500 densest measured texts from
+each of five categories, selected reproducibly from the original 10,000
+synthetic texts. Only an explicit character-budget request calibrates these
+2,500 texts with the consumer's model and task prefix. The recommendation uses
+the selected category's weighted mean characters/token multiplied by 80%, or
+the complete selected corpus's weighted mean multiplied by 90% for `mixed`.
+It stays fixed during inference recovery.
 
-After a direct HTTP 500 drains, bounded exact diagnostics inspect only the
-failed caller's actual POST inputs. A confirmed context overflow returns
-`EmbeddingInputOverflowError` with verified lossless source spans and a
-persisted absolute character ceiling. The consumer owns reprojection and an
-explicit retry; no embedding request is replayed automatically. Unproven
-overflow preserves the original 500. The existing scheduler is unchanged.
+A native HTTP 500 triggers bounded subdivision of that failed POST to isolate
+rejected inputs, without `/tokenize`. `EmbeddingChunkSplitRequiredError`
+returns successful vectors at their original indices and two lossless source
+halves for each isolated rejected occurrence. The consumer retries those
+halves and retains completed vectors. Halves carry Unicode and UTF-8 offsets;
+they make no exact token-fit promise and may need another split. Existing
+scheduling, cancellation, deadlines and backpressure remain in use.
 
-`refresh_character_budget()` observes current limits and reads completed
-calibration/learned state without starting calibration. See the
-[automatic API](docs/AUTOMATIC-EMBEDDING.md) and
-[prerelease record](docs/verification/PUBLIC-RELEASE-0.12.0a1.md).
-This is a public prerelease with an open numerical finding between the observed
-replicas. Stable 0.11.1 remains the latest stable release. A separately authorized
-consumer diagnostic ingestion completed with 126,045 vectors; that functional
-result does not close numerical qualification.
+See the [automatic API](docs/AUTOMATIC-EMBEDDING.md) and
+[consumer recovery contract](docs/HALVING-CONSUMER.md). This candidate is local
+and has not been published. Stable **0.11.1** remains the latest stable release;
+the [published 0.12.0a1 prerelease record](docs/verification/PUBLIC-RELEASE-0.12.0a1.md)
+describes its earlier exact-recovery contract and open numerical finding.
 
 ## Release 0.11.1
 
