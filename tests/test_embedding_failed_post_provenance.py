@@ -1,19 +1,30 @@
-"""Failed direct POST receipts retain actual owner-local input occurrences."""
+"""Isolated direct rejections retain only indexed source metadata and vectors."""
 
 from contextlib import contextmanager
+import hashlib
 from threading import Event
 
 import pytest
 
 from runtime_llama.adapters.embedding import _Call
 from runtime_llama.client import ClientHTTPError
-from runtime_llama.embedding_recovery import _FailedDirectPost, _FailedOwnerPost
+from runtime_llama.embedding_halving import _HalvingResult, _RejectedEmbedding
 from runtime_llama.errors import LLMCancelledError
 
 from test_embedding_async_stream import WindowSource, assert_drained, run, wait_thread
-from test_embedding_contracts import ContractClient, configured
+from test_embedding_contracts import ContractClient, configured, vector
 from test_embedding_direct import policy
 from test_embedding_shared_lifecycle import SharedScenario
+
+
+def assert_sanitized(marker, original):
+    assert marker.original is not original
+    assert marker.original.status_code == original.status_code
+    assert marker.original.error_type == original.error_type
+    assert marker.original.error_code == original.error_code
+    assert marker.original.__traceback__ is None
+    assert marker.original.__context__ is None
+    assert marker.original.__cause__ is None
 
 
 @contextmanager
@@ -60,25 +71,23 @@ def test_failed_direct_post_preserves_occurrence_indices_and_strips_prefix_once(
         group._input_positions = (8, 3, 11)
         original = ClientHTTPError(500, error_type="server_error")
         client.failure = lambda *_: original
-        with pytest.raises(_FailedDirectPost) as raised:
+        result = dict(
             adapter._engine_run_shared(
                 "embed_0", records, [left, right, left], group, observation
             )
-        receipt = raised.value
-        assert receipt.original is original
-        assert receipt.model == "embed_0" and receipt.observation is observation
-        assert [
-            (row.owner, row.input_index, row.text, row.prefix) for row in receipt.rows
-        ] == [
-            (left, 8, "same", "doc: "),
-            (right, 3, "doc: source", "doc: "),
-            (left, 11, "same", "doc: "),
-        ]
-        assert client.embedding_calls == [
-            ("embed_0", ("doc: same", "doc: doc: source", "doc: same"))
-        ]
+        )
+        assert tuple(result) == (0, 1, 2)
+        for index, source in enumerate(("same", "doc: source", "same")):
+            marker = result[index]
+            assert isinstance(marker, _RejectedEmbedding)
+            assert_sanitized(marker, original)
+            assert marker.text_sha256 == hashlib.sha256(source.encode()).hexdigest()
+            assert marker.char_count == len(source)
+            assert not hasattr(marker, "text") and not hasattr(marker, "owner")
+            assert "doc: source" not in repr(marker)
+        assert result[0] is not result[2]
+        assert len(client.embedding_calls) == 5
         assert not client.token_calls
-        assert "doc: source" not in str(receipt) and "doc: source" not in repr(receipt)
 
 
 def test_failed_post_receipt_excludes_owner_pruned_before_native_post():
@@ -91,15 +100,15 @@ def test_failed_post_receipt_excludes_owner_pruned_before_native_post():
         left.stop.set()
         original = ClientHTTPError(500)
         client.failure = lambda *_: original
-        with pytest.raises(_FailedDirectPost) as raised:
+        result = dict(
             adapter._engine_run_shared(
                 "embed_0", records, [left, right], group, observation
             )
+        )
         assert isinstance(left.failure, LLMCancelledError)
-        assert raised.value.original is original
-        assert [
-            (row.owner, row.input_index, row.text) for row in raised.value.rows
-        ] == [(right, 34, "survivor")]
+        assert tuple(result) == (1,)
+        assert_sanitized(result[1], original)
+        assert result[1].text_sha256 == hashlib.sha256(b"survivor").hexdigest()
         assert client.embedding_calls == [("embed_0", ("doc: survivor",))]
         assert not client.token_calls
 
@@ -120,21 +129,23 @@ def test_receipt_contains_only_failed_http_subbatch_not_successful_or_unsent_row
         group = adapter._engine_batch_call([left])
         group._input_positions = (10, 11, 12, 13, 14)
         original = ClientHTTPError(500)
-        client.failure = lambda *_: (
-            original if len(client.embedding_calls) == 2 else None
-        )
-        with pytest.raises(_FailedDirectPost) as raised:
+        client.failure = lambda _model, rows: original if "doc: third" in rows else None
+        result = dict(
             adapter._engine_run_shared(
                 "embed_0", records, [left] * 5, group, observation
             )
-        assert raised.value.original is original
-        assert [(row.input_index, row.text) for row in raised.value.rows] == [
-            (12, "third"),
-            (13, "fourth"),
-        ]
+        )
+        assert tuple(result) == tuple(range(5))
+        assert_sanitized(result[2], original)
+        assert result[2].text_sha256 == hashlib.sha256(b"third").hexdigest()
+        for index in (0, 1, 3, 4):
+            assert result[index] == vector("doc: " + source[index])
         assert client.embedding_calls == [
             ("embed_0", ("doc: first", "doc: second")),
             ("embed_0", ("doc: third", "doc: fourth")),
+            ("embed_0", ("doc: third",)),
+            ("embed_0", ("doc: fourth",)),
+            ("embed_0", ("doc: fifth",)),
         ]
         assert not client.token_calls
 
@@ -154,7 +165,7 @@ def test_other_http_statuses_keep_original_error_without_provenance(status):
 
 
 @pytest.mark.parametrize("exact", [False, True])
-def test_missing_occurrence_provenance_or_exact_records_keep_original_500(exact):
+def test_direct_metadata_needs_no_owner_provenance_and_exact_keeps_original_500(exact):
     with direct_batch() as (adapter, client, left, _, admitted, observation):
         if exact:
             del left._direct_policy
@@ -172,9 +183,19 @@ def test_missing_occurrence_provenance_or_exact_records_keep_original_500(exact)
             group._input_positions = (8,)
         original = ClientHTTPError(500)
         client.failure = lambda *_: original
-        with pytest.raises(ClientHTTPError) as raised:
-            adapter._engine_run_shared("embed_0", [record], [left], group, observation)
-        assert raised.value is original
+        if exact:
+            with pytest.raises(ClientHTTPError) as raised:
+                adapter._engine_run_shared(
+                    "embed_0", [record], [left], group, observation
+                )
+            assert raised.value is original
+        else:
+            result = dict(
+                adapter._engine_run_shared(
+                    "embed_0", [record], [left], group, observation
+                )
+            )
+            assert_sanitized(result[0], original)
         assert len(client.embedding_calls) == 1
         assert len(client.token_calls) == int(exact)
 
@@ -204,31 +225,26 @@ def test_engine_projects_failed_rows_to_owning_windows_without_peer_or_owner_ref
         shared.client.shared_error = original
         async with shared:
             shared.client.shared_gate.set()
-            expected_left = ClientHTTPError if exact_left else _FailedOwnerPost
-            with pytest.raises(expected_left) as left:
-                await shared.tasks[0]
-            with pytest.raises(_FailedOwnerPost) as right:
-                await shared.tasks[1]
             if exact_left:
+                with pytest.raises(ClientHTTPError) as left:
+                    await shared.tasks[0]
                 assert left.value is original
             else:
-                assert left.value.original is original
-                assert [(row.input_index, row.text) for row in left.value.rows] == [
-                    (0, "a-0"),
-                    (1, "same"),
-                ]
-                assert all(row.owner is None for row in left.value.rows)
-                assert left.value.deadline == shared.calls["a"].deadline
-                assert left.value.window_index == 0
-            assert right.value.original is original
-            assert [(row.input_index, row.text) for row in right.value.rows] == [
-                (0, "b-0"),
-                (1, "same"),
-            ]
-            assert all(row.owner is None for row in right.value.rows)
-            assert right.value.deadline == shared.calls["b"].deadline
-            assert right.value.window_index == 0
-            assert len(shared.client.shared_posts) == 1
+                left_result = await shared.tasks[0]
+                assert isinstance(left_result, _HalvingResult)
+                assert left_result.outputs == (None, vector("same"))
+                assert tuple(left_result.rejections) == (0,)
+                assert_sanitized(left_result.rejections[0], original)
+                assert not hasattr(left_result.rejections[0], "owner")
+                assert left_result.window_index == 0
+            right_result = await shared.tasks[1]
+            assert isinstance(right_result, _HalvingResult)
+            assert right_result.outputs == (None, vector("same"))
+            assert tuple(right_result.rejections) == (0,)
+            assert_sanitized(right_result.rejections[0], original)
+            assert not hasattr(right_result.rejections[0], "owner")
+            assert right_result.window_index == 0
+            assert len(shared.client.shared_posts) > 1
             assert_drained(shared.adapter, shared.client)
 
     run(scenario)
@@ -255,15 +271,16 @@ def test_owner_retired_during_failed_post_keeps_cancellation_and_no_receipt():
             shared.client.shared_gate.set()
             with pytest.raises(LLMCancelledError):
                 await shared.tasks[0]
-            with pytest.raises(_FailedOwnerPost) as right:
-                await shared.tasks[1]
-            assert right.value.original is original
-            assert [(row.input_index, row.text) for row in right.value.rows] == [
-                (0, "b-0"),
-                (1, "b-1"),
-            ]
+            right = await shared.tasks[1]
+            assert isinstance(right, _HalvingResult)
+            assert right.outputs == (None, None)
+            assert tuple(right.rejections) == (0, 1)
+            for marker in right.rejections.values():
+                assert_sanitized(marker, original)
             assert not shared.client.transport_cancelled.is_set()
-            assert all(row.owner is None for row in right.value.rows)
+            assert all(
+                not hasattr(marker, "owner") for marker in right.rejections.values()
+            )
             assert_drained(shared.adapter, shared.client)
 
     run(scenario)

@@ -35,7 +35,7 @@ CALIBRATION_CATEGORIES = (
 )
 CATEGORY_SAFETY_FACTOR = 0.80
 MIXED_SAFETY_FACTOR = 0.90
-_CORPUS_SCHEMA = "runtime-llama-calibration-corpus-v1"
+_CORPUS_SCHEMA = "runtime-llama-calibration-corpus-v2"
 _PROFILE_SCHEMA = "runtime-llama-embedding-calibration-v1"
 _MAX_CACHE_BYTES = 128 * 1024
 _MAX_CORPUS_FILE_BYTES = 16 * 1024 * 1024
@@ -94,12 +94,11 @@ class CalibrationProfile:
         return self.statistics[category]
 
     def safe_chars_per_token(self, category: str = "mixed") -> float:
-        self.stats_for(category)
-        # Category selects headroom, never a narrower corpus subset. Every
-        # initial recommendation uses the minimum of all 10,000 observations.
-        minimum = self.stats_for("mixed").min_chars_per_token
+        # The selected hard texts are measured with this model/task policy.
+        # This fixed recommendation is never revised by inference failures.
+        mean = self.stats_for(category).chars_per_token
         factor = MIXED_SAFETY_FACTOR if category == "mixed" else CATEGORY_SAFETY_FACTOR
-        return minimum * factor
+        return mean * factor
 
     def max_input_chars(self, context_tokens: int, category: str = "mixed") -> int:
         if type(context_tokens) is not int or not 0 < context_tokens <= 2**31 - 1:
@@ -135,7 +134,7 @@ def _load_manifest(check: Callable[[], None]):
         if (
             manifest["schema"] != _CORPUS_SCHEMA
             or type(manifest["sample_count"]) is not int
-            or manifest["sample_count"] != 10000
+            or manifest["sample_count"] != 2500
             or type(categories) is not dict
             or set(categories) != set(CALIBRATION_CATEGORIES)
             or manifest["corpus_sha256"]
@@ -158,7 +157,7 @@ def _load_manifest(check: Callable[[], None]):
                 != {"file", "count", "total_characters", "bytes", "sha256"}
                 or description["file"] != category + ".jsonl"
                 or type(description["count"]) is not int
-                or description["count"] != 2000
+                or description["count"] != 500
                 or type(description["bytes"]) is not int
                 or not 0 < description["bytes"] <= _MAX_CORPUS_FILE_BYTES
                 or type(description["total_characters"]) is not int
@@ -520,7 +519,7 @@ def load_existing_calibration(
 
     The packaged manifest identifies the observations, including each corpus
     file hash. Loading those historical scalar statistics does not materialize
-    or retokenize the 10,000 source records. Missing/invalid profiles return
+    or retokenize the 2,500 source records. Missing/invalid profiles return
     ``None``. The caller supplies a freshly verified tokenizer binding.
     """
     if not callable(check):
@@ -542,7 +541,7 @@ def load_or_calibrate(
     workers: int = 2,
     validate: Callable[[], None] | None = None,
 ) -> CalibrationProfile:
-    """Load verified complete measurements, or tokenize all 10,000 raw texts.
+    """Load verified complete measurements, or tokenize all 2,500 selected texts.
 
     ``tokenize`` owns prefix application, exact native special-token policy,
     finite HTTP bounds and model verification. ``check`` enforces this caller's

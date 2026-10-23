@@ -1,4 +1,4 @@
-"""Public failed-POST recovery, without touching consumers or native models."""
+"""Tokenizer-free failed-POST isolation, fixed budgets and drained ownership."""
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -8,8 +8,7 @@ from threading import Event
 import pytest
 
 from runtime_llama import (
-    EmbeddingInputOverflowError,
-    LLMBackendError,
+    EmbeddingChunkSplitRequiredError,
     LLMCancelledError,
     LLMTimeoutError,
 )
@@ -21,6 +20,7 @@ from test_automatic_embedding import (
     remote,
 )
 from test_embedding_async_stream import WindowSource, run, wait_thread
+from test_embedding_contracts import vector
 
 
 def failing_native(client):
@@ -31,82 +31,101 @@ def failing_native(client):
     return error
 
 
-def assert_partition(item, source, client):
+def assert_halves(item, source):
     assert item.text_sha256 == hashlib.sha256(source.encode()).hexdigest()
     assert item.char_count == len(source)
     assert item.utf8_count == len(source.encode())
+    assert not hasattr(item, "token_count") and not hasattr(item, "token_limit")
+    assert len(item.halves) == 2
+    assert item.halves[0].char_end == len(source) // 2
     pieces = []
-    for span in item.fragments:
+    for span in item.halves:
         piece = source[span.char_start : span.char_end]
         assert source.encode()[span.utf8_start : span.utf8_end].decode() == piece
-        assert span.token_count == len("search_document: " + piece) + 1
-        assert span.token_count <= item.token_limit
+        assert not hasattr(span, "token_count")
         pieces.append(piece)
     assert "".join(pieces) == source
-    assert all(len(piece) < len(source) for piece in pieces)
+    assert all(0 < len(piece) < len(source) for piece in pieces)
+    return pieces
 
 
-def test_proven_overflow_returns_exact_source_spans_and_learned_only_snapshot(
+def block_isolation(client):
+    """Only a child POST blocks, so cancellation exercises native isolation."""
+    original = client.embeddings
+    child_started = Event()
+
+    def embeddings(*args, **kwargs):
+        if client.embedding_calls:
+            client.embed_gate.clear()
+            child_started.set()
+        return original(*args, **kwargs)
+
+    client.embeddings = embeddings
+    return child_started
+
+
+def test_failed_post_isolates_one_source_and_returns_already_completed_rows(
     make_service,
 ):
     client = remote(replicas=1, context=64)
     original = failing_native(client)
     service, _ = make_service(client, batch_size=3)
-    source = "α🙂漢字" * 25
-    with pytest.raises(EmbeddingInputOverflowError) as caught:
+    source = "α🙂漢字" * 20
+    with pytest.raises(EmbeddingChunkSplitRequiredError) as caught:
         service.embed_texts(["good", source, "also good"])
     error = caught.value
-    assert error.__cause__ is original
-    assert error.failed_input_indices == (0, 1, 2)
-    assert error.window_index is None
+    assert error.__cause__.status_code == original.status_code
+    assert error.__cause__.error_type == original.error_type
+    assert error.input_count == 3 and error.failed_input_indices == (1,)
+    assert error.window_index is None and error.input_type == "document"
     assert len(error.inputs) == 1 and error.inputs[0].input_index == 1
-    assert_partition(error.inputs[0], source, client)
-    budget = error.budget
-    assert budget.calibration_id is None and budget.initial_max_input_chars is None
-    assert budget.source == "learned_reduction" and budget.budget_revision == 1
-    assert budget.effective_context_tokens == 64
-    assert budget.max_input_chars == max(
-        span.char_end - span.char_start for span in error.inputs[0].fragments
-    )
-    assert len(client.embedding_calls) == 1
-    assert client.token_calls[0][0] == "search_document: good"
-    assert client.token_calls[1][0] == "search_document: " + source
-    assert all(
-        options["add_special"] and options["parse_special"]
-        for _, options in client.token_calls
-    )
-    assert not service._operations
-    # An explicit consumer retry follows exact spans; cardinality is its choice.
-    pieces = [
-        source[span.char_start : span.char_end] for span in error.inputs[0].fragments
+    pieces = assert_halves(error.inputs[0], source)
+    assert [(row.input_index, row.embedding) for row in error.completed] == [
+        (0, tuple(vector("search_document: good"))),
+        (2, tuple(vector("search_document: also good"))),
     ]
-    count_before = len(client.token_calls)
-    assert len(service.embed_texts(["good", *pieces, "also good"])) == len(pieces) + 2
-    assert len(client.token_calls) == count_before
+    assert not hasattr(error, "budget")
+    assert error.representation_id == service.initialize().representation_id
+    assert not client.token_calls and not service.config.cache_dir.exists()
+    assert not service._operations
+    # A consumer retries the rejected source halves only; successful indexed
+    # embeddings are already available and are not calculated again.
+    before = len(client.embedding_calls)
+    assert service.embed_texts(pieces) == [
+        vector("search_document: " + piece) for piece in pieces
+    ]
+    retried = [text for _, rows in client.embedding_calls[before:] for text in rows]
+    assert retried == ["search_document: " + piece for piece in pieces]
+    assert not client.token_calls
 
 
-def test_unproven_500_preserves_same_error_and_creates_no_cache(make_service):
+def test_generic_singleton500_returns_halving_advice_without_claiming_overflow(
+    make_service,
+):
     client = remote(replicas=1, context=64)
     original = ClientHTTPError(500, error_type="server_error")
     client.failure = lambda *_: original
     service, _ = make_service(client)
-    with pytest.raises(ClientHTTPError) as caught:
+    with pytest.raises(EmbeddingChunkSplitRequiredError) as caught:
         service.embed_texts(["short"])
-    assert caught.value is original
-    assert len(client.token_calls) == 1 and len(client.embedding_calls) == 1
+    assert caught.value.__cause__.status_code == original.status_code
+    assert caught.value.__cause__.error_type == original.error_type
+    assert caught.value.original_status_code == 500
+    assert_halves(caught.value.inputs[0], "short")
+    assert len(client.embedding_calls) == 1 and not client.token_calls
     assert not service.config.cache_dir.exists()
 
 
 @pytest.mark.parametrize("status", [400, 429, 502, 503])
-def test_non500_never_diagnoses_or_persists(make_service, status):
+def test_non500_never_isolates_tokenizes_or_persists(make_service, status):
     client = remote(replicas=1, context=64)
     original = ClientHTTPError(status)
     client.failure = lambda *_: original
     service, _ = make_service(client)
     with pytest.raises(ClientHTTPError) as caught:
-        service.embed_texts(["x" * 100])
+        service.embed_texts(["x" * 100, "okay"])
     assert caught.value is original
-    assert not client.token_calls
+    assert not client.token_calls and len(client.embedding_calls) == 1
     assert not service.config.cache_dir.exists()
 
 
@@ -119,101 +138,91 @@ def test_refresh_without_any_state_never_calibrates(make_service):
     assert not client.token_calls and not service.config.cache_dir.exists()
 
 
-def test_learned_ceiling_survives_restart_and_is_task_scoped(make_service):
+def test_failed_post_does_not_create_learned_state_for_later_restarts(make_service):
     client = remote(replicas=1, context=64)
     failing_native(client)
     service, _ = make_service(client)
-    with pytest.raises(EmbeddingInputOverflowError) as caught:
-        service.embed_texts(["x" * 120])
-    snapshot = caught.value.budget
+    with pytest.raises(EmbeddingChunkSplitRequiredError):
+        service.embed_texts(["x" * 80])
     service.close()
     restarted, next_client = make_service(remote(replicas=1, context=64))
-    status = restarted.refresh_character_budget(category="code")
-    assert status.max_input_chars == snapshot.max_input_chars
-    assert status.budget.context_scope_id == snapshot.context_scope_id
-    assert status.budget.category == "code"
-    assert status.budget.budget_revision == snapshot.budget_revision
-    assert not next_client.token_calls
-    assert restarted.refresh_character_budget(input_type="query").budget is None
-    assert restarted.initialize().budget is None
+    for task in ("document", "query", "raw"):
+        status = restarted.refresh_character_budget(category="code", input_type=task)
+        assert status.max_input_chars is None and status.budget is None
+    assert not next_client.token_calls and not service.config.cache_dir.exists()
 
 
-def test_changed_tokenizer_after_count_prevents_persistence(make_service):
+def test_cancel_during_native_subbatch_isolation_drains_without_tokenization(
+    make_service,
+):
     client = remote(replicas=1, context=64)
     failing_native(client)
-    tokenize = client.tokenize
-
-    def drift(*args, **kwargs):
-        result = tokenize(*args, **kwargs)
-        client.builds["embed_0"] = "changed-build"
-        return result
-
-    client.tokenize = drift
-    service, _ = make_service(client)
-    with pytest.raises(LLMBackendError, match="identity_changed|snapshot_changed"):
-        service.embed_texts(["x" * 120])
-    assert not service.config.cache_dir.exists()
-    assert len(client.embedding_calls) == 1
-
-
-def test_cancel_during_diagnosis_drains_and_does_not_commit(make_service):
-    client = remote(replicas=1, context=64)
-    failing_native(client)
-    client.token_gate.clear()
+    child_started = block_isolation(client)
     cancel = Event()
     service, _ = make_service(client)
     with ThreadPoolExecutor(1) as executor:
-        future = executor.submit(service.embed_texts, ["x" * 120], cancel=cancel.is_set)
-        assert client.token_started.wait(2)
+        future = executor.submit(
+            service.embed_texts, ["okay", "x" * 80], cancel=cancel.is_set
+        )
+        assert child_started.wait(2)
         cancel.set()
         with pytest.raises(LLMCancelledError):
             future.result(2)
     assert client.embed_active == client.token_active == 0
     assert not service._operations and not service.config.cache_dir.exists()
+    assert not client.token_calls
 
 
-def test_diagnosis_uses_original_sync_deadline(make_service):
+def test_native_subbatch_isolation_retains_original_sync_deadline(make_service):
     client = remote(replicas=1, context=64)
     failing_native(client)
-    client.token_gate.clear()
+    child_started = block_isolation(client)
     service, _ = make_service(client)
     with pytest.raises(LLMTimeoutError):
-        service.embed_texts(["x" * 120], timeout=0.12)
+        service.embed_texts(["okay", "x" * 80], timeout=0.12)
+    assert child_started.is_set()
     assert client.token_active == client.embed_active == 0
     assert not service._operations and not service.config.cache_dir.exists()
+    assert not client.token_calls
 
 
-def test_async_overflow_keeps_window_provenance_and_own_deadline(make_service):
+def test_async_rejection_keeps_window_provenance_and_no_token_count_promise(
+    make_service,
+):
     client = remote(replicas=1, context=64)
     original = failing_native(client)
     service, _ = make_service(client)
 
     async def scenario():
         async with service.astream_texts(
-            WindowSource([["x" * 100]]), max_pending_windows=1
+            WindowSource([["x" * 80]]), max_pending_windows=1
         ) as stream:
-            with pytest.raises(EmbeddingInputOverflowError) as caught:
+            with pytest.raises(EmbeddingChunkSplitRequiredError) as caught:
                 await anext(stream)
             assert caught.value.window_index == 0
             assert caught.value.failed_input_indices == (0,)
-            assert caught.value.__cause__ is original
-            assert_partition(caught.value.inputs[0], "x" * 100, client)
+            assert caught.value.__cause__.status_code == original.status_code
+            assert caught.value.__cause__.error_type == original.error_type
+            assert_halves(caught.value.inputs[0], "x" * 80)
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream)
         await service.aclose()
 
     run(scenario)
     assert not service._operations and not service._streams
+    assert not client.token_calls
 
 
-def test_async_task_cancel_interrupts_offloop_diagnosis_and_drains(make_service):
+def test_async_task_cancel_interrupts_native_isolation_and_drains(make_service):
     client = remote(replicas=1, context=64)
     failing_native(client)
-    client.token_gate.clear()
+    child_started = block_isolation(client)
     service, _ = make_service(client)
 
     async def scenario():
-        stream = service.astream_texts(WindowSource([["x" * 120]]))
+        stream = service.astream_texts(WindowSource([["okay", "x" * 80]]))
         waiter = asyncio.create_task(anext(stream))
-        await wait_thread(client.token_started)
+        await wait_thread(child_started)
         waiter.cancel()
         with pytest.raises(asyncio.CancelledError):
             await waiter
@@ -223,69 +232,64 @@ def test_async_task_cancel_interrupts_offloop_diagnosis_and_drains(make_service)
     run(scenario)
     assert client.token_active == client.embed_active == 0
     assert not service._operations and not service._streams
-    assert not service.config.cache_dir.exists()
+    assert not service.config.cache_dir.exists() and not client.token_calls
 
 
-def test_incomplete_partition_preserves_original500_without_persist(make_service):
+@pytest.mark.parametrize("text", ["", "x", "🙂"])
+def test_source_without_two_nonempty_halves_preserves_original500(make_service, text):
     client = remote(replicas=1, context=8)
     original = failing_native(client)
     service, _ = make_service(client)
-    # The task prefix alone exceeds this loaded context: no nonempty source
-    # fragment can be proven to fit, so advice must never be fabricated.
     with pytest.raises(ClientHTTPError) as caught:
-        service.embed_texts(["xx"])
+        service.embed_texts([text])
     assert caught.value is original
-    assert not service.config.cache_dir.exists()
+    assert not service.config.cache_dir.exists() and not client.token_calls
 
 
-def test_consumer_source_prefix_is_not_stripped_twice(make_service):
+def test_source_containing_task_prefix_is_halved_without_stripping_source(
+    make_service,
+):
     client = remote(replicas=1, context=64)
     failing_native(client)
     service, _ = make_service(client)
-    text = "search_document: " + "x" * 100
-    with pytest.raises(EmbeddingInputOverflowError) as caught:
-        service.embed_texts([text])
-    assert_partition(caught.value.inputs[0], text, client)
-    assert client.token_calls[0][0] == "search_document: " + text
+    source = "search_document: " + "x" * 80
+    with pytest.raises(EmbeddingChunkSplitRequiredError) as caught:
+        service.embed_texts([source])
+    assert_halves(caught.value.inputs[0], source)
+    assert client.embedding_calls[0][1] == ("search_document: " + source,)
+    assert not client.token_calls
 
 
-def test_initial_factor_is_not_applied_again_to_exact_learned_ceiling(
+def test_calibrated_mean_and_factors_remain_fixed_after_native_rejection(
     make_service, calibration
 ):
     client = remote(replicas=1, context=64)
     service, _ = make_service(client)
     initial = service.character_budget()
     assert initial.max_input_chars == int(64 * 4 * 0.9)
-    failing_native(client)
-    with pytest.raises(EmbeddingInputOverflowError) as caught:
-        service.embed_texts(["x" * 120])
-    error = caught.value
-    measured_maximum = max(
-        span.char_end - span.char_start for span in error.inputs[0].fragments
-    )
-    assert error.budget.max_input_chars == measured_maximum
-    assert error.budget.initial_max_input_chars == initial.max_input_chars
-    assert error.budget.calibration_id == initial.calibration_id
     before = len(client.token_calls)
-    warm = service.refresh_character_budget(category="code")
-    assert warm.max_input_chars == measured_maximum
-    assert warm.budget.budget_revision == error.budget.budget_revision
+    failing_native(client)
+    with pytest.raises(EmbeddingChunkSplitRequiredError):
+        service.embed_texts(["x" * 120])
+    mixed = service.refresh_character_budget()
+    code = service.refresh_character_budget(category="code")
+    assert mixed == initial
+    assert code.max_input_chars == int(64 * 4 * 0.8)
+    assert code.budget.budget_revision == mixed.budget.budget_revision == 0
+    assert code.budget.source == mixed.budget.source == "calibrated_mean"
     assert len(client.token_calls) == before and len(calibration) == 1
+    assert not service.config.cache_dir.exists()
 
 
-def test_already_lower_initial_recommendation_still_returns_strict_partition(
-    make_service, calibration, monkeypatch
-):
-    from runtime_llama.embedding_calibration import CalibrationProfile
-
-    monkeypatch.setattr(CalibrationProfile, "max_input_chars", lambda *_: 20)
+def test_existing_lower_recommendation_is_not_reduced_again(make_service, calibration):
     client = remote(replicas=1, context=64)
     service, _ = make_service(client)
     initial = service.character_budget()
     failing_native(client)
-    with pytest.raises(EmbeddingInputOverflowError) as caught:
-        service.embed_texts(["x" * 120])
-    error = caught.value
-    assert error.budget.max_input_chars == initial.max_input_chars == 20
-    assert len(error.inputs[0].fragments) >= 2
-    assert_partition(error.inputs[0], "x" * 120, client)
+    source = "x" * 120
+    with pytest.raises(EmbeddingChunkSplitRequiredError) as caught:
+        service.embed_texts([source])
+    pieces = assert_halves(caught.value.inputs[0], source)
+    assert service.refresh_character_budget() == initial
+    # Advice is a midpoint split, not a claim that each half fits the server.
+    assert all(len("search_document: " + piece) + 1 > 64 for piece in pieces)

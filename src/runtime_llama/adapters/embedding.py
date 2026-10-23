@@ -40,7 +40,7 @@ from runtime_llama.embedding_preparation import (
     valid_preparation,
 )
 from runtime_llama.embedding_preparation_cache import PreparationCache, PreparationKey
-from runtime_llama.embedding_recovery import _FailedDirectPost, _FailedPostRow
+from runtime_llama.embedding_halving import _RejectedEmbedding, _rejected_embedding
 from runtime_llama.embedding_stream import (
     EmbeddingWindowStream,
     _EmbeddingWindowBridge,
@@ -374,6 +374,14 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         self.embedding_max_response_bytes = getattr(
             profile, "embedding_max_response_bytes", 8 * 1024 * 1024
         )
+        self.embedding_isolation_max_requests = _positive_int(
+            getattr(profile, "embedding_isolation_max_requests", 512),
+            "embedding_isolation_max_requests",
+        )
+        if self.embedding_isolation_max_requests is None:
+            raise ValueError(
+                "embedding_isolation_max_requests must be a positive integer"
+            )
         if (
             _positive_int(
                 self.embedding_max_response_bytes, "embedding_max_response_bytes"
@@ -1221,7 +1229,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         observation: _Observation | None = None,
         records: Sequence[_CountedInput] | None = None,
         wire_input: list | None = None,
-    ) -> list[list[float]]:
+    ) -> list[list[float] | _RejectedEmbedding]:
         # Recovery shares one pending set. A fresh observation is authoritative
         # for every unsent record, while historical limits remain record-local.
         pending = set(range(len(texts)))
@@ -1232,7 +1240,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         def live(index):
             return not owners or owners[index].failure is None
 
-        def send(indices, recovering, observed=None):
+        def send(indices, recovering, observed=None, isolation=None):
             nonlocal admitted
             current_timeout = timeout
             http_limit = None
@@ -1308,14 +1316,32 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                                 tokens += count
                                 child_limit = limit
                                 end += 1
-                            send(indices[cursor:end], True)
+                            send(indices[cursor:end], True, isolation=isolation)
                             cursor = end
                         return
             if cancel is not None and cancel():
                 raise LLMCancelledError()
             with replica.lock:
                 generation = replica.generation
+            post_call = (
+                _BatchCall(owners[index] for index in indices)
+                if isolation is not None and owners
+                else call
+            )
+            post_cancel = cancel
             try:
+                if post_call is not call:
+                    # A descendant may contain only one of a shared POST's
+                    # owners. Drain it when those participants withdraw,
+                    # without waiting for owners of later sibling subsets.
+                    current_timeout = post_call.remaining()
+                    post_cancel = post_call.probe
+                if isolation is not None:
+                    if isolation[0] >= self.embedding_isolation_max_requests:
+                        raise LLMBackendError(
+                            "llamacpp_embedding_isolation_request_limit"
+                        ) from isolation[1]
+                    isolation[0] += 1
                 payload = self._client.embeddings(
                     [wire_input[index] for index in indices]
                     if wire_input is not None
@@ -1329,37 +1355,66 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                     ),
                     model=replica.model,
                     timeout=current_timeout,
-                    cancel=cancel,
+                    cancel=post_cancel,
                     cancel_wait=True,
                     **self._engine_response_options(),
                 )
+            except (LLMCancelledError, LLMTimeoutError):
+                if post_call is not call and not post_call._live():
+                    pending.difference_update(indices)
+                    call.check()
+                    return
+                raise
             except ClientHTTPError as exc:
-                if (
-                    exc.status_code == 500
-                    and records is not None
-                    and owners
-                    and isinstance(call, _BatchCall)
-                    and len(call._record_input_indices) == len(records)
-                ):
-                    failed_rows = tuple(
-                        _FailedPostRow(
-                            owner=owners[index],
-                            input_index=call._record_input_indices[index],
-                            text=records[index].text[
-                                len(records[index]._direct_policy.prefix) :
-                            ],
-                            input_type=records[index].input_type,
-                            prefix=records[index]._direct_policy.prefix,
-                        )
+                if exc.status_code == 500 and records is not None:
+                    direct = tuple(
+                        index
                         for index in indices
                         if live(index) and isinstance(records[index], _DirectInput)
                     )
-                    if failed_rows:
-                        # Preserve only actual rows of this failed POST. No
-                        # diagnostic tokenization or replay occurs on a worker.
-                        raise _FailedDirectPost(
-                            exc, replica.model, observed, failed_rows
-                        ) from None
+                    if direct:
+                        direct_set = set(direct)
+                        exact = tuple(
+                            index for index in indices if index not in direct_set
+                        )
+                        if exact:
+                            if not owners:
+                                # Unowned mixed internal calls cannot safely
+                                # retire only the exact participant.
+                                raise
+                            for index in exact:
+                                owners[index].fail(exc)
+                        direct = tuple(index for index in direct if live(index))
+                        if not direct:
+                            return
+                        if len(indices) == len(direct) == 1:
+                            index = direct[0]
+                            record = records[index]
+                            rejection = _rejected_embedding(
+                                record.text[len(record._direct_policy.prefix) :],
+                                record.input_type,
+                                exc,
+                            )
+                            if rejection.char_count < 2:
+                                if not owners:
+                                    raise
+                                owners[index].fail(exc)
+                            else:
+                                results[index] = rejection
+                            pending.discard(index)
+                            return
+                        # Only failed native POSTs are bisected. Successful
+                        # descendants keep their vectors; no tokenization,
+                        # character-budget update or replay of exact rows.
+                        budget = [0, exc] if isolation is None else isolation
+                        if exact:
+                            send(direct, True, isolation=budget)
+                            return
+                        midpoint = max(1, len(direct) // 2)
+                        send(direct[:midpoint], True, isolation=budget)
+                        if midpoint < len(direct):
+                            send(direct[midpoint:], True, isolation=budget)
+                        return
                 if records is not None and any(
                     isinstance(records[index], _DirectInput) for index in indices
                 ):
@@ -1565,7 +1620,9 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             records=records,
             wire_input=wire,
         )
-        call.validate_dimensions(vectors)
+        call.validate_dimensions(
+            [vector for vector in vectors if not isinstance(vector, _RejectedEmbedding)]
+        )
         return vectors
 
     @staticmethod
@@ -1614,7 +1671,8 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             raise LLMBackendError("llamacpp_embedding_count_or_response_mismatch")
         by_owner = {}
         for (_, _, call), vector in zip(sent, vectors):
-            by_owner.setdefault(call, []).append(vector)
+            if not isinstance(vector, _RejectedEmbedding):
+                by_owner.setdefault(call, []).append(vector)
         for call, owner_vectors in by_owner.items():
             if call.failure is not None:
                 continue

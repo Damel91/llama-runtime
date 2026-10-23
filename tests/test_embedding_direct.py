@@ -15,7 +15,7 @@ from runtime_llama.adapters.embedding import (
     _DirectInput,
 )
 from runtime_llama.client import ClientHTTPError
-from runtime_llama.embedding_recovery import _FailedOwnerPost
+from runtime_llama.embedding_halving import _HalvingResult
 from runtime_llama.errors import LLMBackendError, LLMCancelledError, LLMTimeoutError
 
 from test_embedding_async_stream import WindowSource, assert_drained, run, wait_thread
@@ -321,21 +321,34 @@ def test_reservation_cannot_be_issued_as_exact_public_preparation(make_adapter):
     ("status", "error_type"),
     [(400, "exceed_context_size_error"), (500, "server_error")],
 )
-def test_native_rejection_is_typed_without_retry_or_truncation(
+def test_native_rejection_retains_typed_direct_outcome_without_tokenization(
     make_adapter, status, error_type
 ):
     adapter, client = make_adapter(ContractClient(1))
     error = ClientHTTPError(status, error_type=error_type)
     client.failure = lambda *_: error
-    expected = _FailedOwnerPost if status == 500 else ClientHTTPError
-    with pytest.raises(expected) as raised:
-        adapter._embed_texts_direct(["one", "two"], policy=policy(adapter))
     if status == 500:
-        assert raised.value.original is error
-        assert [row.input_index for row in raised.value.rows] == [0, 1]
+        result = adapter._embed_texts_direct(["one", "two"], policy=policy(adapter))
+        assert isinstance(result, _HalvingResult)
+        assert result.outputs == (None, None)
+        assert tuple(result.rejections) == (0, 1)
+        assert all(
+            marker.original is not error
+            and marker.original.status_code == status
+            and marker.original.error_type == error_type
+            and marker.original.__traceback__ is None
+            for marker in result.rejections.values()
+        )
+        assert client.embedding_calls == [
+            ("embed_0", ("one", "two")),
+            ("embed_0", ("one",)),
+            ("embed_0", ("two",)),
+        ]
     else:
+        with pytest.raises(ClientHTTPError) as raised:
+            adapter._embed_texts_direct(["one", "two"], policy=policy(adapter))
         assert raised.value is error
-    assert client.embedding_calls == [("embed_0", ("one", "two"))]
+        assert client.embedding_calls == [("embed_0", ("one", "two"))]
     assert not client.token_calls
     assert_drained(adapter, client)
 

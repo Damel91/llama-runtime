@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
+from fractions import Fraction
 import hashlib
 import importlib.util
 import json
@@ -84,10 +85,10 @@ def fake_tokens(text):
 
 def test_packaged_corpus_is_complete_unique_varied_and_reproducible(tmp_path):
     manifest, records = module._load_corpus(check)
-    assert len(records) == len({record.text for record in records}) == 10000
+    assert len(records) == len({record.text for record in records}) == 2500
     assert {record.category for record in records} == set(CALIBRATION_CATEGORIES)
     assert all(
-        sum(record.category == category for record in records) == 2000
+        sum(record.category == category for record in records) == 500
         for category in CALIBRATION_CATEGORIES
     )
     for category in CALIBRATION_CATEGORIES:
@@ -114,7 +115,71 @@ def test_packaged_corpus_is_complete_unique_varied_and_reproducible(tmp_path):
         assert (tmp_path / name).read_bytes() == (shipped / name).read_bytes()
 
 
-def test_full_first_use_calls_exactly_ten_thousand_then_warm_start_calls_none(tmp_path):
+def _generator():
+    path = Path(__file__).resolve().parents[1] / "tools/generate_calibration_corpus.py"
+    specification = importlib.util.spec_from_file_location(
+        "hard_corpus_generator", path
+    )
+    generator = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(generator)
+    return generator
+
+
+def test_selected_corpus_is_exactly_the_worst_five_hundred_in_every_category():
+    generator = _generator()
+    receipt_bytes = generator.SELECTION_RECEIPT.read_bytes()
+    receipt = json.loads(receipt_bytes)
+    originals = generator.original_records()
+    selected = generator.select_hardest(originals, receipt)
+    measurements = {row["id"]: row for row in receipt["measurements"]}
+    assert len(measurements) == 10000
+    assert sum(len(rows) for rows in selected.values()) == 2500
+    for category in CALIBRATION_CATEGORIES:
+        ranked = sorted(
+            (row for row in measurements.values() if row["category"] == category),
+            key=lambda row: (
+                Fraction(row["source_characters"], row["tokens"]),
+                row["id"],
+            ),
+        )
+        assert receipt["selected"][category] == [row["id"] for row in ranked[:500]]
+        assert [record["text"] for record in selected[category]] == [
+            originals[category][int(row["id"].split("-")[1]) - 1]["text"]
+            for row in ranked[:500]
+        ]
+    manifest, _ = module._load_corpus(check)
+    assert manifest["schema"] == "runtime-llama-calibration-corpus-v2"
+    assert manifest["corpus_sha256"] != generator.SOURCE_CORPUS_SHA256
+    assert (
+        manifest["selection"]["receipt_sha256"]
+        == hashlib.sha256(receipt_bytes).hexdigest()
+    )
+    assert manifest["selection"]["measurement_binding"] == receipt["binding"]
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        lambda receipt: receipt["measurements"].pop(),
+        lambda receipt: receipt["measurements"][0].update(tokens=True),
+        lambda receipt: receipt["measurements"][0].update(text_sha256="a" * 64),
+        lambda receipt: receipt["selected"]["code"].reverse(),
+        lambda receipt: receipt.update(source_corpus_sha256="b" * 64),
+    ],
+)
+def test_offline_hard_selection_rejects_missing_counts_tampering_and_wrong_ranks(
+    damage,
+):
+    generator = _generator()
+    receipt = json.loads(generator.SELECTION_RECEIPT.read_bytes())
+    damage(receipt)
+    with pytest.raises(ValueError):
+        generator.select_hardest(generator.original_records(), receipt)
+
+
+def test_full_first_use_calls_exactly_twenty_five_hundred_then_warm_start_calls_none(
+    tmp_path,
+):
     count, lock = 0, Lock()
 
     def tokenize(text):
@@ -124,7 +189,7 @@ def test_full_first_use_calls_exactly_ten_thousand_then_warm_start_calls_none(tm
         return fake_tokens(text)
 
     first = load_or_calibrate(tmp_path, binding(), tokenize, check)
-    assert count == first.stats_for().sample_count == 10000
+    assert count == first.stats_for().sample_count == 2500
     second = load_or_calibrate(
         tmp_path, binding(), lambda text: pytest.fail("warm cache tokenized"), check
     )
@@ -155,9 +220,8 @@ def test_source_characters_and_full_native_token_count_are_not_double_adjusted(
         sum(len(record.text) / fake_tokens(record.text) for record in records)
         / len(records)
     )
-    minimum = min(len(record.text) / fake_tokens(record.text) for record in records)
-    assert profile.safe_chars_per_token() == minimum * 0.90
-    assert profile.max_input_chars(512) == math.floor(512 * minimum * 0.90)
+    assert profile.safe_chars_per_token() == weighted * 0.90
+    assert profile.max_input_chars(512) == math.floor(512 * weighted * 0.90)
     assert CATEGORY_SAFETY_FACTOR == 0.80
     assert MIXED_SAFETY_FACTOR == 0.90
     assert profile.corpus_sha256 == manifest["corpus_sha256"]
@@ -168,9 +232,11 @@ def test_source_characters_and_full_native_token_count_are_not_double_adjusted(
         assert statistics.chars_per_token == sum(
             len(row.text) for row in selected
         ) / sum(fake_tokens(row.text) for row in selected)
-        assert profile.safe_chars_per_token(category) == minimum * 0.80
+        assert (
+            profile.safe_chars_per_token(category) == statistics.chars_per_token * 0.80
+        )
         assert profile.max_input_chars(512, category) == math.floor(
-            512 * minimum * 0.80
+            512 * statistics.chars_per_token * 0.80
         )
     assert mixed.chars_per_token != pytest.approx(mixed.arithmetic_mean_chars_per_token)
 
@@ -251,10 +317,10 @@ def test_safety_policy_changes_reuse_raw_cached_measurements(
     assert warm == first
     assert warm.max_input_chars(512) > first_mixed_budget
     assert warm.max_input_chars(512, "code") < first_code_budget
-    assert warm.safe_chars_per_token() == warm.stats_for().min_chars_per_token * 0.95
+    assert warm.safe_chars_per_token() == warm.stats_for().chars_per_token * 0.95
     assert (
         warm.safe_chars_per_token("code")
-        == warm.stats_for("mixed").min_chars_per_token * 0.70
+        == warm.stats_for("code").chars_per_token * 0.70
     )
     assert (tmp_path / (warm.profile_id + ".json")).read_bytes() == cached_bytes
     assert b"SAFETY" not in cached_bytes and b"safety_factor" not in cached_bytes
@@ -535,7 +601,7 @@ def test_modified_shipped_corpus_is_rejected_before_remote_calls(
                 manifest = json.loads(payload)
                 manifest["categories"]["code"]["file"] = "../outside.jsonl"
                 return json.dumps(manifest).encode()
-            return payload.replace(b"normalize", b"altered__", 1)
+            return b"!" + payload[1:]
         return payload
 
     monkeypatch.setattr(module, "_read_bounded", tamper)
@@ -828,12 +894,10 @@ def test_mixed_mean_character_recommendation_does_not_guarantee_code_category_fi
     assert historical_code_budget == 1127 and historical_mixed_budget == 1509
     assert historical_mixed_budget / code_ratio == pytest.approx(548.3318613326799)
     assert historical_mixed_budget / code_ratio > 512
-    # New initial budgets use the minimum across all categories, not their
-    # means or a selected category's less conservative local minimum.
-    assert profile.max_input_chars(512, "code") == 496
-    assert profile.max_input_chars(512, "mixed") == 558
-    for category in ("code", "mixed"):
-        assert profile.max_input_chars(512, category) / code_ratio < 512
+    # Each selected category now uses its own mean. The mixed recommendation
+    # remains an empirical aggregate, not exact admission for every category.
+    assert profile.max_input_chars(512, "code") == historical_code_budget
+    assert profile.max_input_chars(512, "mixed") == historical_mixed_budget
     assert CATEGORY_SAFETY_FACTOR == 0.80 and MIXED_SAFETY_FACTOR == 0.90
 
 

@@ -33,11 +33,11 @@ from runtime_llama.errors import LLMBackendError, LLMTimeoutError
 _STATE_SCHEMA = "runtime-llama-learned-character-budget-v1"
 _POLICY = {
     "schema": _STATE_SCHEMA,
-    "basis": "minimum-source-characters-per-fully-prepared-token-across-all-10000",
+    "basis": "weighted-mean-source-characters-per-fully-prepared-token-selected-hard-2500",
     "character_unit": "unicode-code-points",
     "category_factor": CATEGORY_SAFETY_FACTOR,
     "mixed_factor": MIXED_SAFETY_FACTOR,
-    "learned_limit": "absolute-characters-without-percentage-reapplication",
+    "learned_limit": "fixed-initial-recommendation-no-inference-updates",
     "context_scope": "exact-effective-input-token-limit",
 }
 EMBEDDING_BUDGET_POLICY_ID = hashlib.sha256(_canonical(_POLICY)).hexdigest()

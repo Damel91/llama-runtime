@@ -36,6 +36,12 @@ from runtime_llama.embedding_recovery import (
     EmbeddingOverflowInput,
     EmbeddingInputOverflowError,
 )
+from runtime_llama.embedding_halving import (
+    EmbeddingSourceSpan,
+    EmbeddingHalvingInput,
+    EmbeddingCompletedInput,
+    EmbeddingChunkSplitRequiredError,
+)
 from runtime_llama.diagnostics import ThinkingDiagnostic, ThinkingDiagnosticsConfig
 from runtime_llama.errors import (
     LLMBackendError,
@@ -77,9 +83,13 @@ from runtime_llama.adapters.embedding import LlamaCppEmbeddingAdapter
 from runtime_llama.factory import build_adapter, build_embedding_adapter
 from runtime_llama.tailnet import TailnetConfig, TailnetError, TailnetHelper
 
-__version__ = "0.12.0a1"
+__version__ = "0.13.0a1"
 
 __all__ = [
+    "EmbeddingSourceSpan",
+    "EmbeddingHalvingInput",
+    "EmbeddingCompletedInput",
+    "EmbeddingChunkSplitRequiredError",
     "EmbeddingBudgetSnapshot",
     "EmbeddingVerifiedSpan",
     "EmbeddingOverflowInput",

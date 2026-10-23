@@ -15,6 +15,7 @@ import time
 from typing import Any
 
 from runtime_llama.errors import LLMBackendError
+from runtime_llama.embedding_halving import _HalvingResult, _RejectedEmbedding
 from runtime_llama.embedding_recovery import _FailedDirectPost, _FailedOwnerPost
 
 
@@ -186,6 +187,8 @@ class _State:
     failure_handled: bool = False
     result_credit: int = 0
     plan_rotation: int = 0
+    rejections: dict[int, _RejectedEmbedding] = field(default_factory=dict)
+    rejection_slots: int = 0
 
 
 class PersistentEmbeddingEngine:
@@ -554,6 +557,11 @@ class PersistentEmbeddingEngine:
                     )
                 self._fail(owner, failure)
             return
+        for index, value in indexed.items():
+            if isinstance(value, _RejectedEmbedding):
+                entry = batch.entries[index]
+                if entry.plan.state.call.failure is None:
+                    entry.plan.state.rejection_slots += 1
         destinations = {owner: [] for owner in batch.owners}
         vectors = {owner: [] for owner in batch.owners}
         for index, entry in enumerate(batch.entries):
@@ -572,9 +580,21 @@ class PersistentEmbeddingEngine:
             if owner.call.failure is not None:
                 continue
             result = vectors[owner]
-            if result and self._vector_dim is None:
-                self._vector_dim = len(result[0])
-            if owner.retain_result and not owner.result_credit:
+            if self._vector_dim is None:
+                first = next(
+                    (
+                        value
+                        for value in result
+                        if not isinstance(value, _RejectedEmbedding)
+                    ),
+                    None,
+                )
+                if first is not None:
+                    self._vector_dim = len(first)
+            if owner.retain_result:
+                # A newly isolated rejection adds metadata credits even when
+                # this owner already reserved its vector window. Transfer the
+                # bounded HTTP handoff only after the next reservation pass.
                 self._http_publications.append((owner, destinations[owner], result))
             else:
                 self._publish_http_result(owner, destinations[owner], result)
@@ -664,6 +684,13 @@ class PersistentEmbeddingEngine:
                 ):
                     break
                 if (
+                    plan.state.retain_result
+                    and self._vector_dim is None
+                    and not plan.seeded
+                    and self._unknown_seeds >= self.parallelism
+                ):
+                    break
+                if (
                     self._bytes + publication.byte_cost > self.max_bytes
                     or self._tokens + record.token_count > self.max_tokens
                 ):
@@ -682,6 +709,13 @@ class PersistentEmbeddingEngine:
                     queue = lane[plan.state] = _ReadyQueue()
                 plan.state.ready[plan.model] = queue
                 queue.append(entry)
+                if (
+                    plan.state.retain_result
+                    and self._vector_dim is None
+                    and not plan.seeded
+                ):
+                    plan.seeded = True
+                    self._unknown_seeds += 1
                 plan.seed_published = True
                 self._bytes += entry.byte_cost
                 self._tokens += record.token_count
@@ -1186,13 +1220,27 @@ class PersistentEmbeddingEngine:
     def _complete(self, state):
         failure = state.call.failure
         try:
-            result = (
-                None
-                if failure is not None
-                else self.adapter._engine_result(
+            if failure is not None:
+                result = None
+            elif state.rejections:
+                # Rejected occurrences are complete queue work, not an owner
+                # failure. Keep all successful vectors and finish the remaining
+                # plans before transferring an ordered partial result.
+                self.adapter._engine_result(
+                    state.call,
+                    state.operation,
+                    [vector for vector in state.outputs if vector is not None],
+                )
+                result = _HalvingResult(
+                    tuple(state.outputs),
+                    dict(state.rejections),
+                    getattr(state.call, "_window_index", None),
+                    state.call.deadline,
+                )
+            else:
+                result = self.adapter._engine_result(
                     state.call, state.operation, state.outputs
                 )
-            )
         finally:
             self.adapter._engine_finish(
                 state.call, state.context.joined if state.context else False
@@ -1201,13 +1249,22 @@ class PersistentEmbeddingEngine:
 
     @staticmethod
     def _output_bytes(outputs):
+        if isinstance(outputs, _HalvingResult):
+            return (
+                64
+                + sum(
+                    96 + (40 * len(vector) if vector is not None else 0)
+                    for vector in outputs.outputs
+                )
+                + 640 * len(outputs.rejections)
+            )
         return 64 + sum(96 + 40 * len(vector) for vector in outputs)
 
     def _reserve_result(self, state):
         if not state.retain_result:
             return True
         dimension = self._vector_dim
-        if dimension is None and state.inputs:
+        if dimension is None and state.inputs and not state.rejection_slots:
             # The shared scheduler bounds all first HTTPs by P, also when one
             # owner is using several replicas. Their bounded responses may
             # discover dimension concurrently.
@@ -1215,7 +1272,10 @@ class PersistentEmbeddingEngine:
             # result credits; it is not an unaccounted retained public result.
             return True
         wanted = (
-            64 if not state.inputs else 64 + len(state.inputs) * (96 + 40 * dimension)
+            64
+            + 96 * len(state.inputs)
+            + 40 * (dimension or 0) * (len(state.inputs) - state.rejection_slots)
+            + 640 * state.rejection_slots
         )
         if wanted > self.max_bytes:
             self._fail(state, self._resource("result_bytes"))
@@ -1232,10 +1292,18 @@ class PersistentEmbeddingEngine:
         )
         return True
 
-    @staticmethod
-    def _publish_http_result(state, destinations, vectors):
+    def _publish_http_result(self, state, destinations, vectors):
         for (plan, index), vector in zip(destinations, vectors):
-            state.outputs[index] = vector
+            if isinstance(vector, _RejectedEmbedding):
+                state.rejections[index] = vector
+                # An unknown-dimension stream normally discovers its vector
+                # size from one seed per plan. A rejected seed has no vector;
+                # retire that seed so the next occurrence can discover it.
+                if self._vector_dim is None and plan.seeded and not plan.http_active:
+                    plan.seeded = plan.seed_published = False
+                    self._unknown_seeds -= 1
+            else:
+                state.outputs[index] = vector
             plan.finished += 1
 
     def _publish_http(self):

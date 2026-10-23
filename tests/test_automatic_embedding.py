@@ -735,14 +735,14 @@ def test_explicit_full_corpus_calibration_then_cached_categories_and_consumer_re
     assert service.initialize().available and not client.token_calls
     budget = service.character_budget()
     assert budget.available and budget.max_input_chars > 0
-    assert len(client.token_calls) == 10000
+    assert len(client.token_calls) == 2500
     assert all(text.startswith("search_document: ") for text, _ in client.token_calls)
     assert {options["model"] for _, options in client.token_calls} == {
         "embed_0",
         "embed_1",
     }
     code = service.character_budget(category="code")
-    assert len(client.token_calls) == 10000
+    assert len(client.token_calls) == 2500
     assert code.calibration_id == budget.calibration_id
     assert service.status().max_input_chars is None
     persisted = json.loads(

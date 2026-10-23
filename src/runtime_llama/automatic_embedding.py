@@ -42,14 +42,14 @@ from runtime_llama.embedding_calibration import (
 from runtime_llama.embedding_budget import (
     EMBEDDING_BUDGET_POLICY_ID,
     budget_context_scope_id,
-    load_learned_budget,
-    lower_learned_budget,
 )
 from runtime_llama.embedding_recovery import (
     EmbeddingBudgetSnapshot,
-    EmbeddingInputOverflowError,
-    _FailedOwnerPost,
-    diagnose_overflow_inputs,
+)
+from runtime_llama.embedding_halving import (
+    EmbeddingChunkSplitRequiredError,
+    _HalvingResult,
+    _halving_error,
 )
 from runtime_llama.embedding_stream import _drain
 from runtime_llama.errors import (
@@ -127,6 +127,7 @@ class AutomaticEmbeddingConfig:
     embedding_max_pending_tokens: int = 1024 * 1024
     embedding_max_request_bytes: int = 8 * 1024 * 1024
     embedding_max_response_bytes: int = 8 * 1024 * 1024
+    embedding_isolation_max_requests: int = 512
     http_connection_policy: str = "close"
 
     def __post_init__(self):
@@ -163,6 +164,7 @@ class AutomaticEmbeddingConfig:
             "embedding_max_pending_tokens",
             "embedding_max_request_bytes",
             "embedding_max_response_bytes",
+            "embedding_isolation_max_requests",
         ):
             if _positive_int(getattr(self, name), name) is None:
                 raise ValueError(f"{name} must be a positive integer")
@@ -435,6 +437,7 @@ class AutomaticEmbeddingService:
                 "embedding_max_pending_tokens": self.config.embedding_max_pending_tokens,
                 "embedding_max_request_bytes": self.config.embedding_max_request_bytes,
                 "embedding_max_response_bytes": self.config.embedding_max_response_bytes,
+                "embedding_isolation_max_requests": self.config.embedding_isolation_max_requests,
             },
         )
         with self._condition:
@@ -603,9 +606,7 @@ class AutomaticEmbeddingService:
                     self._profiles[key] = profile
         return profile
 
-    def _budget_snapshot(
-        self, binding, context_tokens, category, profile, operation, *, learned=None
-    ):
+    def _budget_snapshot(self, binding, context_tokens, category, profile, operation):
         operation.check()
         initial = (
             None
@@ -616,20 +617,7 @@ class AutomaticEmbeddingService:
             raise LLMBackendError(
                 "llamacpp_automatic_embedding_character_budget_unavailable"
             )
-        if learned is None:
-            learned = load_learned_budget(
-                self.config.cache_dir or _default_cache_dir(),
-                binding,
-                context_tokens,
-                operation.check,
-            )
         maximum = initial
-        if learned is not None:
-            maximum = (
-                learned.max_input_chars
-                if maximum is None
-                else min(maximum, learned.max_input_chars)
-            )
         if maximum is None:
             return None
         return EmbeddingBudgetSnapshot(
@@ -641,145 +629,10 @@ class AutomaticEmbeddingService:
             calibration_id=None if profile is None else profile.profile_id,
             max_input_chars=maximum,
             initial_max_input_chars=initial,
-            budget_revision=0 if learned is None else learned.budget_revision,
+            budget_revision=0,
             effective_context_tokens=context_tokens,
-            source=(
-                "learned_reduction"
-                if learned is not None and (initial is None or maximum < initial)
-                else "calibrated_minimum"
-            ),
+            source="calibrated_mean",
         )
-
-    def _refresh_observation(self, adapter, context, input_type, metadata_call):
-        metadata = metadata_call()
-        catalog = adapter._engine_catalog_shared((metadata,))
-        observations = {
-            model: adapter._engine_observe(model, metadata, catalog=catalog)
-            for model in context.observations
-        }
-        fresh = type(context)(context.joined, observations, context.conservative)
-        binding, budget = self._binding(adapter, fresh, input_type)
-        return binding, budget, observations
-
-    def _recover_failed_post(self, failure, operation, *, input_type):
-        """Diagnose drained failed rows, without replay or cardinality changes."""
-        operation.check()
-        with self._observed(operation, input_type=input_type) as observed:
-            adapter, call, context, binding, context_budget, metadata_call = observed
-            previous = failure.observation
-            current = context.observations.get(failure.model)
-            if (
-                current is None
-                or previous.identity_key != current.identity_key
-                or previous.tokenizer_build != current.tokenizer_build
-                or previous.context_token_limit != current.context_token_limit
-                or previous.native_microbatch_tokens != current.native_microbatch_tokens
-                or any(
-                    row.input_type != input_type or row.prefix != binding["prefix"]
-                    for row in failure.rows
-                )
-            ):
-                raise LLMBackendError(
-                    "llamacpp_automatic_embedding_recovery_snapshot_changed"
-                ) from failure.original
-            if not failure.rows or current.context_token_limit is None:
-                raise failure.original
-            # Context overflow is a proven rejection. A computation microbatch
-            # alone is not: some native pooling modes can split it internally.
-            # Still keep proposed fragments within the conservative native
-            # limit used by this service's ordinary reservations.
-            # A consumer retry can be scheduled on any verified pool member.
-            # Its fragments must fit the common effective limit, not just the
-            # alias whose POST happened to fail.
-            token_limit = context_budget
-
-            def count_tokens(source):
-                operation.check()
-                token_call = _Call(
-                    adapter,
-                    operation.probe,
-                    min(self.config.timeout, operation.remaining()),
-                )
-                try:
-                    tokens = adapter._tokenize_input(
-                        binding["prefix"] + source,
-                        adapter._replicas[failure.model],
-                        token_call,
-                    )
-                except LLMCancelledError:
-                    operation.check()
-                    raise
-                operation.check()
-                return len(tokens)
-
-            try:
-                diagnosis = diagnose_overflow_inputs(
-                    [(row.input_index, row.text) for row in failure.rows],
-                    token_limit=token_limit,
-                    count_tokens=count_tokens,
-                    check=operation.check,
-                )
-            except (LLMCancelledError, LLMTimeoutError, _ReentrantCloseError):
-                raise
-            except LLMBackendError:
-                # Failed diagnostic transport or malformed tokenizer data is
-                # not overflow proof and must not replace the inference 500.
-                # A concurrent owner shutdown/cancellation retains priority.
-                operation.check()
-                raise failure.original from None
-            if (
-                not diagnosis.complete
-                or not diagnosis.inputs
-                or not any(
-                    item.token_count > current.context_token_limit
-                    for item in diagnosis.inputs
-                )
-            ):
-                raise failure.original
-            fresh_binding, fresh_budget, fresh_observations = self._refresh_observation(
-                adapter, context, input_type, metadata_call
-            )
-            fresh_model = fresh_observations.get(failure.model)
-            if (
-                fresh_binding != binding
-                or fresh_budget != context_budget
-                or fresh_model is None
-                or fresh_model.context_token_limit != current.context_token_limit
-                or fresh_model.native_microbatch_tokens
-                != current.native_microbatch_tokens
-            ):
-                raise LLMBackendError(
-                    "llamacpp_automatic_embedding_recovery_snapshot_changed"
-                ) from failure.original
-            operation.check()
-            profile = self._cached_profile(binding, operation)
-            candidate = diagnosis.suggested_max_input_chars
-            if profile is not None:
-                candidate = min(
-                    candidate,
-                    profile.max_input_chars(context_budget, self.config.category),
-                )
-            learned = lower_learned_budget(
-                self.config.cache_dir or _default_cache_dir(),
-                binding,
-                context_budget,
-                candidate,
-                operation.check,
-            )
-            snapshot = self._budget_snapshot(
-                binding,
-                context_budget,
-                self.config.category,
-                profile,
-                operation,
-                learned=learned,
-            )
-            raise EmbeddingInputOverflowError(
-                budget=snapshot,
-                inputs=diagnosis.inputs,
-                failed_input_indices=tuple(row.input_index for row in failure.rows),
-                window_index=failure.window_index,
-            ) from failure.original
 
     def _ready(self, operation, *, input_type):
         # No corpus, calibration profiles or cache paths are consulted here.
@@ -976,20 +829,24 @@ class AutomaticEmbeddingService:
         with self._operation(bound, cancel) as operation:
             if not texts:
                 return []
-            _, policy, adapter = self._ready(operation, input_type=input_type)
+            status, policy, adapter = self._ready(operation, input_type=input_type)
             try:
-                return adapter._embed_texts_direct(
+                result = adapter._embed_texts_direct(
                     texts,
                     policy=policy,
                     input_type=input_type,
                     timeout=operation.remaining(),
                     cancel=operation.probe,
                 )
-            except _FailedOwnerPost as failure:
-                self._recover_failed_post(failure, operation, input_type=input_type)
             except LLMCancelledError:
                 operation.check()
                 raise
+            operation.check()
+            if isinstance(result, _HalvingResult):
+                error = _halving_error(result, status.representation_id, input_type)
+                operation.check()
+                raise error from next(iter(result.rejections.values())).original
+            return result
 
     def embed_query(self, text, *, timeout=None, cancel=None):
         if not isinstance(text, str):
@@ -1108,6 +965,7 @@ class _AutomaticEmbeddingStream:
         self.cancel, self.close_source = cancel, close_source
         self._stop = Event()
         self._loop = self._initialization = self._delegate = None
+        self._conversion = None
         self._closed = self._next_active = False
         self._callback_failure = None
 
@@ -1157,7 +1015,8 @@ class _AutomaticEmbeddingStream:
             self.service._streams.add(self)
         if self._initialization is None:
             self._initialization = loop.create_task(asyncio.to_thread(self._initialize))
-        _, policy, adapter = await asyncio.shield(self._initialization)
+        status, policy, adapter = await asyncio.shield(self._initialization)
+        self._status = status
         if self._closed or self._stop.is_set():
             return
         if self._delegate is not None:
@@ -1175,33 +1034,6 @@ class _AutomaticEmbeddingStream:
         )
         await self._delegate.__aenter__()
 
-    async def _recover(self, failure):
-        """Keep diagnosis off-loop and inside the failed window's deadline."""
-        stop = Event()
-
-        def recover():
-            remaining = (
-                0 if failure.deadline is None else failure.deadline - time.monotonic()
-            )
-            if remaining <= 0:
-                raise LLMTimeoutError("llamacpp_automatic_embedding_timeout")
-            with self.service._operation(
-                remaining, lambda: stop.is_set() or self._cancelled()
-            ) as operation:
-                operation.deadline = min(operation.deadline, failure.deadline)
-                self.service._recover_failed_post(
-                    failure, operation, input_type=self.input_type
-                )
-
-        task = asyncio.create_task(asyncio.to_thread(recover))
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as exc:
-            stop.set()
-            await _drain(task, primary=self._primary_failure(exc))
-        except LLMCancelledError as exc:
-            raise self._primary_failure(exc)
-
     async def __anext__(self):
         self._check_loop()
         if self._next_active:
@@ -1211,10 +1043,33 @@ class _AutomaticEmbeddingStream:
             await self._start()
             if self._closed or self._delegate is None:
                 raise StopAsyncIteration
-            try:
-                return await anext(self._delegate)
-            except _FailedOwnerPost as failure:
-                await self._recover(failure)
+            result = await anext(self._delegate)
+            if isinstance(result, _HalvingResult):
+                self._conversion = self._loop.create_task(
+                    asyncio.to_thread(
+                        _halving_error,
+                        result,
+                        self._status.representation_id,
+                        self.input_type,
+                    )
+                )
+                try:
+                    error = await _drain(self._conversion)
+                finally:
+                    self._conversion = None
+                if self.service._closing.is_set():
+                    raise LLMBackendError("llamacpp_automatic_embedding_closed")
+                if self._cancelled():
+                    raise self._callback_failure or LLMCancelledError()
+                if result.deadline is not None and time.monotonic() >= result.deadline:
+                    raise LLMTimeoutError("llamacpp_embedding_timeout")
+                raise error from next(iter(result.rejections.values())).original
+            return result
+        except EmbeddingChunkSplitRequiredError:
+            # A recoverable window is delivered in source order. The iterator
+            # stays usable so later buffered windows are neither lost nor
+            # silently replayed while the consumer handles the local halves.
+            raise
         except BaseException as exc:
             await _drain(self.aclose(), primary=self._primary_failure(exc))
         finally:
@@ -1240,6 +1095,8 @@ class _AutomaticEmbeddingStream:
                 await asyncio.gather(self._initialization, return_exceptions=True)
             if self._delegate is not None:
                 await self._delegate.aclose()
+            if self._conversion is not None:
+                await asyncio.gather(self._conversion, return_exceptions=True)
             with self.service._condition:
                 self.service._streams.discard(self)
 

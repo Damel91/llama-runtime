@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
+import hashlib
 import json
 import multiprocessing
 import os
@@ -39,6 +40,27 @@ def binding(**changes):
 
 def check():
     pass
+
+
+def test_fixed_hard_corpus_mean_policy_cannot_reuse_minimum_or_learned_policy():
+    previous = {
+        **module._POLICY,
+        "basis": "minimum-source-characters-per-fully-prepared-token-across-all-10000",
+        "learned_limit": "absolute-characters-without-percentage-reapplication",
+    }
+    assert (
+        EMBEDDING_BUDGET_POLICY_ID
+        != hashlib.sha256(module._canonical(previous)).hexdigest()
+    )
+    assert module._POLICY["basis"] == (
+        "weighted-mean-source-characters-per-fully-prepared-token-selected-hard-2500"
+    )
+    assert module._POLICY["category_factor"] == 0.80
+    assert module._POLICY["mixed_factor"] == 0.90
+    assert (
+        module._POLICY["learned_limit"]
+        == "fixed-initial-recommendation-no-inference-updates"
+    )
 
 
 def state_path(directory, context=512, **changes):

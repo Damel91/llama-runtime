@@ -290,6 +290,7 @@ class AdapterProfile:
     embedding_max_pending_tokens: int = 1024 * 1024
     embedding_max_request_bytes: int = 8 * 1024 * 1024
     embedding_max_response_bytes: int = 8 * 1024 * 1024
+    embedding_isolation_max_requests: int = 512
     embedding_preparation_cache_entries: int = 1024
     embedding_preparation_cache_bytes: int = 8 * 1024 * 1024
 
@@ -316,6 +317,7 @@ class AdapterProfile:
             "embedding_max_pending_tokens",
             "embedding_max_request_bytes",
             "embedding_max_response_bytes",
+            "embedding_isolation_max_requests",
         ):
             if _positive_int(getattr(self, name), name) is None:
                 raise ValueError(f"{name} must be a positive integer")
@@ -475,6 +477,7 @@ class AdapterProfile:
                 "embedding_max_pending_tokens",
                 "embedding_max_request_bytes",
                 "embedding_max_response_bytes",
+                "embedding_isolation_max_requests",
                 "embedding_preparation_cache_entries",
                 "embedding_preparation_cache_bytes",
             )

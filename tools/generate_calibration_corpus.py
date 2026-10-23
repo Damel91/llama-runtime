@@ -1,20 +1,29 @@
-"""Reproduce the original, synthetic 10,000-text calibration corpus.
+"""Reproduce the 2,500 hardest selected synthetic calibration texts offline.
 
 No network, private project files or third-party text is used. Run this file
 from any directory; the default destination is the packaged corpus directory.
+The original 10,000-record pool and checked-in native count receipt reproduce
+the selection. Native counts select this pool once; consumers calibrate the
+selected 2,500 texts with their own model and prefix policy.
 """
 
 from __future__ import annotations
 
 import argparse
+from fractions import Fraction
 import hashlib
 import json
 from pathlib import Path
 import random
 
 CATEGORIES = ("code", "documentation", "prose", "structured", "multilingual")
-COUNT = 2000
-SCHEMA = "runtime-llama-calibration-corpus-v1"
+SOURCE_COUNT = 2000
+COUNT = 500
+SCHEMA = "runtime-llama-calibration-corpus-v2"
+SOURCE_CORPUS_SHA256 = (
+    "6a4733cf1d175b8b5b254f5951d19c5e4e5f5db2da8eaa1e15904474c53d3035"
+)
+SELECTION_RECEIPT = Path(__file__).with_name("calibration-hard-selection.json")
 
 
 def _json(value):
@@ -291,13 +300,13 @@ _GENERATORS = dict(
 )
 
 
-def generate(destination: Path):
-    destination.mkdir(parents=True, exist_ok=True)
-    files = {}
+def original_records():
+    """Reconstruct the unchanged original pool, without reading source files."""
+    result = {}
     texts = set()
     for category_index, category in enumerate(CATEGORIES):
         records = []
-        for index in range(COUNT):
+        for index in range(SOURCE_COUNT):
             rng = random.Random(73471 + category_index * 100000 + index)
             language, text = _GENERATORS[category](rng, index)
             if not text or text in texts:
@@ -311,18 +320,90 @@ def generate(destination: Path):
                     "text": text,
                 }
             )
-        payload = ("\n".join(_json(record) for record in records) + "\n").encode(
-            "utf-8"
+        result[category] = records
+    return result
+
+
+def _file_description(category, records):
+    payload = ("\n".join(_json(record) for record in records) + "\n").encode("utf-8")
+    return payload, {
+        "file": category + ".jsonl",
+        "count": len(records),
+        "total_characters": sum(len(record["text"]) for record in records),
+        "bytes": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def select_hardest(originals, receipt):
+    """Verify source/count provenance and select with exact rational ordering."""
+    descriptions = {
+        category: _file_description(category, originals[category])[1]
+        for category in CATEGORIES
+    }
+    source_digest = hashlib.sha256(_json(descriptions).encode("utf-8")).hexdigest()
+    if (
+        receipt.get("schema") != "runtime-llama-hard-corpus-selection-v1"
+        or source_digest != SOURCE_CORPUS_SHA256
+        or receipt.get("source_corpus_sha256") != source_digest
+        or receipt.get("selected_per_category") != COUNT
+    ):
+        raise ValueError("selection receipt does not match the original corpus")
+    by_id = {
+        record["id"]: record
+        for category in CATEGORIES
+        for record in originals[category]
+    }
+    measurements = receipt.get("measurements")
+    if not isinstance(measurements, list) or len(measurements) != len(by_id):
+        raise ValueError("selection requires every original native token count")
+    seen = set()
+    for row in measurements:
+        original = by_id.get(row.get("id"))
+        if (
+            original is None
+            or row["id"] in seen
+            or row.get("category") != original["category"]
+            or row.get("source_characters") != len(original["text"])
+            or row.get("text_sha256")
+            != hashlib.sha256(original["text"].encode("utf-8")).hexdigest()
+            or type(row.get("tokens")) is not int
+            or row["tokens"] <= 0
+        ):
+            raise ValueError("invalid original native measurement")
+        seen.add(row["id"])
+    result = {}
+    for category in CATEGORIES:
+        ranked = sorted(
+            (row for row in measurements if row["category"] == category),
+            key=lambda row: (
+                Fraction(row["source_characters"], row["tokens"]),
+                row["id"],
+            ),
         )
+        chosen = [row["id"] for row in ranked[:COUNT]]
+        if receipt.get("selected", {}).get(category) != chosen:
+            raise ValueError("selection is not the lowest measured ratio per category")
+        result[category] = [
+            {**by_id[identifier], "id": f"{category}-{index + 1:04d}"}
+            for index, identifier in enumerate(chosen)
+        ]
+    return result
+
+
+def generate(destination: Path, *, selection_receipt: Path = SELECTION_RECEIPT):
+    originals = original_records()
+    selection_payload = selection_receipt.read_bytes()
+    receipt = json.loads(selection_payload)
+    selected = select_hardest(originals, receipt)
+    destination.mkdir(parents=True, exist_ok=True)
+    files = {}
+    for category in CATEGORIES:
+        records = selected[category]
+        payload, description = _file_description(category, records)
         filename = category + ".jsonl"
         (destination / filename).write_bytes(payload)
-        files[category] = {
-            "file": filename,
-            "count": COUNT,
-            "total_characters": sum(len(record["text"]) for record in records),
-            "bytes": len(payload),
-            "sha256": hashlib.sha256(payload).hexdigest(),
-        }
+        files[category] = description
     corpus_sha256 = hashlib.sha256(_json(files).encode("utf-8")).hexdigest()
     manifest = {
         "schema": SCHEMA,
@@ -331,6 +412,15 @@ def generate(destination: Path):
         "categories": files,
         "provenance": "Original synthetic text generated without external sources.",
         "character_unit": "Unicode code points as counted by Python len(str).",
+        "selection": {
+            "source_corpus_sha256": SOURCE_CORPUS_SHA256,
+            "source_sample_count": SOURCE_COUNT * len(CATEGORIES),
+            "selected_per_category": COUNT,
+            "receipt_sha256": hashlib.sha256(selection_payload).hexdigest(),
+            "metric": "lowest source Unicode characters / fully prepared native tokens",
+            "tie_break": "original record ID ascending",
+            "measurement_binding": receipt["binding"],
+        },
     }
     (destination / "manifest.json").write_text(_json(manifest) + "\n", encoding="utf-8")
     return manifest
