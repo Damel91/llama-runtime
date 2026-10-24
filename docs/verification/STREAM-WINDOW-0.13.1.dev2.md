@@ -87,3 +87,46 @@ replays; physical layout changes remain the operator's responsibility.
 Performance output summaries must not be called complete numerical qualification
 unless both existing tolerances were actually checked. Warmup cosine, exact
 native replay and cross-physical loading are distinct comparisons.
+
+## Bounded live qualification: two replicas on one GPU
+
+The initial three-repetition candidate run made sixteen full POSTs of 128 texts
+and 35–36 metadata GETs over the same 2,048 texts. The SDK median was 15.487 s
+and exact native replay 10.703 s. Its per-alias input grouping returned to the
+reference plan. That separated comparison did not pass the latency gate.
+
+A separate diagnostic profile confirmed the local scheduling correction:
+inter-request gaps totalled 2.247 replica-seconds, versus 4.135 for dev1 on the
+same layout. All fourteen gaps were between 0.152 and 0.211 seconds; the larger
+0.5–0.9 second extra gaps disappeared. Full-ready waiting on fresh metadata still
+totalled 1.953 replica-seconds. Instrumented timing is not acceptance timing.
+
+An additional sequential AB/BA/AB check alternated the installed reference and
+the exact candidate on the unchanged layout. Each child performed one SDK run
+and its exact native replay after warmup:
+
+| Pair | Reference SDK | Candidate SDK | Reference native | Candidate native |
+| --- | ---: | ---: | ---: | ---: |
+| AB | 11.292 s | 12.004 s | 12.057 s | 12.671 s |
+| BA | 14.549 s | 12.312 s | 10.163 s | 9.660 s |
+| AB | 11.865 s | 10.631 s | 9.322 s | 9.713 s |
+
+SDK medians were 11.865 s and 12.004 s (+1.17%). The ratio of SDK/native medians
+and the median of individual SDK/native ratios point in different directions.
+There is no robust end-to-end speedup direction in these few variable runs;
+the earlier separated comparison also cannot establish that its approximately
+30% raw difference was caused entirely by the patch. Metadata reduction and
+removal of the locally reproduced head-of-line are the verified improvements.
+
+All twelve paired SDK/native measurements checked both existing tolerances
+outside the timing interval: maximum absolute difference against the within-run
+warmup was at most `1.4901161193847656e-8` (limit `1e-5`), and minimum cosine
+was `0.9999999403953552` (minimum `0.999999`). They retained 2,048 finite
+768-dimensional vectors, sixteen full POSTs and no HTTP errors. The reference
+used 67 GETs and the candidate 36 in this alternating check. These checks do
+not close the cross-physical loading finding.
+
+Consumer process/database/configuration and corpus preservation checks passed.
+The benchmark owner awaits operator placement changes for this exact candidate's
+split-GPU and single-replica repetitions. No additional performance fix,
+publication, shared installation or consumer migration follows from these data.
