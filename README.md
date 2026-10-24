@@ -87,6 +87,10 @@ See the [automatic API](docs/AUTOMATIC-EMBEDDING.md),
 The earlier cross-replica numerical finding remains open; stable **0.11.1**
 remains the latest stable release. Publication does not update consumers.
 
+SDK stability and a server/model profile's numerical qualification are separate
+decisions. A precision difference caused by model loading settings does not by
+itself make the Python library a prerelease.
+
 ## Release 0.11.1
 
 The automatic embedding config now exposes the existing finite request,

@@ -56,6 +56,19 @@ close()
 await aclose()
 ```
 
+The local `0.13.1.dev1` candidate reuses verified admission within an active
+automatic stream. Readiness observes the pool once; subsequent direct windows
+fork independent call references while the same pool generation remains valid.
+An idle stream holds no pool reference or scheduler permit. Each original
+embedding POST still requires fresh catalog and selected-replica properties;
+recovery keeps its own fresh observations. A full matching-pool topology change
+revokes local reuse, and pool replacement waits for existing calls to drain.
+There is no TTL cache or inference authorization attached to saved observations.
+The public signatures, synchronous/exact paths, batch quotas, deadlines,
+cancellation and bounded intake remain unchanged. This candidate is for isolated
+verification and does not update consumer installations. See the
+[control-overhead verification](verification/STREAM-CONTROL-0.13.1.dev1.md).
+
 Observation methods return `AutomaticEmbeddingStatus`. Ordinary availability has
 `max_input_chars`, `category`, `calibration_id` and `budget` set to `None`.
 `refresh_character_budget()` uses completed matching calibration after fresh

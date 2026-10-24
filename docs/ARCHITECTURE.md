@@ -56,6 +56,18 @@ Non prevede TTL o singleflight; richieste fredde concorrenti possono ripetere
 la tokenizzazione. Evizione e chiusura liberano le entry. I contatori sono
 esposti nella diagnostica, senza dichiarare un tetto globale della RSS.
 
+Il candidato locale `0.13.1.dev1`, governato da Flower `REQ-000044` /
+`PACKET-000030`, separa l'ammissione iniziale dello stream automatico dal
+preflight dei POST. Uno scope privato conserva osservazioni iniziali e una
+generazione verificata, senza possedere riferimenti al pool durante le pause.
+Ogni finestra ammessa acquisisce il proprio riferimento reale. Cataloghi
+freschi che rilevano cambiamenti nell'intero gruppo di repliche revocano lo
+scope; la sostituzione del pool attende il drain e soltanto una nuova ammissione
+autorevole può riabilitare il riuso. Nessuno snapshot ripristina capacità
+obsolete. Catalogo e proprietà freschi prima dei POST, recovery, scheduler e
+quote restano quelli esistenti. Non viene anticipato il preflight mentre
+la capacità dell'alias è occupata.
+
 L'architettura adottata revisione 4 e il packet complementare
 `PACKET-000019` (`REQ-000034`/`REQ-000035`, `MILE-000018`, `CHANGE-000018`)
 mantengono sommari incrementali delle code pronte. Il packing usa iteratori
