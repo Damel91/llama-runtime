@@ -127,9 +127,9 @@ used 67 GETs and the candidate 36 in this alternating check. These checks do
 not close the cross-physical loading finding.
 
 Consumer process/database/configuration and corpus preservation checks passed.
-The benchmark owner awaits operator placement changes for this exact candidate's
-split-GPU and single-replica repetitions. No additional performance fix,
-publication, shared installation or consumer migration follows from these data.
+The split-GPU and single-replica repetitions were subsequently completed below.
+No additional performance fix, publication, shared installation or consumer
+migration follows from these data.
 
 ## Bounded live qualification: one replica per GPU
 
@@ -161,7 +161,49 @@ waiting on fresh metadata still totalled 1.883 replica-seconds.
 
 Configuration, database version, corpus and stopped-consumer checks passed;
 the installed reference and immutable candidate artifacts remain intact.
-Single-replica qualification is the remaining operator-dependent layout.
-End-to-end latency qualification and the separate cross-physical numerical
-finding remain open. No runtime code or numerical threshold changed for these
-measurements.
+The final single-replica result follows below. End-to-end latency qualification
+and the separate cross-physical numerical finding remain open. No runtime code
+or numerical threshold changed for these measurements.
+
+## Final single-replica result and campaign completion
+
+The final layout used one loaded replica on GPU0. Three repetitions across the
+same four routes produced twelve valid measurements. Every SDK run sent eight
+full POSTs of 256 texts, retained the original input plan and all 262,482 prompt
+tokens, and used 19 metadata GETs instead of the reference's 43. There were no
+HTTP errors. Both existing numerical thresholds passed for all twelve records;
+the maximum absolute difference was `1.4901161193847656e-8` and minimum cosine
+`0.9999999403953552`, against within-run warmup.
+
+| Median client wall time | Fresh reference 0.13.0a1 | Candidate 0.13.1.dev2 |
+| --- | ---: | ---: |
+| SDK | 18.400 s | 15.932 s |
+| Exact native replay | 13.999 s | 14.145 s |
+
+Candidate SDK repetitions took 15.932, 16.510 and 15.712 seconds. The observed
+SDK change was −13.41%, with exact native +1.04% and SDK/native ratio −14.30%.
+This does not establish general acceleration: the earlier historical single
+SDK median was already 15.929 s. Fixed native and SDK transport-only medians
+were 15.810 s and 14.678 s. All timings remain client wall time.
+
+All three candidate layouts and the separate alternating shared-GPU control are
+now complete. The consolidated receipt covers 120 measured routes across
+reference, dev1, dev2 and alternation, with hashes of the original evidence
+files. Exactly 36 records retain maximum absolute error plus both numerical
+assertions; all 36 passed. The older 84 records did not collect that metric and
+are not retrospectively qualified against it.
+
+The verified producer improvements are reduced admission/control I/O and the
+removal of the causally reproduced same-stream window head-of-line. Stable
+end-to-end acceleration remains unproved, and the cross-physical finding stays
+open. Evidence collection for this campaign is complete with these residuals;
+it does not grant milestone acceptance, release promotion or consumer migration.
+Corpus, configuration and database preservation checks passed, CC remained
+stopped and the shared SDK remains `0.13.0a1`. No further model-layout change,
+inference, code change, publication or shared installation is part of this
+campaign.
+
+Flower retains deterministic evidence 218, live evidence 220–222 and final
+consolidation evidence 223 for `REQ-000045`. All four units of `PACKET-000031`
+are complete with no deferred unit verification. Its final gate remains
+`agent_work_complete_acceptance_pending`; human acceptance is not inferred.
