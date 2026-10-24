@@ -69,6 +69,15 @@ cancellation and bounded intake remain unchanged. This candidate is for isolated
 verification and does not update consumer installations. See the
 [control-overhead verification](verification/STREAM-CONTROL-0.13.1.dev1.md).
 
+The follow-up isolated `0.13.1.dev2` candidate gives all windows of one stream
+one private packing identity. Model-wide packing rotates between independent
+consumers and takes the oldest ready windows within each stream first, while
+allowing a POST to span windows. Each window keeps its own cancellation, result
+and ordered delivery. This avoids a demonstrated source-prefetch blockage
+without increasing `max_pending_windows`, changing batch budgets or introducing
+another scheduler. See the
+[window-packing verification](verification/STREAM-WINDOW-0.13.1.dev2.md).
+
 Observation methods return `AutomaticEmbeddingStatus`. Ordinary availability has
 `max_input_chars`, `category`, `calibration_id` and `budget` set to `None`.
 `refresh_character_budget()` uses completed matching calibration after fresh

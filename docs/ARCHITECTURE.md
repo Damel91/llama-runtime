@@ -68,6 +68,18 @@ obsolete. Catalogo e proprietà freschi prima dei POST, recovery, scheduler e
 quote restano quelli esistenti. Non viene anticipato il preflight mentre
 la capacità dell'alias è occupata.
 
+Il candidato successivo `0.13.1.dev2` (`REQ-000045` / `PACKET-000031`)
+introduce un'identità privata di consumer per lo stream, distinta dallo scope
+di ammissione e dall'ownership delle singole finestre. Il packing ruota fra
+consumer indipendenti e concatena le finestre pronte dello stesso consumer
+in ordine sorgente. Può riempire un POST attraverso più finestre; una coda
+temporaneamente vuota non blocca le successive già pronte. Questo evita che
+due finestre prefetched mantengano entrambe incompleta la propria parte sulla
+replica lenta, impedendo l'ingresso di altro lavoro sulla veloce. Il turno per
+alias avanza soltanto dopo dispatch effettivo. I sommari di readiness seguono
+lo stesso ordine, anche nel passaggio da ID nativi a testo. Scheduler, capacità,
+crediti e consegna ordinata rimangono quelli esistenti.
+
 L'architettura adottata revisione 4 e il packet complementare
 `PACKET-000019` (`REQ-000034`/`REQ-000035`, `MILE-000018`, `CHANGE-000018`)
 mantengono sommari incrementali delle code pronte. Il packing usa iteratori
@@ -137,6 +149,7 @@ flowchart TD
 | `adapters/llama.py` | `/v1/chat/completions`, storia completa, sampling, reasoning/template, schema, tool delta e usage |
 | `adapters/embedding.py` | Preparazione query/document/raw, `/v1/embeddings`, `/tokenize`, `/props`, batching, limiti, ordine e integrità numerica |
 | `embedding_engine.py` | Motore persistente condiviso dalle API sync/async, code per replica, preparazione concorrente, selezione dei batch al dispatch e budget delle risorse |
+| `embedding_packing.py` | Viste senza copia delle code esistenti: equità fra consumer, finestre pronte in ordine per stream e sommari coerenti dei prefissi di ID nativi |
 | `embedding_scheduler.py` | Ammissione condivisa, coda limitata, routing per alias e tetti globali/per replica |
 | `replica_discovery.py` | Selezione del modello logico e repliche loaded dai tag Noxi di identità contenuto e compatibilità semantica |
 | `diagnostics.py` | Cattura thinking opzionale e limitata, correlazione per chiamata e sink finale |

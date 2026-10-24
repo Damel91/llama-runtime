@@ -97,6 +97,9 @@ Within-run vectors retained minimum cosine 0.9999999403953552; all ordering,
 cardinality and finite-value checks passed. This does not close the separate
 cross-physical-replica finding. Consumer process, database/configuration and
 frozen corpus preservation checks passed.
+The performance probe reports cosine against its within-run warmup and did not
+record maximum absolute error; it is not full numerical requalification against
+both existing tolerances.
 
 A separate instrumented candidate profile measured one full admission join
 instead of nine, with 33 GETs (one additional dispatch catalog from timing-
@@ -115,6 +118,31 @@ control load while leaving an important latency bottleneck unresolved.
 Single-replica and shared-GPU repetitions are handled separately with the same
 immutable candidate after operator placement changes. No further performance
 claim, publication or shared installation follows from this stage.
+
+## Completed additional layouts
+
+The operator subsequently provided both remaining layouts. Three repetitions
+per version/layout retained the same corpus, settings and per-round exact native
+replay. A single replica made eight POSTs of 256 texts; both two-replica layouts
+made sixteen POSTs of 128 texts. No output errors occurred.
+
+| Layout | Reference SDK median | Candidate SDK median | Reference exact native | Candidate exact native | Metadata GETs |
+| --- | ---: | ---: | ---: | ---: | --- |
+| One replica | 18.400 s | 16.653 s | 13.999 s | 15.712 s | 43 → 19 |
+| Two replicas, same GPU | 11.932 s | 15.164 s | 10.133 s | 10.010 s | 67 → 32–33 |
+| One replica per GPU | 11.899 s | 13.099 s | 9.386 s | 10.330 s | 67 → 32 |
+
+The single-replica observed improvement is sensitive to native replay variability
+and changed batch interleaving; it is not a general speedup claim. The shared-GPU
+case is an explicit failed latency qualification: SDK time grew 27.09% while
+both exact and fixed native controls stayed near their fresh reference. Metadata
+reduction is verified, but this candidate must not be promoted as the completed
+performance fix. Within-run numerical checks remain separate from that result.
+
+A deterministic follow-up reproduced a same-stream window head-of-line and
+governed its correction separately as `REQ-000045` / `PACKET-000031`. See the
+[dev2 correction](STREAM-WINDOW-0.13.1.dev2.md). Neither candidate updates the
+shared SDK or authorizes publication.
 
 The candidate is installed only in a disposable verification environment and
 an isolated benchmark overlay. The shared installed `0.13.0a1`, consumers,
