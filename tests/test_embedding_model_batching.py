@@ -132,7 +132,12 @@ def test_explicit_token_budget_splits_a_batch_gathered_across_owners():
     async def scenario():
         client = ContractClient(1)
         client.token_gate.clear()
-        windows = [[f"w{owner}-a", f"w{owner}-b"] for owner in range(4)]
+        # Unequal windows require cross-window fill even when packing
+        # completes the oldest ready window before taking the next one.
+        windows = [
+            [f"w{owner}-{index}" for index in range(size)]
+            for owner, size in enumerate((1, 3, 1, 3))
+        ]
         incoming = [text for window in windows for text in window]
         client.counts.update(dict.fromkeys(incoming, 2))
         adapter = configured(

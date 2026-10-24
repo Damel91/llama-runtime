@@ -16,6 +16,7 @@ from typing import Any
 
 from runtime_llama.errors import LLMBackendError
 from runtime_llama.embedding_halving import _HalvingResult, _RejectedEmbedding
+from runtime_llama.embedding_packing import _ConsumerTurns
 from runtime_llama.embedding_recovery import _FailedDirectPost, _FailedOwnerPost
 
 
@@ -250,6 +251,7 @@ class PersistentEmbeddingEngine:
         self._retained_plan_count = 0
         self._view_signature = None
         self._packing_candidate_visits = 0
+        self._packing_turns = _ConsumerTurns()
         self._view = {}
         self._update_view()
 
@@ -959,7 +961,8 @@ class PersistentEmbeddingEngine:
         ]
         if not owners:
             return False
-        queues = [state.ready[model] for state in owners]
+        groups = self._packing_turns.groups(model, owners)
+        queues = [queue for group in groups for queue in group.queues]
         count = sum(map(len, queues))
         cap = self.adapter._current_batch_size(
             self.adapter._scheduler.text_cap(self.adapter.batch_size),
@@ -983,9 +986,9 @@ class PersistentEmbeddingEngine:
         missing = (
             min(
                 (
-                    (queue.first_missing_ids, index)
-                    for index, queue in enumerate(queues)
-                    if queue.first_missing_ids is not None
+                    (group.first_missing_ids, index)
+                    for index, group in enumerate(groups)
+                    if group.first_missing_ids is not None
                 ),
                 default=None,
             )
@@ -997,22 +1000,21 @@ class PersistentEmbeddingEngine:
             if text_size + 2 * (count - 1) >= self.max_request_bytes:
                 return True
         if native_ids:
-            # Fair rotation reaches the first row without reusable IDs at
-            # (round, owner). Earlier queues contribute one more row in that
-            # round; exhausted queues naturally stop contributing. All later
-            # rows use the complete text payload instead of token IDs.
+            # Each consumer concatenates its oldest ready windows. Rotation
+            # between consumers reaches the first row without reusable IDs at
+            # (round, consumer); later rows use the complete text payload.
             if missing is None:
-                counts = [len(queue) for queue in queues]
+                counts = [len(group) for group in groups]
             else:
                 round_index, owner_index = missing
                 counts = [
-                    min(len(queue), round_index + (index < owner_index))
-                    for index, queue in enumerate(queues)
+                    min(len(group), round_index + (index < owner_index))
+                    for index, group in enumerate(groups)
                 ]
             native_count = sum(counts)
             if native_count:
                 native_size = overhead + sum(
-                    queue.id_prefix_bytes(size) for queue, size in zip(queues, counts)
+                    group.id_prefix_bytes(size) for group, size in zip(groups, counts)
                 )
                 if native_size + 2 * (native_count - 1) >= self.max_request_bytes:
                     return True
@@ -1030,16 +1032,20 @@ class PersistentEmbeddingEngine:
         )
 
     def _pack(self, model, observation, states):
-        """Fairly gather owners without summing their source-window ceilings."""
+        """Rotate consumers, draining each one's oldest ready windows first."""
         cap = self.adapter._current_batch_size(
             self.adapter._scheduler.text_cap(self.adapter.batch_size),
             self.adapter._replicas[model],
         )
-        owners = deque(
-            (state, iter(state.ready[model]))
-            for state in states
-            if self._owner_eligible(state, model) and state.ready.get(model)
+        groups = self._packing_turns.groups(
+            model,
+            [
+                state
+                for state in states
+                if self._owner_eligible(state, model) and state.ready.get(model)
+            ],
         )
+        owners = deque(iter(group) for group in groups)
         selected, tokens = [], 0
         budget = observation.batch_token_limit
         text_bytes = token_bytes = self.adapter._engine_payload_overhead(model)
@@ -1049,12 +1055,12 @@ class PersistentEmbeddingEngine:
             is True
         )
         while owners:
-            state, entries = owners.popleft()
+            entries = owners.popleft()
             try:
                 entry = next(entries)
             except StopIteration:
                 continue
-            owners.append((state, entries))
+            owners.append(entries)
             self._packing_candidate_visits += 1
             record = entry.record
             limit = record.batch_token_limit
@@ -1080,7 +1086,7 @@ class PersistentEmbeddingEngine:
             if size > self.max_request_bytes:
                 if selected:
                     return selected, True
-                self._fail(state, self._resource("request_bytes"))
+                self._fail(entry.plan.state, self._resource("request_bytes"))
                 return [], False
             selected.append(entry)
             tokens += record.token_count
@@ -1159,6 +1165,7 @@ class PersistentEmbeddingEngine:
                 for owner in dict.fromkeys(entry.plan.state for entry in selected):
                     self._fail(owner, exc)
                 continue
+            self._packing_turns.committed(model, selected)
             for entry in selected:
                 assert entry.plan.state.ready[model].popleft() is entry
                 entry.plan.http_active += 1
@@ -1651,6 +1658,7 @@ class PersistentEmbeddingEngine:
                 if not cost and any(state.call is call for state in self._states):
                     self._released_calls.add(call)
             self._completions(events)
+            self._packing_turns.prune(self._states, self.adapter._replicas)
             states = list(self._states)
             if states:
                 offset = self._rotation % len(states)

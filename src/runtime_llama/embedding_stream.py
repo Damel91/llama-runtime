@@ -176,6 +176,7 @@ class EmbeddingWindowStream:
             raise ValueError("admission scopes belong to direct streams")
         self._direct_policy = _direct_policy
         self._admission_scope = _admission_scope
+        self._packing_group = object()
         self._adapter, self._source = adapter, windows
         self._prepared, self._input_type = prepared, input_type
         self._maximum, self._timeout, self._cancel = (
@@ -294,6 +295,7 @@ class EmbeddingWindowStream:
                 # Preserve source-window provenance without changing dispatch
                 # or result ordering. Recovery never guesses it from text.
                 call._window_index = self._window_index
+                call._packing_group = self._packing_group
                 future = self._bridge.submit(
                     copied,
                     prepared=self._prepared,

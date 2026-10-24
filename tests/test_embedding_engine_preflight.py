@@ -82,6 +82,9 @@ def test_completed_preflight_wins_rotation_before_another_owner_probes(owner_sta
         return result
 
     requesting, observed = state(), state()
+    # This test bypasses normal readiness/packing. Initialize their fair
+    # consumer roster so it still isolates the completed-preflight boundary.
+    engine._packing_turns.prune([requesting, observed], ("replica",))
     engine._preflights["replica"] = _Preflight(object(), (observed,))
     if owner_status == "failed":
         observed.call.failure = RuntimeError("already failed")
