@@ -130,3 +130,38 @@ Consumer process/database/configuration and corpus preservation checks passed.
 The benchmark owner awaits operator placement changes for this exact candidate's
 split-GPU and single-replica repetitions. No additional performance fix,
 publication, shared installation or consumer migration follows from these data.
+
+## Bounded live qualification: one replica per GPU
+
+The operator then supplied the split-GPU layout. Three repetitions of the same
+2,048-text corpus covered SDK, exact native replay, fixed native plan and SDK
+transport-only paths. All twelve measurements passed the existing `1e-5`
+maximum absolute error and `0.999999` minimum cosine checks against their
+within-run warmup. The measured extremes were `1.4901161193847656e-8` and
+`0.9999999403953552`, respectively. All results retained 2,048 finite
+768-dimensional vectors, with no HTTP errors.
+
+| Median client wall time | Reference 0.13.0a1 | Candidate 0.13.1.dev2 |
+| --- | ---: | ---: |
+| SDK | 11.899 s | 12.768 s |
+| Exact native replay | 9.386 s | 9.148 s |
+
+Candidate SDK repetitions took 13.185, 12.768 and 10.395 seconds. SDK time was
+7.30% higher in this separated comparison; the SDK/native ratio was 10.10%
+higher. These few non-interleaved repetitions do not establish a stable speedup
+or causal regression. The fixed native median was 9.005 s and SDK transport-only
+median 9.687 s; these are distinct paths, not additive component timings.
+
+Input grouping matched the reference exactly: eight POSTs of 128 texts per alias
+with the same token totals. Metadata GETs fell from 67 to 36, 35 and 35. The
+separate diagnostic profile retained 35 GETs and sixteen POSTs, with fourteen
+inter-request gaps of approximately 0.152–0.178 s and total gaps of 2.215
+replica-seconds. The large window head-of-line gaps remained absent; full-ready
+waiting on fresh metadata still totalled 1.883 replica-seconds.
+
+Configuration, database version, corpus and stopped-consumer checks passed;
+the installed reference and immutable candidate artifacts remain intact.
+Single-replica qualification is the remaining operator-dependent layout.
+End-to-end latency qualification and the separate cross-physical numerical
+finding remain open. No runtime code or numerical threshold changed for these
+measurements.
