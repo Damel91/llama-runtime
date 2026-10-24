@@ -24,6 +24,7 @@ class EngineContext:
     joined: bool
     observations: dict[str, Any]
     conservative: tuple[int | None, int | None]
+    admission_generation: object | None = None
 
 
 @dataclass(eq=False)

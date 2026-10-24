@@ -149,6 +149,7 @@ class EmbeddingWindowStream:
         cancel: Callable[[], bool] | None = None,
         close_source: bool = False,
         _direct_policy=None,
+        _admission_scope=None,
     ):
         if (
             isinstance(max_pending_windows, bool)
@@ -171,7 +172,10 @@ class EmbeddingWindowStream:
             raise ValueError("timeout must be a positive finite number")
         if prepared and _direct_policy is not None:
             raise ValueError("direct streams cannot contain exact preparations")
+        if _admission_scope is not None and (prepared or _direct_policy is None):
+            raise ValueError("admission scopes belong to direct streams")
         self._direct_policy = _direct_policy
+        self._admission_scope = _admission_scope
         self._adapter, self._source = adapter, windows
         self._prepared, self._input_type = prepared, input_type
         self._maximum, self._timeout, self._cancel = (
@@ -268,6 +272,8 @@ class EmbeddingWindowStream:
                 call = self._adapter._stream_call(self._cancel, self._timeout)
                 if self._direct_policy is not None:
                     call._direct_policy = self._direct_policy
+                    if self._admission_scope is not None:
+                        call._admission_scope = self._admission_scope
                 self._pull_call = call
                 await self._bridge.acquire(call)
                 self._pull_lease = True

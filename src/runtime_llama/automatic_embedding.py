@@ -51,6 +51,7 @@ from runtime_llama.embedding_halving import (
     _HalvingResult,
     _halving_error,
 )
+from runtime_llama.embedding_observation import _EmbeddingAdmissionScope
 from runtime_llama.embedding_stream import _drain
 from runtime_llama.errors import (
     LLMBackendError,
@@ -634,10 +635,10 @@ class AutomaticEmbeddingService:
             source="calibrated_mean",
         )
 
-    def _ready(self, operation, *, input_type):
+    def _ready(self, operation, *, input_type, admission_scope=None):
         # No corpus, calibration profiles or cache paths are consulted here.
         with self._observed(operation, input_type=input_type) as observed:
-            adapter, _, _, binding, _, _ = observed
+            adapter, _, context, binding, _, _ = observed
             policy = _DirectEmbeddingPolicy(
                 content_sha256=binding["content_sha256"],
                 embedding_sha256=binding["embedding_sha256"],
@@ -645,6 +646,8 @@ class AutomaticEmbeddingService:
                 policy=binding["policy"],
                 prefix=binding["prefix"],
             )
+            if admission_scope is not None:
+                adapter._engine_bind_admission_scope(admission_scope, context)
             return (
                 AutomaticEmbeddingStatus(
                     True,
@@ -968,6 +971,7 @@ class _AutomaticEmbeddingStream:
         self._conversion = None
         self._closed = self._next_active = False
         self._callback_failure = None
+        self._admission_scope = _EmbeddingAdmissionScope()
 
     def __aiter__(self):
         return self
@@ -1002,7 +1006,11 @@ class _AutomaticEmbeddingStream:
     def _initialize(self):
         timeout = self.service.config.timeout if self.timeout is None else self.timeout
         with self.service._operation(timeout, self._cancelled) as operation:
-            return self.service._ready(operation, input_type=self.input_type)
+            return self.service._ready(
+                operation,
+                input_type=self.input_type,
+                admission_scope=self._admission_scope,
+            )
 
     async def _start(self):
         loop = self._check_loop()
@@ -1031,6 +1039,7 @@ class _AutomaticEmbeddingStream:
             else self.timeout,
             cancel=self._cancelled,
             close_source=self.close_source,
+            admission_scope=self._admission_scope,
         )
         await self._delegate.__aenter__()
 
@@ -1097,6 +1106,7 @@ class _AutomaticEmbeddingStream:
                 await self._delegate.aclose()
             if self._conversion is not None:
                 await asyncio.gather(self._conversion, return_exceptions=True)
+            self._admission_scope.clear()
             with self.service._condition:
                 self.service._streams.discard(self)
 

@@ -34,6 +34,10 @@ from runtime_llama.replica_discovery import (
 from runtime_llama.embedding_scheduler import EmbeddingScheduler
 from runtime_llama.embedding_engine import EngineContext, PersistentEmbeddingEngine
 from runtime_llama.embedding_metadata import loaded_execution_metadata
+from runtime_llama.embedding_observation import (
+    _AdmissionBinding,
+    _EmbeddingAdmissionScope,
+)
 from runtime_llama.embedding_preparation import (
     PreparedEmbeddingInput,
     issue_preparation,
@@ -460,6 +464,9 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         self._discovery_lock = Lock()
         self._pool_condition = Condition()
         self._pool_users = 0
+        self._admission_owner = object()
+        self._admission_generation = object()
+        self._admission_revoked = True
         self._discovered_pool: EmbeddingPool | None = None
         self._pinned_identity: ReplicaIdentity | None = None
         self._fallback_alias: str | None = None
@@ -505,15 +512,15 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         self, call: _Call, timeout: float, *, wait_for_drain: bool = True
     ) -> bool | None:
         """Observe before admission; replace topology only after old calls drain."""
-        joined, _catalog = self._join_pool_snapshot(
+        joined, _catalog, _generation = self._join_pool_snapshot(
             call, timeout, wait_for_drain=wait_for_drain
         )
         return joined
 
     def _join_pool_snapshot(self, call, timeout, *, wait_for_drain=True):
-        """Return the catalog that actually governed this admission."""
+        """Return the catalog and generation that governed this admission."""
         if not self._discovery_enabled:
-            return False, None
+            return False, None, None
         deadline = time.monotonic() + timeout
 
         def check_wait():
@@ -523,12 +530,14 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
 
         if not wait_for_drain:
             if not self._discovery_lock.acquire(blocking=False):
-                return None, None
+                return None, None, None
         else:
             while not self._discovery_lock.acquire(timeout=0.05):
                 check_wait()
         try:
             call.check()
+            with self._pool_condition:
+                attempt_generation = self._admission_generation
             self._discovery_server_healthy = False
             health = self._client.health(
                 timeout=call.remaining(), cancel=call.probe, cancel_wait=True
@@ -551,10 +560,14 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 if self._discovered_pool is None or (
                     pool.topology != self._discovered_pool.topology
                 ):
+                    # Fresh dispatch/recovery catalogs also revoke scopes.
+                    # Stop local forks before waiting for old owners to drain.
+                    if self._discovered_pool is not None:
+                        self._revoke_admission_locked()
                     waited = False
                     while self._pool_users:
                         if not wait_for_drain:
-                            return None, None
+                            return None, None, None
                         check_wait()
                         self._pool_condition.wait(0.05)
                         waited = True
@@ -616,11 +629,24 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                         self._pinned_identity = pool.identity
                     if pool.fallback_alias is not None:
                         self._fallback_alias = pool.fallback_alias
+                # Only a serialized fresh admission may enable local reuse.
+                # A newer topology observation during this attempt wins, even
+                # when it came from a dispatch or recovery worker. In that
+                # case a subsequent stable fresh join can enable the scope.
+                if attempt_generation is self._admission_generation:
+                    if self._admission_revoked:
+                        self._admission_generation = object()
+                    self._admission_revoked = False
                 self._pool_users += 1
                 self._discovery_error = None
-            return True, catalog
+                generation = (
+                    self._admission_generation if not self._admission_revoked else None
+                )
+            return True, catalog, generation
         except (LLMBackendError, LLMTimeoutError, LLMCancelledError) as exc:
             self._discovery_error = type(exc).__name__
+            with self._pool_condition:
+                self._revoke_admission_locked()
             raise
         finally:
             self._discovery_lock.release()
@@ -670,19 +696,120 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         return None
 
     def _discovery_catalog(self, *, timeout, cancel):
-        catalog = self._client.models(timeout=timeout, cancel=cancel, cancel_wait=True)
-        entries = catalog.get("data") if isinstance(catalog, dict) else None
-        if (
-            isinstance(entries, list)
-            and len(entries) == 1
-            and isinstance(entries[0], dict)
-            and "status" not in entries[0]
-        ):
-            # Native single-model servers omit status. Root /props does not
-            # select a router model and cannot request an unloaded alias.
-            props = self._client.props(timeout=timeout, cancel=cancel, cancel_wait=True)
-            return attest_single_model_catalog(catalog, props)
-        return catalog
+        try:
+            catalog = self._client.models(
+                timeout=timeout, cancel=cancel, cancel_wait=True
+            )
+            entries = catalog.get("data") if isinstance(catalog, dict) else None
+            if (
+                isinstance(entries, list)
+                and len(entries) == 1
+                and isinstance(entries[0], dict)
+                and "status" not in entries[0]
+            ):
+                # Native single-model servers omit status. Root /props does
+                # not select a router model or load an unloaded alias.
+                props = self._client.props(
+                    timeout=timeout, cancel=cancel, cancel_wait=True
+                )
+                catalog = attest_single_model_catalog(catalog, props)
+            self._observe_admission_topology(catalog)
+            return catalog
+        except BaseException:
+            with self._pool_condition:
+                self._revoke_admission_locked()
+            raise
+
+    def _revoke_admission_locked(self):
+        """Invalidate every non-owning scope; caller owns the pool condition."""
+        self._admission_generation = object()
+        self._admission_revoked = True
+
+    def _observe_admission_topology(self, catalog):
+        """Fresh catalogs revoke scopes for changes beyond the selected alias."""
+        with self._pool_condition:
+            current = self._discovered_pool
+            pinned = self._pinned_identity
+            fallback = self._fallback_alias
+        if current is None:
+            return
+        observed = discover_embedding_pool(
+            catalog, self.model_name, pinned=pinned, fallback_alias=fallback
+        )
+        with self._pool_condition:
+            if (
+                self._discovered_pool is not current
+                or observed.topology != current.topology
+            ):
+                self._revoke_admission_locked()
+
+    def _engine_bind_admission_scope(self, scope, context):
+        """Capture preparation metadata without retaining an admission ref."""
+        if not isinstance(scope, _EmbeddingAdmissionScope):
+            raise ValueError("invalid embedding admission scope")
+        with self._pool_condition:
+            if (
+                not self._discovery_enabled
+                or not context.joined
+                or self._admission_revoked
+                or self._discovered_pool is None
+                or context.admission_generation is not self._admission_generation
+                or self._closing.is_set()
+            ):
+                scope.clear()
+                return False
+            scope._bind(
+                _AdmissionBinding(
+                    self._admission_owner,
+                    self._admission_generation,
+                    self._scheduler,
+                    self._discovered_pool,
+                    tuple(context.observations.items()),
+                    context.conservative,
+                )
+            )
+            return True
+
+    def _engine_fork_admission_scope(self, calls, active):
+        """Fork only actual direct owners; fresh HTTP preflight stays mandatory."""
+        with self._pool_condition:
+            if (
+                self._admission_revoked
+                or self._discovered_pool is None
+                or self._closing.is_set()
+            ):
+                return None
+            bindings = {}
+            for call in active:
+                scope = getattr(call, "_admission_scope", None)
+                if (
+                    not isinstance(scope, _EmbeddingAdmissionScope)
+                    or getattr(call, "_direct_policy", None) is None
+                ):
+                    return None
+                binding = scope._snapshot()
+                if (
+                    binding is None
+                    or binding.owner is not self._admission_owner
+                    or binding.generation is not self._admission_generation
+                    or binding.scheduler is not self._scheduler
+                    or binding.pool is not self._discovered_pool
+                ):
+                    return None
+                bindings[call] = binding
+            contexts = tuple(
+                None
+                if call.failure is not None
+                else EngineContext(
+                    True,
+                    dict(bindings[call].observations),
+                    bindings[call].conservative,
+                    self._admission_generation,
+                )
+                for call in calls
+            )
+            self._pool_users += sum(context is not None for context in contexts)
+            return contexts
 
     @classmethod
     def from_profile(
@@ -1488,8 +1615,11 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         active = tuple(call for call in calls if call.failure is None)
         if not active:
             return (None,) * len(calls)
+        scoped = self._engine_fork_admission_scope(calls, active)
+        if scoped is not None:
+            return scoped
         group = self._engine_batch_call(active)
-        joined, catalog = self._join_pool_snapshot(
+        joined, catalog, admission_generation = self._join_pool_snapshot(
             group, group.remaining(), wait_for_drain=False
         )
         if joined is None:
@@ -1522,7 +1652,12 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 contexts.append(
                     None
                     if call.failure is not None
-                    else EngineContext(joined, dict(observations), conservative)
+                    else EngineContext(
+                        joined,
+                        dict(observations),
+                        conservative,
+                        admission_generation,
+                    )
                 )
             contexts = tuple(contexts)
             accepted = sum(context is not None for context in contexts)
@@ -1533,6 +1668,14 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                     self._pool_users += accepted - 1
                     self._pool_condition.notify_all()
                 staging = False
+            for call, context in zip(calls, contexts):
+                scope = getattr(call, "_admission_scope", None)
+                if (
+                    context is not None
+                    and getattr(call, "_direct_policy", None) is not None
+                    and isinstance(scope, _EmbeddingAdmissionScope)
+                ):
+                    self._engine_bind_admission_scope(scope, context)
             return contexts
         finally:
             if staging:
@@ -1833,6 +1976,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         timeout=None,
         cancel=None,
         close_source=False,
+        admission_scope=None,
     ) -> EmbeddingWindowStream:
         """Create inert direct intake over the same async bridge and engine."""
         self._validate_direct_policy(policy, input_type)
@@ -1845,6 +1989,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             cancel=cancel,
             close_source=close_source,
             _direct_policy=policy,
+            _admission_scope=admission_scope,
         )
 
     def _stream_bridge(self):
