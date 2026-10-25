@@ -53,7 +53,7 @@ fragment identities.
 
 Existing embedding method signatures are preserved:
 
-```python
+```text
 service.embed_texts(texts, *, input_type="document", timeout=None, cancel=None)
 service.astream_texts(windows, *, input_type="document",
                       max_pending_windows=2, timeout=None, cancel=None,
