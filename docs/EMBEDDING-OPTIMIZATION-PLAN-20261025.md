@@ -1,5 +1,13 @@
 # Piano di ottimizzazione embedding — 25 ottobre 2026
 
+Continuazione autorizzata: il successivo messaggio umano del 25 ottobre ha
+avviato lo sviluppo e la qualifica con due repliche EmbeddingGemma su GPU
+separate, parallel 4. La revisione 5 è ora adottata; il ciclo Flower
+`BOOT-000029` governa i packet `PACKET-000032`–`PACKET-000038` delle milestone
+29–35. Le sezioni seguenti conservano la fotografia della progettazione;
+non costituiscono un risultato delle nuove prove. L'estensione opzionale
+rimane distinta dall'effettiva implementazione/verifica del server remoto.
+
 **Stato: progettazione, senza implementazione o nuove prove.** Piano concordato
 fra la chat runtime e la chat CodingCastle: runtime possiede il filone scheduler;
 CC ha revisionato limiti operativi, lifecycle e overhead dal lato consumer.

@@ -1,9 +1,9 @@
 # Architettura della libreria
 
 La [proposta di ottimizzazione del 25 ottobre 2026](EMBEDDING-OPTIMIZATION-PLAN-20261025.md)
-è registrata in Flower come revisione 5 proposta, base 4. Definisce scheduler
-per replica e limiti operativi; non è ancora implementata o adottata e non
-sostituisce il comportamento del codice descritto qui.
+è registrata in Flower come revisione 5, base 4, ora adottata per lo sviluppo
+autorizzato nel ciclo `BOOT-000029`. Definisce scheduler per replica e limiti
+operativi; l'adozione non implica completamento o qualifica dell'implementazione.
 
 Il package Python `runtime-llama` separa i contratti per i consumer dal
 trasporto HTTP e dall'inferenza eseguita da llama-server. La base funzionale è
