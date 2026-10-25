@@ -17,6 +17,7 @@ def configured(**changes):
         "model": "embed-model",
         "base_url": "https://remote.example/vpn",
         "timeout": 7.0,
+        "dimension": 2,  # RecordingClient always returns this declared width.
         "embedding_prefixes": {"query": "Q: ", "document": "D: "},
     }
     values.update(changes)
@@ -25,6 +26,24 @@ def configured(**changes):
 
 def vector(text):
     return [float(len(text)), float(sum(map(ord, text)))]
+
+
+def verified_catalog():
+    # Both synthetic replicas execute the same deterministic vector function;
+    # declare matching content/semantic identity instead of bypassing discovery.
+    return {
+        "data": [
+            {
+                "id": alias,
+                "status": {"value": "loaded"},
+                "tags": [
+                    "noxi-content-sha256-v1:" + "a" * 64,
+                    "noxi-embedding-sha256-v1:" + "b" * 64,
+                ],
+            }
+            for alias in ("embed-0", "embed-1")
+        ]
+    }
 
 
 class RecordingClient:
@@ -37,6 +56,9 @@ class RecordingClient:
         self.tokenize_calls = []
         self.embedding_calls = []
         self.lock = Lock()
+
+    def health(self, **kwargs):
+        return {"status": "ok"}
 
     def props(self, model=None, **kwargs):
         with self.lock:
@@ -237,7 +259,7 @@ def test_empty_inputs_remain_empty_even_with_nonempty_prefixes(make_adapter):
 
 def test_prefix_counts_toward_input_limit_and_raw_call_recovers(make_adapter):
     client = RecordingClient(context=4, counts={"x": 2, "Q: x": 5})
-    adapter, _ = make_adapter(client)
+    adapter, _ = make_adapter(client, dimension=None)
     with pytest.raises(LLMBackendError, match="input_exceeds_context:tokens=5:limit=4"):
         adapter.embed_query("x")
     assert not client.embedding_calls
@@ -280,6 +302,9 @@ def test_prefixes_are_shared_by_replicas_with_stable_result_order(make_adapter):
             super().__init__()
             self.first_started, self.release_first = Event(), Event()
             self.completions = []
+
+        def models(self, **kwargs):
+            return verified_catalog()
 
         def embeddings(self, input, model=None, **kwargs):
             result = super().embeddings(input, model=model, **kwargs)
@@ -324,6 +349,9 @@ def test_concurrent_query_cancellation_does_not_change_document_task(make_adapte
             super().__init__(total_slots=2)
             self.query_started, self.release_query = Event(), Event()
 
+        def models(self, **kwargs):
+            return verified_catalog()
+
         def embeddings(self, input, model=None, **kwargs):
             result = super().embeddings(input, model=model, **kwargs)
             if input == ["Q: hold"]:
@@ -334,7 +362,15 @@ def test_concurrent_query_cancellation_does_not_change_document_task(make_adapte
             return result
 
     client = ControlledClient()
-    adapter, _ = make_adapter(client, embedding_request_parallelism=2)
+    adapter, _ = make_adapter(
+        client,
+        model="embed-0",
+        embedding_request_parallelism=2,
+        embedding_replicas=[
+            {"model": "embed-0", "max_in_flight": 1},
+            {"model": "embed-1", "max_in_flight": 1},
+        ],
+    )
     cancel = Event()
     with ThreadPoolExecutor(max_workers=2) as callers:
         query = callers.submit(

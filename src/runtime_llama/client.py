@@ -24,6 +24,7 @@ import time
 from typing import Any, Callable, Iterator
 from urllib.parse import urlencode, urlsplit
 import weakref
+import zlib
 
 import requests
 from urllib3.exceptions import NewConnectionError
@@ -41,6 +42,70 @@ _MAX_FRAME = 8 * 1024 * 1024
 _MAX_ERROR_BODY = 64 * 1024
 _MAX_ERROR_BODY_SECONDS = 5.0
 _INHERIT_IDLE_TIMEOUT = object()
+
+
+def _bounded_json_body(chunks: Iterator[bytes], encoding: str, bound: int) -> bytes:
+    """Bound wire and inflated bytes without an unbounded decoder allocation.
+
+    ``urllib3``'s decoded reads may inflate a compressed chunk before returning
+    it. Reading the wire and using zlib's hard ``max_length`` output limit keeps
+    that transient allocation inside a finite envelope. ``bound`` retains its
+    decoded-body meaning; a distinct derived wire guard admits compression
+    headers even for a tiny valid JSON body. This is not a claim about Python
+    objects allocated by the JSON decoder.
+    """
+    encoding = encoding.strip().lower()
+    if encoding not in {"", "identity", "gzip", "x-gzip", "deflate"}:
+        raise LLMBackendError("llama_server_json_unsupported_encoding")
+    body = bytearray()
+    wire_bytes = 0
+    wire_bound = bound if encoding in {"", "identity"} else max(65536, 2 * bound)
+    decoder: Any = None
+    prefix = b""
+    completed = False
+    for chunk in chunks:
+        wire_bytes += len(chunk)
+        if wire_bytes > wire_bound:
+            raise LLMBackendError("llama_server_json_response_too_large")
+        if encoding in {"", "identity"}:
+            body.extend(chunk)
+            continue
+        pending = prefix + chunk
+        prefix = b""
+        while pending:
+            if decoder is None:
+                if completed and encoding == "deflate":
+                    raise LLMBackendError("llama_server_json_invalid_compression")
+                if encoding == "deflate":
+                    if len(pending) < 2:
+                        prefix = pending
+                        break
+                    # RFC deflate uses a zlib wrapper; tolerate raw deflate as
+                    # requests does, without retrying HTTP or replaying input.
+                    wrapped = (
+                        pending[0] & 15 == 8
+                        and int.from_bytes(pending[:2], "big") % 31 == 0
+                    )
+                    window = zlib.MAX_WBITS if wrapped else -zlib.MAX_WBITS
+                else:
+                    window = 16 + zlib.MAX_WBITS
+                decoder = zlib.decompressobj(window)
+                completed = False
+            inflated = decoder.decompress(pending, bound - len(body) + 1)
+            if len(body) + len(inflated) > bound:
+                raise LLMBackendError("llama_server_json_response_too_large")
+            body.extend(inflated)
+            if decoder.eof:
+                pending = decoder.unused_data
+                decoder = None
+                completed = True
+            else:
+                pending = decoder.unconsumed_tail
+    if encoding not in {"", "identity"} and (
+        not completed or decoder is not None or prefix
+    ):
+        raise LLMBackendError("llama_server_json_invalid_compression")
+    return bytes(body)
 
 
 class ClientHTTPError(LLMBackendError):
@@ -298,6 +363,7 @@ class _HTTPCall:
             self._body,
             self._http_timeout,
             self._stop,
+            bounded_json=self._max_response_bytes is not None,
         )
         if isinstance(self._response, requests.Response) and isinstance(
             self._response.raw, Urllib3HTTPResponse
@@ -350,6 +416,48 @@ class _HTTPCall:
             if max_response_bytes is None
             else max_response_bytes
         )
+        if bound is not None:
+            if not isinstance(self._response, requests.Response):
+                # An opaque borrowed .json() has already delegated both body
+                # reads and decoding. Never silently drop a requested bound.
+                raise LLMBackendError("llama_server_json_bounded_response_required")
+            raw = getattr(self._response, "raw", None)
+            if raw is not None:
+                if not isinstance(raw, Urllib3HTTPResponse):
+                    raise LLMBackendError("llama_server_json_bounded_response_required")
+
+                def wire_chunks() -> Iterator[bytes]:
+                    size = min(65536, bound + 1)
+                    read1 = getattr(raw, "read1", None)
+                    if callable(read1):
+                        while not self._stop.is_set():
+                            chunk = read1(size, decode_content=False)
+                            if self._stop.is_set() or not chunk:
+                                return
+                            yield chunk
+                    else:
+                        # Older urllib3 lacks read1. Owned calls can interrupt
+                        # bulk reads; borrowed calls keep cooperative reads.
+                        size = size if self._interrupt is not None else 1
+                        for chunk in raw.stream(size, decode_content=False):
+                            if self._stop.is_set():
+                                return
+                            yield chunk
+
+                body = _bounded_json_body(
+                    wire_chunks(),
+                    self._response.headers.get("Content-Encoding", ""),
+                    bound,
+                )
+                if self._stop.is_set():
+                    raise LLMCancelledError()
+                self._response._content = body
+                self._response._content_consumed = True
+            elif len(self._response.content) > bound:
+                # A borrowed, pre-buffered Response is already caller-owned;
+                # bound the bytes before this client performs JSON decoding.
+                raise LLMBackendError("llama_server_json_response_too_large")
+            return self._response.json()
         if (
             isinstance(self._response, requests.Response)
             and getattr(self._response, "raw", None) is not None
@@ -371,6 +479,20 @@ class _HTTPCall:
             if bound is not None and len(content) > bound:
                 raise LLMBackendError("llama_server_json_response_too_large")
         return self._response.json()
+
+    def _read_error_json(self) -> Any:
+        # Preserve caller-owned opaque response behavior only for explicitly
+        # unbounded borrowed calls. All finite embedding/control paths and all
+        # real streamed responses use the smaller sanitized error envelope.
+        if self._max_response_bytes is None and not isinstance(
+            self._response, requests.Response
+        ):
+            return self._read_json()
+        return self._read_json(
+            max_response_bytes=min(
+                self._max_response_bytes or _MAX_ERROR_BODY, _MAX_ERROR_BODY
+            )
+        )
 
     def _signal_close(self) -> None:
         self._stop.set()
@@ -432,7 +554,7 @@ class _JSONCall(_HTTPCall):
             if self._stop.is_set():
                 return
             if not 200 <= int(self._response.status_code) < 300:
-                raise _http_error(self._response, self._read_json)
+                raise _http_error(self._response, self._read_error_json)
             payload = self._read_json()
             if not isinstance(payload, (dict, list)):
                 raise LLMBackendError("llama_server_json_payload_not_object_or_array")
@@ -535,7 +657,7 @@ class _SSEStream(_HTTPCall, Iterator[dict[str, Any]]):
             if not 200 <= int(self._response.status_code) < 300:
                 if self._idle_timeout is None:
                     raise self._bounded_http_error()
-                raise _http_error(self._response, self._read_json)
+                raise _http_error(self._response, self._read_error_json)
             for payload in _sse(self._chunks()):
                 if self._stop.is_set():
                     break
@@ -720,6 +842,8 @@ class LlamaCppClient:
         body: Any,
         timeout: float | tuple[float, float | None],
         stop: Event,
+        *,
+        bounded_json: bool = False,
     ) -> Any:
         locked = False
         try:
@@ -733,10 +857,14 @@ class LlamaCppClient:
                 locked = True
             if stop.is_set():
                 raise LLMBackendError("llama_server_client_closed")
+            headers = self._headers()
+            if bounded_json:
+                # Only advertise decoders whose output can be hard-bounded.
+                headers["Accept-Encoding"] = "gzip, deflate"
             return session.request(
                 method=method,
                 url=f"{self.base_url}{path}",
-                headers=self._headers(),
+                headers=headers,
                 json=body,
                 timeout=timeout,
                 verify=self.verify_ssl,
@@ -768,7 +896,10 @@ class LlamaCppClient:
 
         ``max_response_bytes`` does not change the existing SSE frame limit.
         The bound is enforced while reading network responses, before buffering
-        additional bytes. Borrowed custom response objects own their decoding.
+        additional bytes. Bounded requests accept identity, gzip and deflate;
+        wire and inflated byte limits precede JSON decoding. Opaque custom
+        response objects cannot satisfy a finite bound and fail closed.
+        Unbounded borrowed calls retain caller-owned decoding.
 
         For SSE only, omitted ``idle_timeout`` inherits the finite ``timeout``;
         a positive value overrides SSE idle while keeping a finite connection
@@ -961,9 +1092,15 @@ class LlamaCppClient:
         *,
         timeout: float | None = None,
         cancel_wait: bool = False,
+        max_response_bytes: int | None = None,
     ) -> Any:
         return self.request(
-            "GET", "/health", cancel=cancel, timeout=timeout, cancel_wait=cancel_wait
+            "GET",
+            "/health",
+            cancel=cancel,
+            timeout=timeout,
+            cancel_wait=cancel_wait,
+            max_response_bytes=max_response_bytes,
         )
 
     def props(

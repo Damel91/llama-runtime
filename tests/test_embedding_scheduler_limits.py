@@ -29,38 +29,32 @@ def blocked(started, release, value):
     return run
 
 
-def test_reducing_limit_drains_active_jobs_before_next_same_alias_job(scheduler):
-    first_started, second_started, next_started = Event(), Event(), Event()
-    release_first, release_second = Event(), Event()
+def test_cap_refresh_does_not_overlap_original_jobs_or_replay_them(scheduler):
+    first_started, next_started = Event(), Event()
+    release_first = Event()
     first = scheduler.submit(
         blocked(first_started, release_first, 0), unchecked, model="a"
     )
-    second = scheduler.submit(
-        blocked(second_started, release_second, 1), unchecked, model="a"
-    )
     try:
-        assert first_started.wait(2) and second_started.wait(2)
+        assert first_started.wait(2)
         following = scheduler.submit(
             lambda model: (next_started.set(), model)[1], unchecked, model="a"
         )
-        scheduler.update_limits({"a": 1, "b": 1})
+        scheduler.update_limits({"a": 100, "b": 4})
         status = scheduler.snapshot()
-        assert status["replicas"]["a"]["in_flight"] == 2
+        assert status["replicas"]["a"]["in_flight"] == 1
         assert status["replicas"]["a"]["max_in_flight"] == 1
+        assert status["replicas"]["a"]["requested_max_in_flight"] == 100
+        assert not next_started.is_set()
         release_first.set()
         assert first.result(timeout=2) == ("a", 0)
-        assert not next_started.is_set()
-        assert scheduler.snapshot()["replicas"]["a"]["in_flight"] == 1
-        release_second.set()
-        assert second.result(timeout=2) == ("a", 1)
         assert following.result(timeout=2) == "a"
         assert next_started.is_set()
     finally:
         release_first.set()
-        release_second.set()
 
 
-def test_increased_observed_capacity_admits_ready_batch_without_replaying_active():
+def test_increased_observed_slot_count_does_not_admit_second_original_post():
     scheduler = EmbeddingScheduler(2, 2, {"a": 1})
     first_started, second_started, release = Event(), Event(), Event()
     calls = []
@@ -80,8 +74,8 @@ def test_increased_observed_capacity_admits_ready_batch_without_replaying_active
         assert first_started.wait(2)
         assert not second_started.is_set()
         scheduler.update_limits({"a": 2})
-        assert second_started.wait(2)
-        assert scheduler.snapshot()["in_flight"] == 2
+        assert not second_started.is_set()
+        assert scheduler.snapshot()["in_flight"] == 1
         release.set()
         assert first.result(timeout=2) == ("a", 0)
         assert second.result(timeout=2) == ("a", 1)
@@ -101,8 +95,8 @@ def test_capacity_refresh_retains_global_bound_and_affinity():
             scheduler.submit(blocked(started[i], release, i), unchecked, model=model)
             for i, model in enumerate(("a", "a", "b"))
         ]
-        assert started[0].wait(2) and started[1].wait(2)
-        assert not started[2].is_set()
+        assert started[0].wait(2) and started[2].wait(2)
+        assert not started[1].is_set()
         assert scheduler.snapshot()["in_flight"] == 2
         release.set()
         assert [p.result(timeout=2) for p in pending] == [("a", 0), ("a", 1), ("b", 2)]
@@ -112,7 +106,7 @@ def test_capacity_refresh_retains_global_bound_and_affinity():
         scheduler.close()
 
 
-def test_limit_increase_wakes_zero_queue_backpressured_submitter():
+def test_zero_queue_backpressure_survives_a_slot_limit_increase():
     scheduler = EmbeddingScheduler(2, 0, {"a": 1})
     started, release, waiting = Event(), Event(), Event()
     first = scheduler.submit(blocked(started, release, 0), unchecked, model="a")
@@ -127,6 +121,9 @@ def test_limit_increase_wakes_zero_queue_backpressured_submitter():
             )
             assert waiting.wait(2)
             scheduler.update_limits({"a": 2})
+            assert not admitted.done()
+            release.set()
+            assert first.result(timeout=2) == ("a", 0)
             assert admitted.result(timeout=2).result(timeout=2) == "a"
         assert scheduler.snapshot()["peak_queued"] == 0
         release.set()

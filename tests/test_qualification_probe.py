@@ -189,6 +189,12 @@ class MetadataClient:
                     "id": alias,
                     "status": {"value": "loaded" if self.loaded else "unloaded"},
                     "meta": {"n_embd": self.metadata_dimension},
+                    "tags": [
+                        "noxi-content-sha256-v1:" + "a" * 64,
+                        "noxi-embedding-sha256-v1:" + "b" * 64,
+                    ]
+                    if alias in self.args.replica
+                    else [],
                 }
                 for alias in [self.args.llm_model, *self.args.replica]
             ]
@@ -393,6 +399,26 @@ class InferenceClient:
         self.barrier = Barrier(4)
         self.closed = False
 
+    def health(self, **kwargs):
+        return {"status": "ok"}
+
+    def models(self, **kwargs):
+        if hasattr(self, "args"):
+            return MetadataClient.models(self, **kwargs)
+        return {
+            "data": [
+                {
+                    "id": "fixture-embed_" + str(index),
+                    "status": {"value": "loaded"},
+                    "tags": [
+                        "noxi-content-sha256-v1:" + "a" * 64,
+                        "noxi-embedding-sha256-v1:" + "b" * 64,
+                    ],
+                }
+                for index in range(2)
+            ]
+        }
+
     def props(self, **kwargs):
         return {"total_slots": 4, "default_generation_settings": {"n_ctx": 512}}
 
@@ -415,6 +441,15 @@ class InferenceClient:
 
     def close(self):
         self.closed = True
+
+
+def inference_adapter(config, client=None):
+    client = client or InferenceClient()
+    # Native slots no longer multiply HTTP admission on one replica. The
+    # barrier still proves real overlap across independently verified aliases.
+    underlying = getattr(client, "client", client)
+    underlying.barrier = Barrier(len(config["embedding_replicas"]))
+    return build_embedding_adapter(config, client=client)
 
 
 class LLMAdapter:
@@ -441,7 +476,7 @@ def test_offline_four_phases_preserve_every_vector_and_measure_real_call_overlap
     report = {"phases": []}
     runtime = {
         "client": InferenceClient,
-        "embedding": build_embedding_adapter,
+        "embedding": inference_adapter,
         "llm": lambda config, client: LLMAdapter(config, client),
     }
     for label, caps, baseline, mixed in [
@@ -462,7 +497,7 @@ def test_offline_four_phases_preserve_every_vector_and_measure_real_call_overlap
         )
         assert phase["result"] == "passed"
         assert phase["processed"] == 32
-        assert phase["activity"]["maximum_embedding_requests"] == 4
+        assert phase["activity"]["maximum_embedding_requests"] == len(caps)
         assert phase["activity"]["active_at_finish"] == 0
         assert phase["activity"]["response_associations_checked"] == 32
         assert phase["activity"]["same_request_order_projection_checks"] == 32
@@ -510,7 +545,7 @@ def test_campaign_continues_numeric_failures_and_never_reports_false_pass(
     monkeypatch.setattr(
         runtime_llama,
         "build_embedding_adapter",
-        lambda config, client=None: build_embedding_adapter(
+        lambda config, client=None: inference_adapter(
             config, client=client or CampaignClient()
         ),
     )
@@ -550,7 +585,7 @@ def test_phase_fails_immediately_for_output_permuted_against_own_request(tmp_pat
 
     class PermutedAdapter:
         def __init__(self, config, client):
-            self.adapter = build_embedding_adapter(config, client=client)
+            self.adapter = inference_adapter(config, client=client)
 
         def embed_texts(self, texts, **kwargs):
             values = self.adapter.embed_texts(texts, **kwargs)

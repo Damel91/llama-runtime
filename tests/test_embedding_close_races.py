@@ -24,6 +24,8 @@ def test_close_during_pending_work_preserves_typed_first_failure(
         token_count_parallelism=1,
         embedding_request_parallelism=1,
         embedding_queue_size=0,
+        # This case targets engine-queued work, distinct from H admission.
+        embedding_max_pending_owners=2 if phase == "queued" else 1,
     )
     metadata_entered, release_metadata = Event(), Event()
     props = client.props
@@ -140,4 +142,39 @@ def test_busy_replica_does_not_block_collection_of_other_prepared_quota(monkeypa
         assert adapter._scheduler.snapshot()["peak_in_flight"] == 2
     finally:
         release_a.set()
+        adapter.close()
+
+
+def test_close_stops_sync_owner_waiting_before_engine_registration():
+    client = ContractClient(1)
+    client.token_gate.clear()
+    adapter = configured(
+        client,
+        timeout=5,
+        token_count_parallelism=1,
+        embedding_request_parallelism=1,
+        embedding_queue_size=0,
+        embedding_max_pending_owners=1,
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=3) as callers:
+            first = callers.submit(adapter.embed_query, "one")
+            assert client.token_started.wait(2)
+            second = callers.submit(adapter.embed_query, "two")
+            eventually(lambda: adapter._intake.snapshot()["owner_waiters"] == 1)
+            assert len(adapter._calls) == 1
+            assert client.token_active == 1
+            assert len(client.token_calls) == 1
+            closing = callers.submit(adapter.close)
+            for pending in (first, second):
+                with pytest.raises(LLMBackendError, match="adapter_closed"):
+                    pending.result(timeout=4)
+            closing.result(timeout=4)
+        view = adapter._intake.snapshot()
+        assert view["owners"] == view["owner_waiters"] == 0
+        assert view["snapshot_bytes"] == 0
+        assert not adapter._calls and not client.embedding_calls
+        assert client.token_active == client.embed_active == 0
+    finally:
+        client.token_gate.set()
         adapter.close()

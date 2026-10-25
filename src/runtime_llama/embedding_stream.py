@@ -65,9 +65,7 @@ class _EmbeddingWindowBridge:
 
     def __init__(self, adapter):
         self.adapter = adapter
-        self.capacity = max(
-            1, adapter.embedding_request_parallelism + adapter.embedding_queue_size
-        )
+        self.capacity = adapter._intake.owner_limit
         self.loop = None
         self.streams = set()
         self.used = 0
@@ -97,23 +95,27 @@ class _EmbeddingWindowBridge:
             previous.set()
 
     async def acquire(self, call):
-        while True:
+        # The same fixed adapter-wide owner budget also covers synchronous
+        # registration. Acquire it before touching the source iterator.
+        lease = await self.adapter._intake.acquire_owner_async(call)
+        try:
             call.check()
             with self.adapter._calls_lock:
-                if self.used < self.capacity:
-                    self.used += 1
-                    return
-                changed = self.changed
-            try:
-                await asyncio.wait_for(
-                    changed.wait(), timeout=min(0.05, call.remaining())
-                )
-            except TimeoutError:
-                pass
+                if self.adapter._closed or self.adapter._closing.is_set():
+                    raise LLMBackendError("llamacpp_embedding_adapter_closed")
+                self.used += 1
+                call._bridge_intake_released = False
+        except BaseException:
+            lease.release()
+            raise
 
-    def release(self):
+    def release(self, call):
         with self.adapter._calls_lock:
+            if getattr(call, "_bridge_intake_released", False):
+                return
+            call._bridge_intake_released = True
             self.used -= 1
+        call._intake_lease.release()
         self._notify()
 
     def submit(self, window, *, prepared, input_type, call):
@@ -286,11 +288,9 @@ class EmbeddingWindowStream:
                     break
                 if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
                     raise ValueError("each window must be a finite sequence")
-                copied = list(value)
-                if not self._prepared and any(
-                    not isinstance(text, str) for text in copied
-                ):
-                    raise ValueError("text windows must contain only strings")
+                copied = await call._intake_lease.snapshot_async(
+                    value, prepared=self._prepared
+                )
                 call.check()
                 # Preserve source-window provenance without changing dispatch
                 # or result ordering. Recovery never guesses it from text.
@@ -315,10 +315,11 @@ class EmbeddingWindowStream:
         finally:
             if self._pull_lease and (self._pull is None or self._pull.done()):
                 self._pull_lease = False
-                self._bridge.release()
+                self._bridge.release(self._pull_call)
             # A cancelled source pull can still be executing its async finally.
-            # Cleanup owns that lease until the actual pull task has drained.
-            self._pull_call = None
+            # Cleanup owns its call and lease until that pull has really drained.
+            if not self._pull_lease:
+                self._pull_call = None
             self._notify()
 
     def _completed(self, future):
@@ -336,7 +337,7 @@ class EmbeddingWindowStream:
         try:
             self._adapter._stream_release_result(window.call)
         finally:
-            self._bridge.release()
+            self._bridge.release(window.call)
 
     def _ensure_cleanup(self):
         if self._cleanup_task is None and self._loop is not None:
@@ -359,7 +360,8 @@ class EmbeddingWindowStream:
                 await asyncio.gather(*owned, return_exceptions=True)
             if self._pull_lease:
                 self._pull_lease = False
-                self._bridge.release()
+                self._bridge.release(self._pull_call)
+                self._pull_call = None
             if self._pending:
                 await asyncio.gather(
                     *(asyncio.shield(item.future) for item in self._pending),

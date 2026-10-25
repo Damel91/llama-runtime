@@ -656,7 +656,11 @@ def test_concurrent_streams_and_sync_caller_share_caps_and_cancel_locally():
         client = ContractClient(2)
         client.embed_gate.clear()
         adapter = configured(
-            client, embedding_request_parallelism=2, embedding_queue_size=0, timeout=5
+            client,
+            embedding_request_parallelism=2,
+            embedding_queue_size=0,
+            embedding_max_pending_owners=3,
+            timeout=5,
         )
         a = adapter.astream_texts(WindowSource([["async-a"]]))
         b = adapter.astream_texts(WindowSource([["async-b"]]))
@@ -1071,25 +1075,19 @@ def test_window_timeout_starts_before_global_admission_without_cancelling_owner(
     run(scenario)
 
 
-def test_completed_result_does_not_expire_while_consumer_is_paused(monkeypatch):
+def test_completed_result_does_not_expire_while_consumer_is_paused():
     async def scenario():
         client = ContractClient(1)
         adapter = configured(client, timeout=5)
-        ready = Event()
-        original = client.embeddings
-
-        def embeddings(input, **kwargs):
-            result = original(input, **kwargs)
-            if input == ["second"]:
-                ready.set()
-            return result
-
-        monkeypatch.setattr(client, "embeddings", embeddings)
         stream = adapter.astream_texts(WindowSource([["first"], ["second"]]), timeout=1)
         try:
             async with stream:
                 assert await anext(stream) == [vector("first")]
-                await wait_thread(ready)
+                # Source-window completion, independent of whether compatible
+                # windows shared the same embedding POST.
+                await wait_until(
+                    lambda: bool(stream._pending) and stream._pending[0].future.done()
+                )
                 # Intentionally advance real time past the documented budget;
                 # this tests deadline semantics, not a performance threshold.
                 expired = asyncio.Event()
@@ -1264,7 +1262,11 @@ def test_empty_window_does_not_compare_a_stale_dimension_snapshot(monkeypatch):
     async def scenario():
         client = ContractClient(1)
         adapter = configured(
-            client, embedding_request_parallelism=2, embedding_queue_size=0, timeout=5
+            client,
+            dimension=None,
+            embedding_request_parallelism=2,
+            embedding_queue_size=0,
+            timeout=5,
         )
         empty_registered, dimension_known = Event(), Event()
         submit, request, finish = (
@@ -1409,6 +1411,7 @@ def test_async_window_over_result_lower_bound_fails_before_tokenization():
         client = ContractClient(1)
         adapter = configured(
             client,
+            dimension=None,
             embedding_request_parallelism=1,
             embedding_queue_size=0,
             embedding_max_pending_bytes=512,

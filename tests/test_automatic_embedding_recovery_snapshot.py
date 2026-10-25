@@ -7,6 +7,7 @@ from runtime_llama.client import ClientHTTPError
 
 from test_automatic_embedding import make_service as make_service, remote
 from test_automatic_embedding_recovery import assert_halves, failing_native
+from test_embedding_contracts import vector
 
 
 @pytest.mark.parametrize("changed_identity", ["tokenizer", "content"])
@@ -33,9 +34,12 @@ def test_native_isolation_rejects_changed_identity_before_child_post(
         return original
 
     client.failure = failure
-    service, _ = make_service(client, request_parallelism=1, batch_size=2)
+    # N-wide planning is independent of the global HTTP guard. Four inputs
+    # give each replica a two-row original POST, so this exercises the fresh
+    # check before an isolation child rather than singleton rejection advice.
+    service, _ = make_service(client, request_parallelism=1, batch_size=4)
     with pytest.raises(LLMBackendError, match="identity_changed|tokenizer_changed"):
-        service.embed_texts(["okay", "x" * 80])
+        service.embed_texts(["okay", "x" * 80, "also okay", "y" * 80])
     assert changed and len(client.embedding_calls) == 1
     assert client.embedding_calls[0][0] == "embed_0"
     assert not client.token_calls and not service.config.cache_dir.exists()
@@ -49,7 +53,9 @@ def test_midpoint_advice_does_not_claim_fit_on_different_capacity_replica(
     client.contexts["embed_1"] = 64
     failing_native(client)
     service, _ = make_service(client, request_parallelism=1, batch_size=2)
-    source = "α🙂漢字" * 50
+    # Keep the two same-size Unicode halves distinguishable so the fake
+    # server's routed occurrences can be correlated without assuming aliases.
+    source = "α🙂漢字" * 25 + "漢字🙂α" * 25
     with pytest.raises(EmbeddingChunkSplitRequiredError) as caught:
         service.embed_texts([source])
     assert client.embedding_calls[0][0] == "embed_0"
@@ -59,12 +65,30 @@ def test_midpoint_advice_does_not_claim_fit_on_different_capacity_replica(
     # consumer retry may therefore request another halving without pretending
     # that any estimated/exact token admission happened in the library.
     assert all(64 < len("search_document: " + piece) + 1 <= 128 for piece in pieces)
+    before = len(client.embedding_calls)
     with pytest.raises(EmbeddingChunkSplitRequiredError) as repeated:
         service.embed_texts(pieces)
-    assert repeated.value.failed_input_indices == (0, 1)
+    routed = {
+        text: model for model, rows in client.embedding_calls[before:] for text in rows
+    }
+    assert set(routed.values()) == {"embed_0", "embed_1"}
+    failed = tuple(
+        index
+        for index, piece in enumerate(pieces)
+        if len("search_document: " + piece) + 1
+        > client.contexts[routed["search_document: " + piece]]
+    )
+    assert len(failed) == 1
+    assert repeated.value.failed_input_indices == failed
+    assert [item.input_index for item in repeated.value.completed] == [
+        index for index in range(len(pieces)) if index not in failed
+    ]
+    for item in repeated.value.completed:
+        assert item.embedding == tuple(
+            vector("search_document: " + pieces[item.input_index])
+        )
     for item in repeated.value.inputs:
         assert_halves(item, pieces[item.input_index])
-    assert client.embedding_calls[1][0] == "embed_1"
     assert not client.token_calls and not service.config.cache_dir.exists()
     assert not service._operations
 

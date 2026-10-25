@@ -6,6 +6,7 @@ Neither a path, a display name nor a vector width establishes equivalence.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 import re
 from typing import Any
@@ -237,3 +238,56 @@ def verify_loaded_replica(
     parsed = parse_replica(matches[0])
     if identity is not None and parsed.identity != identity:
         raise LLMBackendError("llamacpp_embedding_content_identity_changed")
+
+
+def verify_explicit_pool(
+    catalog: Any,
+    models: Iterable[str],
+    *,
+    pinned: ReplicaIdentity | None = None,
+) -> EmbeddingPool:
+    """Verify only the explicitly configured, loaded canonical destinations.
+
+    Synonyms of one catalog entry consume one original lease. More than one
+    distinct destination requires matching content and embedding digests; a
+    name, path or vector width never establishes that equivalence. A single
+    unverified entry remains a conservative exact-target fallback.
+    """
+    entries = catalog.get("data") if isinstance(catalog, dict) else None
+    if not isinstance(entries, list) or any(not isinstance(e, dict) for e in entries):
+        raise LLMBackendError("llamacpp_embedding_invalid_model_catalog")
+    if isinstance(models, (str, bytes)):
+        raise LLMBackendError("llamacpp_embedding_invalid_model_selector")
+    try:
+        selectors = tuple(models)
+    except TypeError:
+        raise LLMBackendError("llamacpp_embedding_invalid_model_selector") from None
+    if not selectors or any(
+        not isinstance(model, str) or not model for model in selectors
+    ):
+        raise LLMBackendError("llamacpp_embedding_invalid_model_selector")
+    selected: dict[str, DiscoveredReplica] = {}
+    for selector in dict.fromkeys(selectors):
+        matches = [entry for entry in entries if selector in catalog_aliases(entry)]
+        if len(matches) > 1:
+            raise LLMBackendError("llamacpp_embedding_ambiguous_model")
+        if not matches or not is_loaded(matches[0]):
+            raise LLMBackendError("llamacpp_embedding_model_not_loaded")
+        replica = parse_replica(matches[0])
+        # POST uses the canonical id; it must resolve uniquely even when the
+        # configured synonym itself was unambiguous.
+        if sum(replica.model in catalog_aliases(entry) for entry in entries) != 1:
+            raise LLMBackendError("llamacpp_embedding_ambiguous_model")
+        if pinned is not None and replica.identity != pinned:
+            raise LLMBackendError("llamacpp_embedding_content_identity_changed")
+        selected[replica.model] = replica
+    replicas = tuple(selected[model] for model in sorted(selected))
+    identities = {replica.identity for replica in replicas}
+    if len(replicas) > 1 and (None in identities or len(identities) != 1):
+        raise LLMBackendError("llamacpp_embedding_ambiguous_model_identity")
+    identity = replicas[0].identity
+    return EmbeddingPool(
+        replicas,
+        identity,
+        replicas[0].model if identity is None else None,
+    )

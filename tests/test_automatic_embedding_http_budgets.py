@@ -54,8 +54,8 @@ def large_vectors():
 
 @pytest.fixture
 def facade_endpoint(endpoint, large_vectors):
-    def start(*, compressed=False, incomplete=False):
-        _, large_body = large_vectors
+    def start(*, compressed=False, incomplete=False, large=False):
+        vectors, _ = large_vectors
         server = remote(replicas=1, context=2048)
         headers = []
 
@@ -89,8 +89,31 @@ def facade_endpoint(endpoint, large_vectors):
                 assert handler.path == "/v1/embeddings", handler.path
                 assert isinstance(body["input"], list)
                 assert all(isinstance(text, str) for text in body["input"])
-                if len(body["input"]) == 128:
-                    send(handler, large_body, compress=compressed, truncate=incomplete)
+                rows = body["input"]
+                if large:
+                    # Reply to the actual requested cardinality, including the
+                    # one-row dimension bootstrap. Distinct source vectors
+                    # remain correlated even if the request is safely split.
+                    payload = {
+                        "object": "list",
+                        "data": [
+                            {
+                                "index": index,
+                                "embedding": vectors[
+                                    int(rows[index].removeprefix("item-"))
+                                    if rows[index].startswith("item-")
+                                    else 0
+                                ],
+                            }
+                            for index in reversed(range(len(rows)))
+                        ],
+                    }
+                    send(
+                        handler,
+                        json.dumps(payload, separators=(",", ":")).encode(),
+                        compress=compressed,
+                        truncate=incomplete,
+                    )
                     return
                 payload = {
                     "data": [
@@ -152,17 +175,25 @@ def posts(seen):
 
 @pytest.mark.parametrize("compressed", [False, True])
 def test_public_default_response_cap_rejects_large_body_and_drains_without_replay(
-    facade_endpoint, compressed
+    facade_endpoint, large_vectors, compressed
 ):
-    base_url, seen, _ = facade_endpoint(compressed=compressed)
-    service = service_for(base_url)
+    expected, _ = large_vectors
+    base_url, seen, _ = facade_endpoint(compressed=compressed, large=True)
+    # Isolate the configured JSON cap from conservative decoded-vector and
+    # handoff admission. This budget funds the same full 128-row wire payload
+    # for both the rejecting 8 MiB and accepting 16 MiB configurations.
+    service = service_for(base_url, embedding_max_pending_bytes=512 * _MIB)
     incoming = [f"item-{index:03}" for index in range(128)]
     try:
+        warmup = service.embed_query("warmup")
+        assert warmup == pytest.approx(expected[0], abs=1e-5)
+        assert_drained(service)
+        seen.clear()
         with pytest.raises(LLMBackendError, match="json_response_too_large"):
             service.embed_texts(incoming)
         assert posts(seen) == [{"input": incoming, "model": "embed_0"}]
         assert_drained(service)
-        assert service.embed_query("healthy") == [1.0, 0.0]
+        assert service.embed_query("healthy") == pytest.approx(expected[0], abs=1e-5)
         assert len(posts(seen)) == 2
         assert_drained(service)
     finally:
@@ -174,10 +205,18 @@ def test_public_larger_response_cap_accepts_ordered_128_by_4096_vectors(
     facade_endpoint, large_vectors
 ):
     expected, _ = large_vectors
-    base_url, seen, _ = facade_endpoint()
-    service = service_for(base_url, embedding_max_response_bytes=16 * _MIB)
+    base_url, seen, _ = facade_endpoint(large=True)
+    service = service_for(
+        base_url,
+        embedding_max_response_bytes=16 * _MIB,
+        embedding_max_pending_bytes=512 * _MIB,
+    )
     incoming = [f"item-{index:03}" for index in range(128)]
     try:
+        warmup = service.embed_query("warmup")
+        assert warmup == pytest.approx(expected[0], abs=1e-5)
+        assert_drained(service)
+        seen.clear()
         result = service.embed_texts(incoming)
         assert len(result) == 128
         for actual, source in zip(result, expected):
@@ -275,6 +314,10 @@ def test_public_pending_token_budget_controls_high_context_cardinality(
     )
     incoming = [f"short-{index}" for index in range(256)]
     try:
+        # Measure token-reservation cardinality after the independent one-row
+        # dimension bootstrap has established the decoded result allowance.
+        assert service.embed_query("warmup") == vector("search_query: warmup")
+        client.embedding_calls.clear()
         assert service.embed_texts(incoming) == [
             vector("search_document: " + text) for text in incoming
         ]

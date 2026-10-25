@@ -156,7 +156,7 @@ def test_discovery_configuration_is_strict_boolean(settings):
         )
 
 
-def test_discovery_defaults_do_not_change_legacy_parallelism():
+def test_defaults_keep_automatic_policy_and_preserve_positive_guards():
     legacy = AdapterProfile.from_config(
         "embedding", {"model": "x", "adapter_type": "embedding"}
     )
@@ -177,8 +177,8 @@ def test_discovery_defaults_do_not_change_legacy_parallelism():
             "embedding_request_parallelism": 2,
         },
     )
-    assert legacy.embedding_request_parallelism == 1
-    assert auto.embedding_request_parallelism == 4
+    assert legacy.embedding_request_parallelism is None
+    assert auto.embedding_request_parallelism is None
     assert explicit.embedding_request_parallelism == 2
 
 

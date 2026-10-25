@@ -8,7 +8,7 @@ import pytest
 
 from runtime_llama.adapters.embedding import _Call, _TextInputs
 from runtime_llama.embedding_engine import _MetadataRound, _Preflight, _State
-from runtime_llama.errors import LLMCancelledError
+from runtime_llama.errors import LLMBackendError, LLMCancelledError
 
 from test_embedding_contracts import (
     ContractClient,
@@ -127,10 +127,12 @@ def test_registered_windows_share_admission_and_simultaneous_dispatch_catalog():
         dimension=2,
         embedding_request_parallelism=2,
         embedding_queue_size=2,
+        # One priming owner plus the four owners injected as one cohort.
+        embedding_max_pending_owners=5,
         embedding_batch_wait_sec=0,
         timeout=5,
     )
-    pending = []
+    pending, calls = [], []
     try:
         with ThreadPoolExecutor(1) as workers:
             prime = workers.submit(adapter.embed_texts, ["prime0", "prime1"])
@@ -140,6 +142,7 @@ def test_registered_windows_share_admission_and_simultaneous_dispatch_catalog():
             with adapter._engine._condition:
                 for window in windows:
                     call = _Call(adapter, None)
+                    calls.append(call)
                     pending.append(
                         adapter._submit_execute(
                             _TextInputs(window, "", "raw"),
@@ -173,6 +176,18 @@ def test_registered_windows_share_admission_and_simultaneous_dispatch_catalog():
         assert adapter._engine.snapshot()["metadata_targets"] == 0
     finally:
         client.embed_gate.set()
+        for call in calls:
+            call.stop.set()
+        adapter._engine.wake()
+        for future in pending:
+            try:
+                future.result(3)
+            except (LLMBackendError, LLMCancelledError):
+                pass
+        for call in calls:
+            lease = getattr(call, "_intake_lease", None)
+            if lease is not None:
+                lease.release()
         adapter.close()
 
 

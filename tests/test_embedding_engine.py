@@ -296,7 +296,7 @@ def test_nonqueueing_scheduler_dispatch_never_freezes_waiting_work():
         scheduler.close()
 
 
-def test_result_credits_follow_source_order_when_earlier_discovery_is_slow():
+def test_result_credits_follow_source_order_when_earlier_discovery_is_slow(monkeypatch):
     class SlowFirstStart(ContractClient):
         def __init__(self):
             super().__init__(1)
@@ -326,14 +326,61 @@ def test_result_credits_follow_source_order_when_earlier_discovery_is_slow():
             embedding_max_pending_bytes=1024,
             token_count_parallelism=1,
             timeout=5,
+            # This case needs an unknown-dimension seed from the later owner
+            # while the earlier owner's metadata is still delayed.
+            dimension=None,
         )
         windows = [["a0", "a1"], ["b0", "b1", "b2", "b3"]]
+        validated, return_response, reserve_checked, completed_checked = (
+            Event() for _ in range(4)
+        )
+        run_shared = adapter._engine_run_shared
+        reserve_result = adapter._engine._reserve_result
+
+        def held_response(model, records, owners, group, observed):
+            result = run_shared(model, records, owners, group, observed)
+            if any(record.text.startswith("b") for record in records):
+                # Width is already visible in call.dimension, but the HTTP
+                # Future/lease has not completed. Force a coordinator pass in
+                # precisely the race that used to grant the younger credits.
+                validated.set()
+                adapter._engine.wake()
+                client._wait(
+                    return_response, cancel=group.probe, timeout=group.remaining()
+                )
+            return result
+
+        def checked_reservation(state):
+            result = reserve_result(state)
+            if getattr(state.call, "_window_index", None) == 1:
+                if validated.is_set() and not return_response.is_set():
+                    reserve_checked.set()
+                if state.response_dimension is not None:
+                    completed_checked.set()
+            return result
+
+        monkeypatch.setattr(adapter, "_engine_run_shared", held_response)
+        monkeypatch.setattr(adapter._engine, "_reserve_result", checked_reservation)
         stream = adapter.astream_texts(WindowSource(windows), max_pending_windows=2)
         first = asyncio.create_task(anext(stream))
         try:
             await wait_thread(client.first_props)
             await wait_thread(client.embed_started)
             assert client.embedding_calls[0][1][0].startswith("b")
+            await wait_thread(validated)
+            await wait_thread(reserve_checked)
+            states = sorted(
+                tuple(adapter._engine._states),
+                key=lambda state: state.call._window_index,
+            )
+            assert states[1].call.dimension == 2
+            assert states[1].response_dimension is None
+            assert states[1].result_credit == 0
+            return_response.set()
+            await wait_thread(completed_checked)
+            assert states[0].context is None
+            assert states[0].result_credit == 416
+            assert states[1].result_credit == 0
             client.release.set()
             assert await asyncio.wait_for(first, 3) == [
                 vector(text) for text in windows[0]
@@ -343,6 +390,7 @@ def test_result_credits_follow_source_order_when_earlier_discovery_is_slow():
             ]
             assert adapter._engine.snapshot()["peak_result_reserved_bytes"] <= 1024
         finally:
+            return_response.set()
             client.release.set()
             await asyncio.gather(first, return_exceptions=True)
             await stream.aclose()

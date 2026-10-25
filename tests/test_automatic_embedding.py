@@ -413,7 +413,13 @@ def test_invalid_inputs_do_not_initialize_or_infer(make_service, calibration):
         {"calibration_workers": True},
         {"calibration_workers": 33},
         {"batch_size": 0},
-        {"request_parallelism": None},
+        {"request_parallelism": 0},
+        {"request_parallelism": True},
+        {"request_parallelism": 1.5},
+        {"embedding_max_pending_owners": 0},
+        {"embedding_max_pending_owners": -1},
+        {"embedding_max_pending_owners": True},
+        {"embedding_max_pending_owners": 1.5},
         {"queue_size": -1},
         {"normalize": 1},
         {"trust_env": "yes"},
@@ -428,6 +434,30 @@ def test_config_validation(changes):
     values.update(changes)
     with pytest.raises(ValueError):
         AutomaticEmbeddingConfig(**values)
+
+
+@pytest.mark.parametrize("parallelism,effective", [(None, 2), (1, 1), (4, 2)])
+@pytest.mark.parametrize("owners", [None, 1, 3])
+def test_config_auto_guard_and_owner_limit_survive_verified_discovery(
+    make_service, parallelism, effective, owners
+):
+    service, client = make_service(
+        request_parallelism=parallelism,
+        embedding_max_pending_owners=owners,
+    )
+    assert service.config.request_parallelism == parallelism
+    assert service.config.embedding_max_pending_owners == owners
+    assert service.embed_texts(["one", "two"]) == [
+        vector("search_document: one"),
+        vector("search_document: two"),
+    ]
+    adapter = service._adapter
+    assert adapter.profile.embedding_request_parallelism == parallelism
+    assert adapter._scheduler.requested_parallelism == parallelism
+    assert adapter.embedding_request_parallelism == effective
+    if owners is not None:
+        assert adapter._intake.owner_limit == owners
+    assert not client.token_calls
 
 
 def test_config_secrets_are_not_in_repr():

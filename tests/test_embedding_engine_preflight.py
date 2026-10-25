@@ -39,6 +39,7 @@ def test_completed_preflight_wins_rotation_before_another_owner_probes(owner_sta
         embedding_dim=2,
         embedding_batch_wait_sec=0,
         _scheduler=scheduler,
+        _engine_payload_overhead=lambda _model: 64,
         _engine_batch_call=lambda calls: SimpleNamespace(check_local=lambda: None),
     )
     engine = PersistentEmbeddingEngine(adapter)

@@ -101,7 +101,7 @@ def test_resource_pressure_flushes_partial_model_batch_without_a_timer(pressure)
     incoming = texts(8)
     client.counts.update(dict.fromkeys(incoming, 2))
     limits = (
-        {"embedding_max_pending_bytes": 1024}
+        {"embedding_max_pending_bytes": 2048}
         if pressure == "bytes"
         else {"embedding_max_pending_tokens": 3}
     )
@@ -182,13 +182,13 @@ def test_explicit_token_budget_splits_a_batch_gathered_across_owners():
 def test_text_cap_is_pure_and_small_windows_keep_their_distribution_credits():
     scheduler = EmbeddingScheduler(2, 0, {"a": 1, "b": 1, "c": 1})
     try:
-        assert scheduler.text_cap(256) == 128
-        assert scheduler.text_cap(3) == 2
+        assert scheduler.text_cap(256) == 86
+        assert scheduler.text_cap(3) == 1
         assert scheduler.text_cap(1) == 1
         # Reading the configured ceiling cannot consume the rotation used to
         # distribute actual source windows over the verified destinations.
         assert scheduler.plan_window(1) == (("a", 1),)
-        assert scheduler.text_cap(256) == 128
+        assert scheduler.text_cap(256) == 86
         assert scheduler.plan_window(1) == (("b", 1),)
     finally:
         scheduler.close()
@@ -207,6 +207,9 @@ def test_worker_rejected_owner_releases_its_unsent_backlog_after_shared_drain():
             dimension=2,
             embedding_request_parallelism=1,
             embedding_queue_size=1,
+            # Three owners are intentional here: prime holds HTTP while the
+            # two queued owners prepare. The default H=G+Q would admit two.
+            embedding_max_pending_owners=3,
             embedding_batch_wait_sec=0,
         )
         prime = asyncio.create_task(asyncio.to_thread(adapter.embed_query, "prime"))

@@ -343,7 +343,13 @@ def test_progressive_ready_pressure_remains_bounded_across_shared_callers(monkey
                 for i in range(4)
             ]
             assert client.embed_started.wait(2)
-            eventually(lambda: len(adapter._calls) == len(jobs))
+            # Intake now blocks before registering/copying later owners.
+            eventually(
+                lambda: (
+                    len(adapter._calls) == 1
+                    and adapter._intake.snapshot()["owner_waiters"] == len(jobs) - 1
+                )
+            )
             snapshot = adapter._scheduler.snapshot()
             assert snapshot["queued"] == 0 and snapshot["in_flight"] == 1
             assert client.token_peak <= 1 and client.embed_peak <= 1
@@ -952,7 +958,8 @@ def test_paused_consumer_retains_native_windows_without_speculative_source_reads
             async with stream:
                 await wait_until(
                     lambda: (
-                        len(client.embedding_calls) == 2 and client.embed_active == 0
+                        sum(wire_text_count(body) for _, body in client.wire_calls) == 2
+                        and client.embed_active == 0
                     )
                 )
                 await checkpoint()
@@ -970,72 +977,27 @@ def test_paused_consumer_retains_native_windows_without_speculative_source_reads
     run(scenario)
 
 
-def test_concurrent_capacity_observations_cannot_restore_another_replicas_old_limit(
+def test_concurrent_native_slot_observations_never_change_http_replica_capacity(
     monkeypatch,
 ):
     client = ContractClient(2)
-    slots = {"embed_0": 2, "embed_1": 2}
     props = client.props
+    older_started, release_older = Event(), Event()
 
     def observed_props(model=None, **kwargs):
-        return {**props(model=model, **kwargs), "total_slots": slots[model]}
+        observed = props(model=model, **kwargs)
+        if current_thread().name.startswith("older-observer"):
+            older_started.set()
+            assert release_older.wait(3)
+            return {**observed, "total_slots": 8}
+        return {**observed, "total_slots": 1}
 
-    client.props = observed_props
     adapter = adapter_for(client)
-    old_snapshot_captured, release_old_snapshot = Event(), Event()
-    newer_progress = Event()
-
-    class ObservedLock:
-        """Announce a newer observer before blocking on the corrected lock."""
-
-        def __init__(self, lock):
-            self.lock = lock
-
-        def acquire(self, *args, **kwargs):
-            if current_thread().name.startswith("newer-observer"):
-                newer_progress.set()
-            return self.lock.acquire(*args, **kwargs)
-
-        def release(self):
-            self.lock.release()
-
-        def __enter__(self):
-            self.acquire()
-            return self
-
-        def __exit__(self, *_args):
-            self.release()
-
     try:
         assert adapter.embed_query("warmup") == vector("warmup")
-        before = adapter._scheduler.snapshot()["replicas"]
-        assert {name: entry["max_in_flight"] for name, entry in before.items()} == {
-            "embed_0": 2,
-            "embed_1": 2,
-        }
-        slots.update(embed_0=1, embed_1=1)
-        monkeypatch.setattr(
-            adapter,
-            "_capacity_lock",
-            ObservedLock(getattr(adapter, "_capacity_lock", Lock())),
-            raising=False,
-        )
-        original_update = adapter._scheduler.update_limits
-
-        def update(limits):
-            name = current_thread().name
-            if name.startswith("older-observer"):
-                old_snapshot_captured.set()
-                assert release_old_snapshot.wait(3)
-            original_update(limits)
-            if name.startswith("newer-observer"):
-                # On the previous unlocked source, this signals only after the
-                # newer reduction is applied. Releasing the older update then
-                # deterministically reproduced its stale overwrite. With the
-                # fix, acquire above signals instead, avoiding lock deadlock.
-                newer_progress.set()
-
-        monkeypatch.setattr(adapter._scheduler, "update_limits", update)
+        monkeypatch.setattr(client, "props", observed_props)
+        # A delayed props response can report a different native sequence count.
+        # Neither arrival order may turn native slots into HTTP capacity.
         with (
             ThreadPoolExecutor(1, thread_name_prefix="older-observer") as older,
             ThreadPoolExecutor(1, thread_name_prefix="newer-observer") as newer,
@@ -1046,25 +1008,24 @@ def test_concurrent_capacity_observations_cannot_restore_another_replicas_old_li
                 timeout=3,
             )
             try:
-                assert old_snapshot_captured.wait(2)
+                assert older_started.wait(2)
                 second = newer.submit(
                     adapter._observe_replica,
                     replica=adapter._replicas["embed_1"],
                     timeout=3,
                 )
-                assert newer_progress.wait(2)
+                second.result(3)
+                assert adapter._replicas["embed_1"].total_slots == 1
             finally:
-                release_old_snapshot.set()
+                release_older.set()
             first.result(3)
-            second.result(3)
-        latest = {
-            name: replica.max_in_flight for name, replica in adapter._replicas.items()
-        }
+        assert adapter._replicas["embed_0"].total_slots == 8
         scheduled = {
             name: entry["max_in_flight"]
             for name, entry in adapter._scheduler.snapshot()["replicas"].items()
         }
-        assert latest == scheduled == {"embed_0": 1, "embed_1": 1}
+        assert scheduled == {"embed_0": 1, "embed_1": 1}
+        assert adapter._scheduler.parallelism == 2
     finally:
-        release_old_snapshot.set()
+        release_older.set()
         adapter.close()

@@ -19,9 +19,11 @@ from test_embedding_direct import policy
 
 
 @contextmanager
-def batch(*, count=1, prefix="doc: ", limit=512):
+def batch(*, count=1, prefix="doc: ", limit=512, dimension=2):
     client = ContractClient(count, context=100, native_batch=100)
-    adapter = configured(client, embedding_prefixes={"document": prefix})
+    adapter = configured(
+        client, embedding_prefixes={"document": prefix}, dimension=dimension
+    )
     adapter.embedding_isolation_max_requests = limit
     calls = (_Call(adapter, None), _Call(adapter, None))
     for call in calls:
@@ -426,7 +428,7 @@ def test_removed_alias_after_parent_failure_prevents_child_post():
 
 
 def test_isolated_descendants_validate_dimensions_per_owner_without_markers():
-    with batch() as (adapter, client, (left, right), admitted):
+    with batch(dimension=None) as (adapter, client, (left, right), admitted):
         embed = client.embeddings
 
         def embeddings(input, **kwargs):

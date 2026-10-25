@@ -420,8 +420,13 @@ def test_public_cache_diagnostics_observe_bound_eviction_oversize_skip_and_close
     client = ReuseClient(1)
     adapter = runtime(client, embedding_max_pending_bytes=8192)
     try:
-        adapter.prepare_texts([f"text-{index:02d}" for index in range(20)])
-        adapter.prepare_query("x" * 300)
+        # Exercise LRU turnover without retaining twenty sealed public records
+        # in a single 8 KiB output window. Each result transfers before the next.
+        for index in range(20):
+            adapter.prepare_query(f"text-{index:02d}")
+        # Larger than the 2 KiB cache, but the public sealed result still fits
+        # its independent 8 KiB result limit.
+        adapter.prepare_query("x" * 40)
         view = adapter.health_status()["preparation_cache"]
         assert view["max_entries"] == 1024
         assert view["max_bytes"] == 2048

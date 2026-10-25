@@ -25,7 +25,33 @@ def submit(adapter, rows, *, retained=False, cancel=None, window_index=None):
         call=call,
         retain_result=retained,
     )
+    # These tests deliberately exercise the private engine boundary. Keep its
+    # caller-owned transfer protocol explicit instead of releasing on done().
+    adapter.__dict__.setdefault("_test_private_calls", []).append((call, future))
     return call, future
+
+
+def release_private_calls(adapter):
+    """Transfer/discard only after the original engine work really drains."""
+    calls = adapter.__dict__.pop("_test_private_calls", [])
+    for call, future in calls:
+        if not future.done():
+            call.stop.set()
+    adapter._engine.wake()
+    for call, future in calls:
+        while True:
+            try:
+                future.result()
+            except BaseException:
+                # Interruption of the wait cannot abandon live engine work.
+                # The tests assert their typed worker outcomes separately.
+                if not future.done():
+                    continue
+            break
+        try:
+            adapter._engine.release_result(call, wait=True)
+        finally:
+            call._intake_lease.release()
 
 
 def reject(client, bad):
@@ -50,7 +76,9 @@ def test_first_rejection_rearms_unknown_dimension_and_preserves_every_occurrence
     retained,
 ):
     client = ContractClient(1)
-    adapter = configured(client, batch_size=16, embedding_batch_wait_sec=0, timeout=5)
+    adapter = configured(
+        client, dimension=None, batch_size=16, embedding_batch_wait_sec=0, timeout=5
+    )
     reject(client, {"bad"})
     rows = ["bad", "bad", "good-one", "good-two", "bad", "good-three"]
     try:
@@ -75,12 +103,13 @@ def test_first_rejection_rearms_unknown_dimension_and_preserves_every_occurrence
             adapter._engine.release_result(call)
             eventually(lambda: adapter._engine.snapshot()["result_reserved_bytes"] == 0)
     finally:
+        release_private_calls(adapter)
         adapter.close()
 
 
 def test_all_rejected_unknown_dimension_windows_complete_and_release_scalar_credits():
     client = ContractClient(1)
-    adapter = configured(client, embedding_batch_wait_sec=0, timeout=5)
+    adapter = configured(client, dimension=None, embedding_batch_wait_sec=0, timeout=5)
     reject(client, {"bad-one", "bad-two", "bad-three"})
     try:
         call, future = submit(
@@ -102,6 +131,7 @@ def test_all_rejected_unknown_dimension_windows_complete_and_release_scalar_cred
             vector("next-good")
         ]
     finally:
+        release_private_calls(adapter)
         adapter.close()
 
 
@@ -123,6 +153,7 @@ def test_rejection_metadata_obeys_retained_result_limit_and_drains():
         assert adapter._engine.snapshot()["peak_result_reserved_bytes"] <= 2048
         assert_clean(adapter, client)
     finally:
+        release_private_calls(adapter)
         adapter.close()
 
 
@@ -156,6 +187,7 @@ def test_marker_credit_is_reserved_before_retained_publication(monkeypatch):
         adapter._engine.release_result(call)
         eventually(lambda: adapter._engine.snapshot()["result_reserved_bytes"] == 0)
     finally:
+        release_private_calls(adapter)
         adapter.close()
 
 
@@ -205,6 +237,7 @@ def test_shared_post_has_distinct_owner_local_indices_and_never_replays_success(
         assert_clean(adapter, client)
     finally:
         client.embed_gate.set()
+        release_private_calls(adapter)
         adapter.close()
 
 
@@ -212,6 +245,9 @@ def test_paused_all_rejected_windows_keep_bounded_credits_and_resume_on_release(
     client = ContractClient(1)
     adapter = configured(
         client,
+        # No successful vector ever establishes a width in this scalar-credit
+        # regression; keep the cold contract explicit after the shared default.
+        dimension=None,
         batch_size=1,
         embedding_batch_wait_sec=0,
         embedding_request_parallelism=1,
@@ -255,6 +291,7 @@ def test_paused_all_rejected_windows_keep_bounded_credits_and_resume_on_release(
     finally:
         for call, _ in calls:
             adapter._engine.release_result(call)
+        release_private_calls(adapter)
         adapter.close()
 
 
@@ -290,6 +327,7 @@ def test_unsplittable_singleton_fails_only_its_owner_in_shared_http_batch():
         assert_clean(adapter, client)
     finally:
         client.embed_gate.set()
+        release_private_calls(adapter)
         adapter.close()
 
 
@@ -341,6 +379,7 @@ def test_cancelling_owner_during_isolation_drains_it_and_keeps_shared_peer():
     finally:
         client.child_release.set()
         client.embed_gate.set()
+        release_private_calls(adapter)
         adapter.close()
 
 
@@ -368,17 +407,21 @@ def test_close_while_isolation_child_is_running_drains_scheduler_and_owner():
         _, future = submit(adapter, ["bad", "good"])
         assert child_started.wait(2)
         closing = executor.submit(adapter.close)
-        closing.result(3)
         with pytest.raises((LLMCancelledError, LLMBackendError)) as stopped:
-            future.result(1)
+            future.result(3)
         if not isinstance(stopped.value, LLMCancelledError):
             assert str(stopped.value) == "llamacpp_embedding_adapter_closed"
+        # Synchronous close correctly waits for the caller to release its
+        # private owner after observing the drained engine Future.
+        release_private_calls(adapter)
+        closing.result(3)
         assert_clean(adapter, client)
         assert not adapter._engine._thread.is_alive()
         assert adapter._engine.snapshot()["result_reserved_bytes"] == 0
     finally:
         child_release.set()
         executor.shutdown(wait=True)
+        release_private_calls(adapter)
         adapter.close()
 
 
@@ -418,4 +461,5 @@ def test_rejected_rows_release_their_absent_vector_reservation(monkeypatch):
         eventually(lambda: adapter._engine.snapshot()["result_reserved_bytes"] == 0)
         assert_clean(adapter, client)
     finally:
+        release_private_calls(adapter)
         adapter.close()

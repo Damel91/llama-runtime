@@ -31,7 +31,10 @@ def profile(**changes):
         batch_token_limit=None,
         token_count_parallelism=1,
         normalize=False,
-        dimension=None,
+        # The default fake server returns two dimensions. Tests of cold
+        # dimension discovery opt out explicitly; full-batch contract tests
+        # should not accidentally exercise the one-row bootstrap instead.
+        dimension=2,
         max_input_tokens=None,
         embedding_request_parallelism=1,
         embedding_queue_size=16,
@@ -366,7 +369,7 @@ def test_invalid_tokenization_never_reaches_embedding(tokens):
 )
 def test_vectors_must_be_nonempty_finite_numeric_arrays(vectors):
     client = Client(responses=[payload([vectors])])
-    adapter = LlamaCppEmbeddingAdapter(profile(), client=client)
+    adapter = LlamaCppEmbeddingAdapter(profile(dimension=None), client=client)
     with pytest.raises(LLMBackendError):
         adapter.embed_query("private input")
     assert adapter.embedding_dim == 0
@@ -375,10 +378,12 @@ def test_vectors_must_be_nonempty_finite_numeric_arrays(vectors):
 @pytest.mark.parametrize("indexes", [[0, 0], [0, 2], [True, 1], [0.0, 1], ["0", 1]])
 def test_indexes_are_unique_in_range_integers(indexes):
     client = Client(responses=[payload([[1], [2]], indexes=indexes)])
-    adapter = LlamaCppEmbeddingAdapter(profile(), client=client)
+    # Declare the one-dimensional fixture so both rows reach native index
+    # validation in one POST; an unknown width would first require a seed.
+    adapter = LlamaCppEmbeddingAdapter(profile(dimension=1), client=client)
     with pytest.raises(LLMBackendError):
         adapter.embed_texts(["a", "b"])
-    assert adapter.embedding_dim == 0
+    assert adapter.embedding_dim == 1
 
 
 def test_dimension_learning_is_atomic_across_a_failing_call():
@@ -389,7 +394,9 @@ def test_dimension_learning_is_atomic_across_a_failing_call():
             payload([[1, 2, 3]]),
         ]
     )
-    adapter = LlamaCppEmbeddingAdapter(profile(batch_size=1), client=client)
+    adapter = LlamaCppEmbeddingAdapter(
+        profile(batch_size=1, dimension=None), client=client
+    )
     with pytest.raises(LLMBackendError):
         adapter.embed_texts(["a", "b"])
     assert adapter.embedding_dim == 0
@@ -405,7 +412,9 @@ def test_configured_dimension_and_batch_dimensions_are_enforced():
     assert adapter.embedding_dim == 2
     client = Client(responses=[payload([[1], [1, 2]])])
     with pytest.raises(LLMBackendError, match="dimension_mismatch"):
-        LlamaCppEmbeddingAdapter(profile(), client=client).embed_texts(["a", "b"])
+        LlamaCppEmbeddingAdapter(profile(dimension=1), client=client).embed_texts(
+            ["a", "b"]
+        )
 
 
 def test_normalization_handles_extreme_finite_values_and_zero_vectors():
@@ -508,6 +517,11 @@ def test_success_started_before_capacity_reduction_cannot_restore_capacity_early
     )
     assert len(adapter.embed_texts([f"initial-{index}" for index in range(8)])) == 8
     assert adapter.health_status()["effective_batch_size"] == 4
+    assert adapter._primary.total_slots == 2
+    assert adapter._scheduler.snapshot()["effective_parallelism"] == 1
+    assert (
+        adapter._scheduler.snapshot()["replicas"]["embed-model"]["max_in_flight"] == 1
+    )
 
     old_texts = [f"old-{index}" for index in range(4)]
     old_started, release_old = Event(), Event()
@@ -524,22 +538,22 @@ def test_success_started_before_capacity_reduction_cannot_restore_capacity_early
         pending = executor.submit(adapter.embed_texts, old_texts)
         try:
             assert old_started.wait(3)
-            client.responses.append(
-                ClientHTTPError(400, error_type="exceed_context_size_error")
-            )
-            assert len(adapter.embed_texts(["new-a", "new-b", "new-c", "new-d"])) == 4
+            # One original lease per replica prevents a second concurrent
+            # POST, even though native props advertise two sequence slots.
+            # Inject the adaptive-generation transition directly to retain
+            # the stale-success regression without inventing HTTP capacity.
+            adapter._tighten_adaptive_batch_size(2, replica=adapter._primary)
             assert adapter.health_status()["effective_batch_size"] == 2
+            release_old.set()
+            assert len(pending.result(timeout=3)) == 4
+            status = adapter.health_status()
+            assert status["effective_batch_size"] == 2
+            assert status["batch_recovery"]["successes"] == 0
 
             # Complete all but one of the new stability window's successes.
             for _ in range(63):
                 assert len(adapter.embed_texts(["stable-a", "stable-b"])) == 2
             assert adapter.health_status()["batch_recovery"]["successes"] == 63
-
-            release_old.set()
-            assert len(pending.result(timeout=3)) == 4
-            status = adapter.health_status()
-            assert status["effective_batch_size"] == 2
-            assert status["batch_recovery"]["successes"] == 63
 
             assert len(adapter.embed_texts(["stable-a", "stable-b"])) == 2
             assert adapter.health_status()["effective_batch_size"] == 4
@@ -585,18 +599,34 @@ def test_multiple_client_owned_instances_are_rejected():
 
 
 def test_actual_profile_and_http_client_integrate_without_runtime_or_sdk():
-    class Response:
-        status_code = 200
+    from io import BytesIO
+    import json
 
+    import requests
+    from urllib3.response import HTTPResponse
+
+    class Response(requests.Response):
         def __init__(self, data):
-            self.data = data
+            super().__init__()
+            body = json.dumps(data).encode("utf-8")
+            self.status_code = 200
+            self.encoding = "utf-8"
+            self.headers.update(
+                {"Content-Type": "application/json", "Content-Length": str(len(body))}
+            )
+            self.raw = HTTPResponse(
+                body=BytesIO(body),
+                headers=self.headers,
+                preload_content=False,
+                decode_content=False,
+            )
             self.closed = False
 
-        def json(self):
-            return self.data
-
         def close(self):
-            self.closed = True
+            try:
+                super().close()
+            finally:
+                self.closed = True
 
     class Session:
         def __init__(self):
@@ -636,6 +666,7 @@ def test_actual_profile_and_http_client_integrate_without_runtime_or_sdk():
             "base_url": "https://remote.example/vpn",
             "timeout": 2.0,
             "normalize": True,
+            "dimension": 2,
             "model_context_length": 12,
             "max_input_tokens": 9,
             "embedding_batch_wait_sec": 0.5,

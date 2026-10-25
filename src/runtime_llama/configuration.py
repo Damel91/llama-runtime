@@ -280,6 +280,7 @@ class AdapterProfile:
     dimension: int | None = None
     max_input_tokens: int | None = None
     embedding_request_parallelism: int | None = None
+    embedding_max_pending_owners: int | None = None
     embedding_queue_size: int = 16
     embedding_replicas: tuple[EmbeddingReplicaConfig, ...] = ()
     embedding_prefixes: EmbeddingPrefixes = field(default_factory=EmbeddingPrefixes)
@@ -342,15 +343,10 @@ class AdapterProfile:
             raise ValueError(
                 "embedding_replica_discovery requires an embedding profile"
             )
-        if self.embedding_request_parallelism is None:
-            object.__setattr__(
-                self,
-                "embedding_request_parallelism",
-                4 if self.embedding_replica_discovery else 1,
-            )
         _positive_int(
             self.embedding_request_parallelism, "embedding_request_parallelism"
         )
+        _positive_int(self.embedding_max_pending_owners, "embedding_max_pending_owners")
         if (
             isinstance(self.embedding_queue_size, bool)
             or not isinstance(self.embedding_queue_size, int)
@@ -467,6 +463,7 @@ class AdapterProfile:
                 "dimension",
                 "max_input_tokens",
                 "embedding_request_parallelism",
+                "embedding_max_pending_owners",
                 "embedding_queue_size",
                 "embedding_replicas",
                 "embedding_prefixes",

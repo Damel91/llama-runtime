@@ -26,6 +26,8 @@ from runtime_llama.adapters.embedding import (
     _DirectEmbeddingPolicy,
 )
 from runtime_llama.client import LlamaCppClient
+from runtime_llama.embedding_metrics import EmbeddingHTTPMetrics
+
 from runtime_llama.configuration import (
     AdapterProfile,
     EmbeddingPrefixes,
@@ -65,6 +67,8 @@ from runtime_llama.replica_discovery import (
     is_loaded,
     parse_replica,
 )
+
+_NATIVE_CLIENT_CLASS = LlamaCppClient
 
 
 def _category(value):
@@ -116,7 +120,8 @@ class AutomaticEmbeddingConfig:
     calibration_timeout: float = 600.0
     calibration_workers: int = 2
     batch_size: int = 256
-    request_parallelism: int = 2
+    request_parallelism: int | None = None
+    embedding_max_pending_owners: int | None = None
     queue_size: int = 16
     normalize: bool = True
     api_key: str | None = field(default=None, repr=False)
@@ -154,9 +159,11 @@ class AutomaticEmbeddingConfig:
             )
         for name in ("timeout", "calibration_timeout"):
             _finite(getattr(self, name), name, positive=True)
-        for name in ("batch_size", "request_parallelism", "calibration_workers"):
+        for name in ("batch_size", "calibration_workers"):
             if _positive_int(getattr(self, name), name) is None:
                 raise ValueError(f"{name} must be a positive integer")
+        _positive_int(self.request_parallelism, "request_parallelism")
+        _positive_int(self.embedding_max_pending_owners, "embedding_max_pending_owners")
         if self.calibration_workers > 32:
             raise ValueError("calibration_workers must not exceed 32")
         _nonnegative_int(self.queue_size, "queue_size")
@@ -258,6 +265,7 @@ class AutomaticEmbeddingService:
             raise ValueError("config must describe the automatic embedding service")
         self.config = config
         self._client = client
+        self._http_metrics = EmbeddingHTTPMetrics()
         self._owns_client = client is None
         self._adapter = None
         self._identity = self._prefixes = None
@@ -317,6 +325,31 @@ class AutomaticEmbeddingService:
                 )
             return self._client
 
+    def _response_options(self, client):
+        # Injected clients own decoding unless they explicitly support bounds.
+        return (
+            {"max_response_bytes": self.config.embedding_max_response_bytes}
+            if isinstance(client, _NATIVE_CLIENT_CLASS)
+            or getattr(client, "supports_bounded_json", False) is True
+            else {}
+        )
+
+    def _http_call(self, client, method, *args, **kwargs):
+        kind = {"models": "catalog"}.get(method, method)
+        with self._http_metrics.measure(kind, "admission"):
+            return getattr(client, method)(*args, **kwargs)
+
+    def diagnostics(self):
+        """Read bounded local counters without health/catalog network traffic."""
+        with self._condition:
+            adapter = self._adapter
+        return {
+            "initialization_http": self._http_metrics.snapshot(),
+            "engine": adapter._engine_health_snapshot()
+            if adapter is not None
+            else None,
+        }
+
     def _select_pool(self, catalog):
         if self.config.model is not None:
             pool = discover_embedding_pool(catalog, self.config.model)
@@ -373,18 +406,24 @@ class AutomaticEmbeddingService:
         if self._adapter is not None:
             return self._adapter
         client = self._ensure_client(operation)
-        healthy = client.health(
+        healthy = self._http_call(
+            client,
+            "health",
             timeout=min(self.config.timeout, operation.remaining()),
             cancel=operation.probe,
             cancel_wait=True,
+            **self._response_options(client),
         )
         operation.check()
         if not isinstance(healthy, dict) or healthy.get("status") != "ok":
             raise LLMBackendError("llamacpp_embedding_server_not_healthy")
-        catalog = client.models(
+        catalog = self._http_call(
+            client,
+            "models",
             timeout=min(self.config.timeout, operation.remaining()),
             cancel=operation.probe,
             cancel_wait=True,
+            **self._response_options(client),
         )
         operation.check()
         entries = catalog.get("data") if isinstance(catalog, dict) else None
@@ -401,10 +440,13 @@ class AutomaticEmbeddingService:
                 raise LLMBackendError(
                     "llamacpp_automatic_embedding_identity_unverified"
                 )
-            props = client.props(
+            props = self._http_call(
+                client,
+                "props",
                 timeout=min(self.config.timeout, operation.remaining()),
                 cancel=operation.probe,
                 cancel_wait=True,
+                **self._response_options(client),
             )
             operation.check()
             catalog = attest_single_model_catalog(catalog, props)
@@ -424,6 +466,7 @@ class AutomaticEmbeddingService:
                 "embedding_replica_discovery": True,
                 "embedding_input_format": "text",
                 "embedding_request_parallelism": self.config.request_parallelism,
+                "embedding_max_pending_owners": self.config.embedding_max_pending_owners,
                 "embedding_queue_size": self.config.queue_size,
                 "token_count_parallelism": self.config.calibration_workers,
                 "embedding_batch_wait_sec": 0,

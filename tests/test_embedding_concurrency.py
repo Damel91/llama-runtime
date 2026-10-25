@@ -57,7 +57,17 @@ class State:
         self.props_overrides = {}
         self.health_code = 200
         self.catalog = [
-            {"id": model, "status": {"value": "loaded"}} for model in self.contexts
+            {
+                "id": model,
+                "status": {"value": "loaded"},
+                # Both endpoints serve the same synthetic weights and embedding
+                # semantics; slot counts are deliberately a separate property.
+                "tags": [
+                    "noxi-content-sha256-v1:" + "a" * 64,
+                    "noxi-embedding-sha256-v1:" + "b" * 64,
+                ],
+            }
+            for model in self.contexts
         ]
         self.token_counts = {}
         self.action = lambda body: (200, response(body["input"]))
@@ -111,15 +121,18 @@ def server():
             elif path.path == "/v1/models":
                 body = {"data": state.catalog}
             elif path.path == "/props":
-                model = parse_qs(path.query)["model"][0]
+                model = parse_qs(path.query).get("model", [None])[0]
                 with state.lock:
                     state.props_calls.append(model)
+                # Native singleton statusless discovery observes root props
+                # without a query parameter. The direct server serves embed.
+                selected = model or "embed"
                 body = {
-                    "model_alias": model,
+                    "model_alias": selected,
                     "total_slots": 2,
-                    "default_generation_settings": {"n_ctx": state.contexts[model]},
+                    "default_generation_settings": {"n_ctx": state.contexts[selected]},
                 }
-                body.update(state.props_overrides.get(model, {}))
+                body.update(state.props_overrides.get(selected, {}))
             else:
                 raise AssertionError(path.path)
             self.send_json(200, body)
@@ -156,6 +169,9 @@ def configured(base_url, **changes):
     values = {
         "adapter_type": "embedding",
         "model": "embed",
+        # This server fixture returns exactly two vector components. Tests of
+        # unknown-width learning opt out explicitly rather than forcing seeds.
+        "dimension": 2,
         "base_url": base_url,
         "timeout": 2,
         "batch_size": 2,
@@ -174,7 +190,7 @@ def configured(base_url, **changes):
     return AdapterProfile.from_config("documents", values)
 
 
-def test_real_http_four_in_flight_two_replicas_and_bounded_shared_queue():
+def test_real_http_one_original_per_replica_and_bounded_shared_queue():
     with server() as (state, url):
 
         def action(body):
@@ -193,19 +209,19 @@ def test_real_http_four_in_flight_two_replicas_and_bounded_shared_queue():
             with ThreadPoolExecutor(max_workers=2) as callers:
                 a = callers.submit(adapter.embed_texts, first)
                 b = callers.submit(adapter.embed_texts, second)
-                eventually(lambda: state.active == 4)
+                eventually(lambda: state.active == 2)
                 eventually(
                     lambda: (
                         adapter._engine.snapshot()["pending_tokens"] == 12
                         and sum(adapter._engine.snapshot()["ready_by_replica"].values())
-                        == 2
+                        == 4
                         and adapter._engine.snapshot()["preparation_results_waiting"]
                         > 0
                     )
                 )
-                assert state.peak == 4
-                assert state.peak_by_model == {"embed": 2, "embed_1": 2}
-                # Four active rows and two ready rows exhaust the explicit
+                assert state.peak == 2
+                assert state.peak_by_model == {"embed": 1, "embed_1": 1}
+                # Two active rows and four ready rows exhaust the explicit
                 # token budget. A bounded worker handoff cannot publish more
                 # until a real HTTP lease drains; preparation leases can retire.
                 assert adapter._scheduler.snapshot()["queued"] == 0
@@ -218,7 +234,7 @@ def test_real_http_four_in_flight_two_replicas_and_bounded_shared_queue():
                 assert a.result(timeout=5) == vectors(first)
                 assert b.result(timeout=5) == vectors(second)
             status = adapter.health_status()
-            assert status["scheduler"]["peak_in_flight"] == 4
+            assert status["scheduler"]["peak_in_flight"] == 2
             assert status["scheduler"]["peak_queued"] == 0
             assert status["scheduler"]["queued"] == 0
             assert status["scheduler"]["in_flight"] == 0
@@ -313,7 +329,7 @@ def test_native_context_failure_never_replays_and_drains_sibling_work(
                 ("embed_1", tuple(texts[4:])): 1,
             }
             assert not adapter._calls
-            assert adapter.embedding_dim == 0
+            assert adapter.embedding_dim == 2
             status = adapter.health_status()
             assert status["scheduler"]["queued"] == 0
             assert status["scheduler"]["in_flight"] == 0
@@ -348,7 +364,7 @@ def test_real_http_failure_stops_unsent_batches_and_next_call_recovers():
             with pytest.raises(ClientHTTPError):
                 adapter.embed_texts([f"item-{index}" for index in range(30)])
             assert state.calls == [("embed", ("item-0", "item-1"))]
-            assert adapter.embedding_dim == 0
+            assert adapter.embedding_dim == 2
             assert adapter.embed_query("item-99") == [99, 1]
         finally:
             adapter.close()
@@ -412,6 +428,7 @@ def test_borrowed_preheader_request_keeps_its_slot_until_transport_drains():
                 batch_size=1,
                 embedding_request_parallelism=1,
                 embedding_queue_size=0,
+                embedding_max_pending_owners=2,
                 embedding_replicas=[],
             ),
             client=client,
@@ -448,7 +465,7 @@ def test_observed_replica_context_rejects_input_before_embedding_request():
         state.contexts["embed"] = 2
         state.token_counts["item-0"] = 3
         adapter = LlamaCppEmbeddingAdapter(
-            configured(url, embedding_replicas=[], max_input_tokens=8)
+            configured(url, dimension=None, embedding_replicas=[], max_input_tokens=8)
         )
         try:
             with pytest.raises(LLMBackendError, match="tokens=3:limit=2"):
@@ -473,7 +490,7 @@ def test_close_waits_for_http_cleanup_and_leaves_no_adapter_workers():
             result = callers.submit(
                 adapter.embed_texts, [f"item-{index}" for index in range(40)]
             )
-            eventually(lambda: state.active == 4)
+            eventually(lambda: state.active == 2)
             closed = callers.submit(adapter.close)
             eventually(adapter._closing.is_set)
             # The close call retains its HTTP permits until the gated request ends.
@@ -487,8 +504,8 @@ def test_close_waits_for_http_cleanup_and_leaves_no_adapter_workers():
             for thread in threads()
             if thread.ident not in existing and thread.name.startswith("runtime_llama_")
         ]
-        assert state.peak == 4
-        assert len(state.calls) == 4
+        assert state.peak == 2
+        assert len(state.calls) == 2
         adapter.close()
         with pytest.raises(LLMBackendError, match="closed"):
             adapter.embed_query("item-99")

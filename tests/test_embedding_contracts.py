@@ -189,6 +189,9 @@ def configured(client, **changes):
         "token_count_parallelism": 2,
         "timeout": 2,
         "normalize": False,
+        # ContractClient's server fixture always returns two-dimensional vectors.
+        # Tests of cold/unknown width opt out explicitly with dimension=None.
+        "dimension": 2,
     }
     values.update(changes)
     return LlamaCppEmbeddingAdapter(
@@ -211,7 +214,7 @@ def assert_once(client, expected):
     [
         (2, 256, 4, [128, 128]),
         (4, 256, 4, [64, 64, 64, 64]),
-        (4, 256, 2, [128, 128]),
+        (4, 256, 2, [64, 64, 64, 64]),
         (2, 255, 4, [127, 128]),
         (4, 255, 4, [63, 64, 64, 64]),
         (4, 3, 4, [1, 1, 1]),

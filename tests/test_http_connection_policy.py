@@ -313,7 +313,9 @@ def test_json_bulk_fallback_is_bounded_after_gzip_decoding(
         with pytest.raises(LLMBackendError, match="json_response_too_large"):
             api.models(max_response_bytes=128)
         assert api.models(max_response_bytes=100000) == payload
-    assert sizes == [65536, 65536]
+    # Finite JSON bodies now use undecoded wire reads and a hard-bounded
+    # inflater; iter_content would inflate before the client could bound it.
+    assert sizes == []
     assert len(observed) == 2
 
 

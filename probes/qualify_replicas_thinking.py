@@ -718,9 +718,10 @@ def run_phase(
         phase["activity"]["coverage_index_xor"] == expected_xor,
         "embedding index coverage xor",
     )
+    # Native slots do not multiply HTTP admission on a single replica.
     require(
-        phase["activity"]["maximum_embedding_requests"] >= 2,
-        "no simultaneous embedding requests observed",
+        phase["activity"]["maximum_embedding_requests"] == min(len(caps), 4),
+        "embedding overlap does not match the selected replica capacity",
     )
     if mixed:
         require(

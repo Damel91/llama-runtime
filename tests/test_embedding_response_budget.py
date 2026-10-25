@@ -139,8 +139,11 @@ def adapter_for(url, **changes):
 @pytest.mark.parametrize("compressed", [False, True])
 def test_large_valid_vector_accepts_separate_response_budget(compressed):
     with endpoint(compressed=compressed) as (url, seen, _):
-        # The retained input queue remains smaller than the valid JSON body.
-        adapter = adapter_for(url, embedding_max_pending_bytes=4096, dimension=1536)
+        # The response limit is independent of the tiny HTTP input limit.
+        # Materialized outputs now also need explicit result/handoff credits.
+        adapter = adapter_for(
+            url, embedding_max_pending_bytes=1024 * 1024, dimension=1536
+        )
         try:
             assert adapter.embed_query("x") == LARGE_VECTOR
             assert len(json.dumps({"data": LARGE_VECTOR})) > 4096

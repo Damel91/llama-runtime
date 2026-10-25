@@ -49,8 +49,12 @@ def schedulers():
             4,
             (("a", 64), ("b", 64), ("c", 64), ("d", 64)),
         ),
-        ({"a": 1, "b": 1, "c": 1, "d": 1}, 2, (("a", 128), ("b", 128))),
-        ({"a": 2, "b": 2}, 1, (("a", 256),)),
+        (
+            {"a": 1, "b": 1, "c": 1, "d": 1},
+            2,
+            (("a", 64), ("b", 64), ("c", 64), ("d", 64)),
+        ),
+        ({"a": 2, "b": 2}, 1, (("a", 128), ("b", 128))),
     ],
 )
 def test_total_budget_is_balanced_over_distinct_effective_aliases(
@@ -63,11 +67,19 @@ def test_total_budget_is_balanced_over_distinct_effective_aliases(
     assert len({alias for alias, _ in planned}) == len(planned)
 
 
-def test_global_cap_rotates_distinct_alias_pairs_across_windows(schedulers):
+def test_global_guard_does_not_reduce_topology_width(schedulers):
     scheduler = schedulers(parallelism=2, replicas={"a": 1, "b": 1, "c": 1, "d": 1})
-    assert scheduler.plan_window(256) == (("a", 128), ("b", 128))
-    assert scheduler.plan_window(256) == (("c", 128), ("d", 128))
-    assert scheduler.plan_window(256) == (("a", 128), ("b", 128))
+    expected = (("a", 64), ("b", 64), ("c", 64), ("d", 64))
+    assert scheduler.plan_window(256) == expected
+    assert scheduler.plan_window(256) == expected
+    assert scheduler.text_cap(256) == 64
+
+
+def test_odd_remainders_rotate_across_full_width_windows(schedulers):
+    scheduler = schedulers(parallelism=1)
+    assert scheduler.plan_window(255) == (("a", 128), ("b", 127))
+    assert scheduler.plan_window(255) == (("b", 128), ("a", 127))
+    assert scheduler.plan_window(255) == (("a", 128), ("b", 127))
 
 
 @pytest.mark.parametrize(
@@ -333,7 +345,7 @@ def test_future_cancellation_is_safe_during_pump_and_close(schedulers):
     scheduler.close()
 
 
-def test_configured_alias_capacity_and_global_limit_are_shared(schedulers):
+def test_positive_legacy_caps_never_multiply_original_alias_leases(schedulers):
     scheduler = schedulers(parallelism=3, queue_size=1, replicas={"a": 2, "b": 1})
     release = Event()
 
@@ -343,26 +355,25 @@ def test_configured_alias_capacity_and_global_limit_are_shared(schedulers):
 
     first = scheduler.submit(blocked, unchecked, model="a")
     second = scheduler.submit(blocked, unchecked, model="a")
-    queued = scheduler.submit(blocked, unchecked, model="a")
     third = scheduler.submit(blocked, unchecked, model="b")
     try:
         snapshot = scheduler.snapshot()
-        assert snapshot["in_flight"] == 3 and snapshot["queued"] == 1
-        assert snapshot["replicas"]["a"]["in_flight"] == 2
+        assert snapshot["in_flight"] == 2 and snapshot["queued"] == 1
+        assert snapshot["replicas"]["a"]["in_flight"] == 1
+        assert snapshot["replicas"]["a"]["requested_max_in_flight"] == 2
+        assert snapshot["effective_parallelism"] == 2
+        assert snapshot["requested_parallelism"] == 3
         assert snapshot["replicas"]["b"]["in_flight"] == 1
         release.set()
-        assert [
-            future.result(timeout=2) for future in (first, second, queued, third)
-        ] == [
-            "a",
+        assert [future.result(timeout=2) for future in (first, second, third)] == [
             "a",
             "a",
             "b",
         ]
         eventually(lambda: scheduler.snapshot()["in_flight"] == 0)
         snapshot = scheduler.snapshot()
-        assert snapshot["peak_in_flight"] == 3
-        assert snapshot["replicas"]["a"]["peak_in_flight"] == 2
+        assert snapshot["peak_in_flight"] == 2
+        assert snapshot["replicas"]["a"]["peak_in_flight"] == 1
         assert snapshot["replicas"]["b"]["peak_in_flight"] == 1
     finally:
         release.set()

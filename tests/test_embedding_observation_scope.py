@@ -214,7 +214,7 @@ def test_cancelled_scope_owner_does_not_retire_surviving_owner():
         adapter.close()
 
 
-def test_old_snapshot_never_restores_capacity_and_fresh_props_reduce_slots():
+def test_old_snapshot_never_multiplies_http_capacity_when_native_slots_change():
     client = MetadataClient(1)
     props = client.props
     slots = [4]
@@ -228,7 +228,8 @@ def test_old_snapshot_never_restores_capacity_and_fresh_props_reduce_slots():
     adapter = configured(client, embedding_request_parallelism=4)
     try:
         scope = seeded(adapter)
-        assert adapter._replicas["embed_0"].max_in_flight == 4
+        assert adapter._replicas["embed_0"].max_in_flight == 1
+        assert adapter._scheduler.parallelism == 1
         slots[0] = 1
         call = direct_call(adapter, scope)
         catalog = adapter._engine_catalog_shared((call,))

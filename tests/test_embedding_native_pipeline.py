@@ -106,7 +106,7 @@ def test_control_and_tokenizer_executors_are_reused_across_windows_and_calls(
         adapter.close()
 
 
-def test_discovered_two_slots_admit_two_packed_requests_from_one_quota():
+def test_two_native_slots_do_not_multiply_original_http_leases():
     client = ContractClient(1, context=64, native_batch=1)
     original = client.props
     client.props = lambda **kwargs: {**original(**kwargs), "total_slots": 2}
@@ -125,16 +125,20 @@ def test_discovered_two_slots_admit_two_packed_requests_from_one_quota():
         with ThreadPoolExecutor(max_workers=1) as callers:
             pending = callers.submit(adapter.embed_texts, incoming)
             try:
-                eventually(lambda: client.embed_active == 2)
-                assert client.alias_peak == {"embed_0": 2}
+                eventually(lambda: client.embed_active == 1)
+                assert client.alias_peak == {"embed_0": 1}
                 assert Counter(client.embedding_calls) == {
                     ("embed_0", tuple(incoming[:2])): 1,
-                    ("embed_0", tuple(incoming[2:])): 1,
                 }
+                assert adapter._replicas["embed_0"].total_slots == 2
             finally:
                 client.embed_gate.set()
             assert pending.result(timeout=3) == [vector(text) for text in incoming]
-        assert adapter._scheduler.snapshot()["peak_in_flight"] == 2
+        assert Counter(client.embedding_calls) == {
+            ("embed_0", tuple(incoming[:2])): 1,
+            ("embed_0", tuple(incoming[2:])): 1,
+        }
+        assert adapter._scheduler.snapshot()["peak_in_flight"] == 1
     finally:
         client.embed_gate.set()
         adapter.close()
@@ -214,6 +218,9 @@ def test_preparation_credit_releases_while_charged_http_rows_bound_lookahead():
         embedding_request_parallelism=1,
         embedding_queue_size=0,
         embedding_max_pending_bytes=1024,
+        # This test isolates working-record pressure across eight admitted
+        # owners; admission outside H has separate coverage below.
+        embedding_max_pending_owners=8,
         timeout=5,
     )
     try:
@@ -479,7 +486,9 @@ def test_close_drains_pending_preparation_and_all_global_admission_waiters():
                 callers.submit(adapter.embed_query, f"waiting-{i}") for i in range(6)
             ]
             assert client.token_started.wait(2)
-            eventually(lambda: len(adapter._calls) == 6)
+            eventually(lambda: len(adapter._calls) == 1)
+            eventually(lambda: adapter._intake.snapshot()["owner_waiters"] == 5)
+            assert adapter._intake.snapshot()["owners"] == 1
             adapter.close()
             for future in pending:
                 with pytest.raises((LLMBackendError, LLMCancelledError)):

@@ -27,16 +27,16 @@ def test_explicit_replica_config_is_copied_and_sampling_keeps_runtime_identity()
         first.embedding_replicas[0].max_in_flight = 10
 
 
-def test_sequential_defaults_and_zero_queue_are_supported():
+def test_automatic_defaults_and_zero_queue_are_supported():
     parsed = profile(embedding_queue_size=0)
-    assert parsed.embedding_request_parallelism == 1
+    assert parsed.embedding_request_parallelism is None
     assert parsed.embedding_replicas == ()
     assert parsed.embedding_queue_size == 0
 
 
-@pytest.mark.parametrize("discovery, expected", [(False, 1), (True, 4)])
-def test_none_parallelism_materializes_mode_default_without_http(
-    discovery, expected, monkeypatch
+@pytest.mark.parametrize("discovery", [False, True])
+def test_none_parallelism_preserves_automatic_policy_without_http(
+    discovery, monkeypatch
 ):
     def forbidden(*args, **kwargs):
         raise AssertionError("profile construction must not send HTTP")
@@ -45,7 +45,7 @@ def test_none_parallelism_materializes_mode_default_without_http(
     parsed = profile(
         embedding_replica_discovery=discovery, embedding_request_parallelism=None
     )
-    assert parsed.embedding_request_parallelism == expected
+    assert parsed.embedding_request_parallelism is None
 
 
 @pytest.mark.parametrize("value", [0, -1, True, 1.5, "4"])

@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections import Counter, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from threading import Condition, Thread, current_thread
+from threading import Condition, Event, Thread, current_thread
 import sys
 import time
 from typing import Any
@@ -17,7 +17,10 @@ from typing import Any
 from runtime_llama.errors import LLMBackendError
 from runtime_llama.embedding_halving import _HalvingResult, _RejectedEmbedding
 from runtime_llama.embedding_packing import _ConsumerTurns
+from runtime_llama.embedding_handoff import HandoffReservations
+from runtime_llama.embedding_resources import EmbeddingResourceLimitError
 from runtime_llama.embedding_recovery import _FailedDirectPost, _FailedOwnerPost
+from runtime_llama.embedding_preparation import PreparedEmbeddingInput
 
 
 @dataclass(frozen=True)
@@ -152,6 +155,18 @@ class _Batch:
     entries: list[_Entry]
     owners: tuple[Any, ...]
     call: Any
+    handoff: Any = None
+
+
+@dataclass
+class _HandoffRetention:
+    ticket: Any
+    remaining: int
+
+    def done(self):
+        self.remaining -= 1
+        if not self.remaining and self.ticket is not None:
+            self.ticket.release()
 
 
 @dataclass(eq=False)
@@ -188,6 +203,10 @@ class _State:
     checked_at: float = 0.0
     failure_handled: bool = False
     result_credit: int = 0
+    result_required: int = 0
+    result_ready: bool = False
+    response_dimension: int | None = None
+    preparation_result_cost: int = 0
     plan_rotation: int = 0
     rejections: dict[int, _RejectedEmbedding] = field(default_factory=dict)
     rejection_slots: int = 0
@@ -204,10 +223,8 @@ class PersistentEmbeddingEngine:
 
     def __init__(self, adapter):
         self.adapter = adapter
-        self.parallelism = adapter.embedding_request_parallelism
         self.tokenizers = adapter.token_count_parallelism
-        self.control_workers = max(1, self.parallelism)
-        self.capacity = max(1, self.parallelism + adapter.embedding_queue_size)
+        self.control_workers = getattr(adapter, "embedding_control_parallelism", 2)
         self.max_bytes = getattr(
             adapter, "embedding_max_pending_bytes", 64 * 1024 * 1024
         )
@@ -216,6 +233,12 @@ class PersistentEmbeddingEngine:
             adapter, "embedding_max_request_bytes", 8 * 1024 * 1024
         )
         self._condition = Condition()
+        self._handoff = HandoffReservations(
+            self.max_bytes,
+            getattr(adapter, "embedding_max_response_bytes", 8 * 1024 * 1024),
+            notify=self.wake,
+        )
+        self._handoff_blocked = {}
         self._incoming = deque()
         self._events = deque()
         self._states: deque[_State] = deque()
@@ -226,11 +249,14 @@ class PersistentEmbeddingEngine:
         self._http_publications: deque = deque()
         self._observing: set[str] = set()
         self._preflights: dict[str, _Preflight] = {}
+        self._preflight_renewals: dict[str, int] = {}
+        self._preflight_renewals_total = 0
         self._metadata_rounds: deque[_MetadataRound] = deque()
         self._retained: dict[Any, int] = {}
         self._released_calls: set[Any] = set()
         self._release_results = deque()
         self._closed = False
+        self._coordinator_stopped = False
         self._thread = None
         self._control = self._tokenizer = None
         self._control_active = self._token_active = self._http_active = 0
@@ -254,6 +280,25 @@ class PersistentEmbeddingEngine:
         self._packing_turns = _ConsumerTurns()
         self._view = {}
         self._update_view()
+
+    @property
+    def parallelism(self):
+        return getattr(
+            self.adapter._scheduler,
+            "parallelism",
+            self.adapter.embedding_request_parallelism or 1,
+        )
+
+    @property
+    def capacity(self):
+        return min(
+            getattr(
+                self.adapter,
+                "embedding_max_pending_owners",
+                self.parallelism + self.adapter.embedding_queue_size,
+            ),
+            max(1, self.parallelism + self.adapter.embedding_queue_size),
+        )
 
     def submit(self, inputs, *, operation, call, retain_result=False) -> Future:
         """Register borrowed input storage; a Future completes after real drain."""
@@ -302,16 +347,61 @@ class PersistentEmbeddingEngine:
             self._metadata_availability += 1
             self._notify_locked()
 
-    def release_result(self, call):
+    def release_result(self, call, *, wait=False):
+        acknowledgement = Event() if wait else None
         with self._condition:
-            if self._closed and (self._thread is None or not self._thread.is_alive()):
+            if wait and self._thread is current_thread():
+                raise LLMBackendError("llamacpp_embedding_release_from_coordinator")
+            if self._coordinator_stopped or (self._closed and self._thread is None):
+                # Liveness is not a handoff: a thread can still be alive after
+                # deciding to return. The stopped flag is published under this
+                # lock before that decision, so no ack can be stranded behind
+                # the final coordinator cycle. Close shares the same lock.
+                cost = self._retained.pop(call, 0)
+                self._result_bytes -= cost
+                self._result_reserved -= cost
+                self._update_view()
                 return
-            self._release_results.append(call)
+            self._release_results.append((call, acknowledgement))
             self._notify_locked()
+        primary = None
+        if acknowledgement is not None:
+            while not acknowledgement.is_set():
+                try:
+                    acknowledgement.wait()
+                except BaseException as exc:
+                    # Repeated interruption must not turn queued release into
+                    # completed ownership or strand the synchronous caller.
+                    if primary is None:
+                        primary = exc
+            if primary is not None:
+                raise primary
 
     @staticmethod
     def _resource(name):
         return LLMBackendError(f"llamacpp_embedding_{name}_limit")
+
+    @staticmethod
+    def _detach_worker_tracebacks(failure):
+        """Keep typed receipts, not completed transport/parser frame ownership.
+
+        A Future's exception can otherwise retain raw bodies, parsed payloads
+        and input batches through its traceback after their handoff is released.
+        Preserve exception identity, attributes and cause classification while
+        removing data-bearing worker frames from the complete exception chain.
+        """
+        pending, visited = [failure], set()
+        while pending:
+            current = pending.pop()
+            if not isinstance(current, BaseException) or id(current) in visited:
+                continue
+            visited.add(id(current))
+            current.__traceback__ = None
+            pending.extend((current.__cause__, current.__context__))
+            original = getattr(current, "original", None)
+            if isinstance(original, BaseException):
+                pending.append(original)
+        return failure
 
     def _event(self, kind, state, payload, future):
         with self._condition:
@@ -363,9 +453,13 @@ class PersistentEmbeddingEngine:
         self._publications = deque(
             item for item in self._publications if item.plan.state is not state
         )
-        self._http_publications = deque(
-            item for item in self._http_publications if item[0] is not state
-        )
+        kept = deque()
+        for item in self._http_publications:
+            if item[0] is state:
+                item[3].done()
+            else:
+                kept.append(item)
+        self._http_publications = kept
 
     def _release_entry(self, entry):
         self._bytes -= entry.byte_cost
@@ -397,6 +491,7 @@ class PersistentEmbeddingEngine:
             try:
                 result = future.result()
             except BaseException as exc:
+                self._detach_worker_tracebacks(exc)
                 self._progress += 1
                 self._fail(state, exc)
                 if kind == "finish":
@@ -411,9 +506,20 @@ class PersistentEmbeddingEngine:
                 continue
             if kind == "prepare":
                 if state.operation == "prepare":
-                    for position in positions:
-                        state.outputs[position] = result
-                        plan.finished += 1
+                    try:
+                        wanted = state.preparation_result_cost + (
+                            self._prepared_output_bytes(result) * len(positions)
+                        )
+                        if wanted > state.result_credit:
+                            raise EmbeddingResourceLimitError(
+                                "result_bytes", self.max_bytes, wanted
+                            )
+                        state.preparation_result_cost = wanted
+                        for position in positions:
+                            state.outputs[position] = result
+                            plan.finished += 1
+                    except BaseException as exc:
+                        self._fail(state, exc)
                 else:
                     try:
                         self.adapter._engine_validate(
@@ -442,6 +548,7 @@ class PersistentEmbeddingEngine:
         try:
             result = future.result()
         except BaseException as exc:
+            self._detach_worker_tracebacks(exc)
             if kind == "catalog_shared":
                 self._observing.difference_update(payload.members)
             for owner in owners:
@@ -518,6 +625,7 @@ class PersistentEmbeddingEngine:
     def _http_completion(self, batch, future):
         self._http_active -= 1
         self._progress += 1
+        retained = _HandoffRetention(batch.handoff, 0)
         for owner in batch.owners:
             owner.pending -= 1
         for entry in batch.entries:
@@ -536,8 +644,13 @@ class PersistentEmbeddingEngine:
                     raise LLMBackendError(
                         "llamacpp_embedding_count_or_response_mismatch"
                     )
+                if isinstance(vector, _RejectedEmbedding):
+                    self._detach_worker_tracebacks(vector.original)
                 indexed[index] = vector
         except BaseException as exc:
+            self._detach_worker_tracebacks(exc)
+            if batch.handoff is not None:
+                batch.handoff.release()
             for owner in batch.owners:
                 failure = exc
                 if isinstance(exc, _FailedDirectPost):
@@ -583,24 +696,34 @@ class PersistentEmbeddingEngine:
             if owner.call.failure is not None:
                 continue
             result = vectors[owner]
-            if self._vector_dim is None:
-                first = next(
-                    (
-                        value
-                        for value in result
-                        if not isinstance(value, _RejectedEmbedding)
-                    ),
-                    None,
-                )
-                if first is not None:
+            first = next(
+                (
+                    value
+                    for value in result
+                    if not isinstance(value, _RejectedEmbedding)
+                ),
+                None,
+            )
+            if first is not None:
+                # Worker-local call.dimension changes before its Future is
+                # complete. Publish width only here, so one reservation pass
+                # can give older owners credits before a younger seed takes
+                # the pool and blocks ordered delivery behind itself.
+                owner.response_dimension = len(first)
+                if self._vector_dim is None:
                     self._vector_dim = len(first)
             if owner.retain_result:
                 # A newly isolated rejection adds metadata credits even when
                 # this owner already reserved its vector window. Transfer the
                 # bounded HTTP handoff only after the next reservation pass.
-                self._http_publications.append((owner, destinations[owner], result))
+                retained.remaining += 1
+                self._http_publications.append(
+                    (owner, destinations[owner], result, retained)
+                )
             else:
                 self._publish_http_result(owner, destinations[owner], result)
+        if not retained.remaining and retained.ticket is not None:
+            retained.ticket.release()
 
     @staticmethod
     def _record_bytes(record):
@@ -672,11 +795,7 @@ class PersistentEmbeddingEngine:
             plan, record = publication.plan, publication.record
             if plan.state.call.failure is not None:
                 continue
-            if not plan.admitted or (
-                plan.state.retain_result
-                and self._vector_dim is not None
-                and not plan.state.result_credit
-            ):
+            if not plan.admitted or not self._result_admitted(plan.state):
                 self._publications.append(publication)
                 continue
             while publication.positions:
@@ -731,11 +850,7 @@ class PersistentEmbeddingEngine:
         self._preparation_blocked = False
         if any(
             item.plan.admitted
-            and not (
-                item.plan.state.retain_result
-                and self._vector_dim is not None
-                and not item.plan.state.result_credit
-            )
+            and self._result_admitted(item.plan.state)
             and not (
                 item.plan.state.retain_result
                 and self._vector_dim is None
@@ -754,10 +869,11 @@ class PersistentEmbeddingEngine:
                 if state.context is None or state.call.failure is not None:
                     continue
                 if state.retain_result:
-                    if self._vector_dim is not None and not state.result_credit:
+                    if not self._result_admitted(state):
                         continue
                     if (
-                        self._vector_dim is None
+                        state.operation != "prepare"
+                        and self._vector_dim is None
                         and self._unknown_seeds >= self.parallelism
                     ):
                         continue
@@ -767,7 +883,12 @@ class PersistentEmbeddingEngine:
                     plan = state.plans[index]
                     if not plan.groups or not plan.admitted:
                         continue
-                    if state.retain_result and self._vector_dim is None and plan.seeded:
+                    if (
+                        state.retain_result
+                        and state.operation != "prepare"
+                        and self._vector_dim is None
+                        and plan.seeded
+                    ):
                         continue
                     choices.append((state, plan, index))
             # A fast worker continues feeding a lane that has no tokenizer
@@ -810,7 +931,11 @@ class PersistentEmbeddingEngine:
             state, plan, item_index, positions, raw_cost = selected
             plan.groups.popleft()
             self._descriptor_count -= len(positions)
-            if state.retain_result and self._vector_dim is None:
+            if (
+                state.retain_result
+                and state.operation != "prepare"
+                and self._vector_dim is None
+            ):
                 plan.seeded = True
                 self._unknown_seeds += 1
             plan.preparing += 1
@@ -841,11 +966,7 @@ class PersistentEmbeddingEngine:
             and not state.future.done()
             and state.call.failure is None
             and model in state.context.observations
-            and (
-                not state.retain_result
-                or state.result_credit
-                or self._vector_dim is None
-            )
+            and self._result_admitted(state)
         )
 
     def _metadata_member(self, state, model):
@@ -882,11 +1003,7 @@ class PersistentEmbeddingEngine:
             and state.operation != "prepare"
             and bool(state.inputs)
             and (state.starting or state.blocked_at is None)
-            and (
-                not state.retain_result
-                or state.result_credit
-                or self._vector_dim is None
-            )
+            and self._result_admitted(state)
         )
 
     def _can_produce(self, model, states):
@@ -1106,7 +1223,31 @@ class PersistentEmbeddingEngine:
 
     def _dispatch(self, states):
         scheduler = self.adapter._scheduler
-        for model, preflight in tuple(self._preflights.items()):
+        order = getattr(scheduler, "dispatch_order", lambda models: tuple(models))
+        oldest = next(
+            (
+                state
+                for state in self._states
+                if state.call.failure is None and not state.finishing
+            ),
+            None,
+        )
+
+        def handoff_epoch(model):
+            view = self._handoff.snapshot()
+            return (
+                view["normal_used"],
+                view["progress_used"],
+                id(oldest),
+                bool(
+                    oldest is not None
+                    and self._owner_eligible(oldest, model)
+                    and oldest.ready.get(model)
+                ),
+            )
+
+        for model in order(tuple(self._preflights)):
+            preflight = self._preflights[model]
             # A completed observation belongs only to members that existed
             # before its catalog request. New owners require another round.
             members = set(preflight.members)
@@ -1122,18 +1263,43 @@ class PersistentEmbeddingEngine:
             # it does not prove the whole model queue has reached its tail.
             # Renew a partial round when a later owner can help fill it,
             # rather than sending the old members' artificially short tail.
-            if not self._forced_flush(selected, bounded) and any(
-                state not in members
-                and (
-                    self._metadata_member(state, model)
-                    or self._pending_admission(state)
+            if (
+                not self._forced_flush(selected, bounded)
+                and not self._preflight_renewals.get(model)
+                and any(
+                    state not in members
+                    and (
+                        self._metadata_member(state, model)
+                        or self._pending_admission(state)
+                    )
+                    for state in states
                 )
-                for state in states
             ):
+                self._preflight_renewals[model] = 1
+                self._preflight_renewals_total += 1
                 continue
             if not self._eligible(model, selected, bounded, scope):
                 continue
+            ticket = None
             try:
+                while selected:
+                    try:
+                        ticket = self._handoff.try_acquire(
+                            selected,
+                            self._vector_dim,
+                            progress=any(
+                                entry.plan.state is oldest for entry in selected
+                            ),
+                            wire_overhead=self.adapter._engine_payload_overhead(model),
+                        )
+                        break
+                    except EmbeddingResourceLimitError:
+                        if len(selected) == 1:
+                            raise
+                        selected = selected[: max(1, len(selected) // 2)]
+                if ticket is None:
+                    self._handoff_blocked[model] = handoff_epoch(model)
+                    continue
                 distinct = tuple(dict.fromkeys(entry.plan.state for entry in selected))
                 group = self.adapter._engine_batch_call(
                     tuple(owner.call for owner in distinct)
@@ -1145,7 +1311,8 @@ class PersistentEmbeddingEngine:
                 group._input_positions = tuple(
                     getattr(entry, "index", None) for entry in selected
                 )
-                batch = _Batch(selected, distinct, group)
+                group._embedding_response_limit = ticket.response_limit
+                batch = _Batch(selected, distinct, group, ticket)
                 future = scheduler.try_dispatch(
                     lambda _alias, batch=batch, model=model, observed=observation: (
                         self.adapter._engine_run_shared(
@@ -1160,12 +1327,17 @@ class PersistentEmbeddingEngine:
                     model=model,
                 )
                 if future is None:
+                    ticket.release()
                     continue
             except BaseException as exc:
+                if ticket is not None:
+                    ticket.release()
                 for owner in dict.fromkeys(entry.plan.state for entry in selected):
                     self._fail(owner, exc)
                 continue
             self._packing_turns.committed(model, selected)
+            self._handoff_blocked.pop(model, None)
+            self._preflight_renewals.pop(model, None)
             for entry in selected:
                 assert entry.plan.state.ready[model].popleft() is entry
                 entry.plan.http_active += 1
@@ -1185,13 +1357,16 @@ class PersistentEmbeddingEngine:
             - len(self._preflights)
         )
         members = {}
-        for model in dict.fromkeys(model for state in states for model in state.ready):
+        for model in order(
+            dict.fromkeys(model for state in states for model in state.ready)
+        ):
             if len(members) >= budget:
                 break
             if (
                 model in self._observing
                 or model in self._preflights
                 or not scheduler.has_capacity(model)
+                or self._handoff_blocked.get(model) == handoff_epoch(model)
             ):
                 continue
             scope = tuple(
@@ -1249,11 +1424,32 @@ class PersistentEmbeddingEngine:
                 result = self.adapter._engine_result(
                     state.call, state.operation, state.outputs
                 )
+                if state.operation == "prepare":
+                    # Public prepare_texts returns a tuple. Construct it while
+                    # the result reservation still covers both reference lists;
+                    # the public tuple() conversion then transfers it as-is.
+                    result = tuple(result)
+            if failure is None:
+                # Final conversion/sealing is part of the original operation,
+                # not a fresh deadline or permission for a late success.
+                state.call.check()
         finally:
             self.adapter._engine_finish(
                 state.call, state.context.joined if state.context else False
             )
         return result
+
+    @staticmethod
+    def _prepared_output_bytes(record):
+        """Conservative counted + sealed output and one sealing transient.
+
+        Native token IDs are immutable integers but sealing temporarily copies
+        references and serializes them. ensure_ascii can expand control text;
+        cover that bounded work before accumulating the public bulk result.
+        This is an ownership envelope, not process RSS measurement.
+        """
+        ids = getattr(record, "_token_ids", None)
+        return 2048 + 16 * sys.getsizeof(record.text) + 96 * len(ids or ())
 
     @staticmethod
     def _output_bytes(outputs):
@@ -1266,12 +1462,67 @@ class PersistentEmbeddingEngine:
                 )
                 + 640 * len(outputs.rejections)
             )
+        if outputs and isinstance(outputs[0], PreparedEmbeddingInput):
+            return (
+                64
+                + 96 * len(outputs)
+                + sum(
+                    PersistentEmbeddingEngine._prepared_output_bytes(record)
+                    for record in outputs
+                )
+            )
         return 64 + sum(96 + 40 * len(vector) for vector in outputs)
+
+    def _result_admitted(self, state):
+        return (
+            not state.retain_result
+            or state.result_ready
+            or (
+                state.operation != "prepare"
+                and self._vector_dim is None
+                and not state.result_required
+            )
+        )
 
     def _reserve_result(self, state):
         if not state.retain_result:
             return True
-        dimension = self._vector_dim
+        if state.operation == "prepare":
+            if state.result_credit:
+                return True
+            base = 64 + 96 * len(state.inputs)
+            state.result_required = self.max_bytes
+            if base > self.max_bytes:
+                self._fail(
+                    state,
+                    EmbeddingResourceLimitError("result_bytes", self.max_bytes, base),
+                )
+                return False
+            if self._result_reserved:
+                return False
+            # Unknown token counts cannot predict final sealed output size.
+            # One accumulator reserves the existing global pool, then checks
+            # each result before retaining it. Partial owners cannot each hold
+            # credits needed by the other to finish, and tokenizer workers stay
+            # parallel within this owner. Future completion shrinks the lease.
+            state.result_credit = self.max_bytes
+            state.result_ready = True
+            state.preparation_result_cost = base
+            self._result_reserved = self.max_bytes
+            self._peak_result_reserved = max(
+                self._peak_result_reserved, self._result_reserved
+            )
+            state.outputs = [None] * len(state.inputs)
+            return True
+        committed = getattr(self.adapter, "embedding_dim", None) or None
+        observed = state.response_dimension
+        if committed is not None and observed is not None and observed != committed:
+            self._fail(state, LLMBackendError("llamacpp_embedding_dimension_mismatch"))
+            return False
+        # A provisional global seed is only an admission hint. The owner may
+        # learn a different valid dimension after an earlier owner failed;
+        # reconcile its actual output width before any handoff is published.
+        dimension = observed or committed or self._vector_dim
         if dimension is None and state.inputs and not state.rejection_slots:
             # The shared scheduler bounds all first HTTPs by P, also when one
             # owner is using several replicas. Their bounded responses may
@@ -1285,14 +1536,36 @@ class PersistentEmbeddingEngine:
             + 40 * (dimension or 0) * (len(state.inputs) - state.rejection_slots)
             + 640 * state.rejection_slots
         )
+        state.result_required = wanted
+        state.result_ready = False
         if wanted > self.max_bytes:
-            self._fail(state, self._resource("result_bytes"))
+            self._fail(
+                state,
+                EmbeddingResourceLimitError("result_bytes", self.max_bytes, wanted),
+            )
             return False
         delta = wanted - state.result_credit
+        if not state.result_credit:
+            # A whole-pool exact-preparation accumulator must eventually see
+            # the existing owners drain. Younger vector owners cannot keep
+            # taking each newly released slice ahead of that waiter. Owners
+            # that already hold credits may still grow to complete and drain.
+            for earlier in self._states:
+                if earlier is state:
+                    break
+                if (
+                    earlier.operation == "prepare"
+                    and earlier.retain_result
+                    and not earlier.result_ready
+                    and earlier.call.failure is None
+                    and not earlier.finishing
+                ):
+                    return False
         if self._result_reserved + delta > self.max_bytes:
             return False
         self._result_reserved += delta
         state.result_credit = wanted
+        state.result_ready = True
         if state.outputs is None:
             state.outputs = [None] * len(state.inputs)
         self._peak_result_reserved = max(
@@ -1316,13 +1589,15 @@ class PersistentEmbeddingEngine:
 
     def _publish_http(self):
         for _ in range(len(self._http_publications)):
-            state, destinations, vectors = self._http_publications.popleft()
+            state, destinations, vectors, retained = self._http_publications.popleft()
             if state.call.failure is not None:
+                retained.done()
                 continue
-            if state.result_credit:
+            if state.result_ready:
                 self._publish_http_result(state, destinations, vectors)
+                retained.done()
             else:
-                self._http_publications.append((state, destinations, vectors))
+                self._http_publications.append((state, destinations, vectors, retained))
 
     def _sync_result_admission(self):
         """Dormant uncredited windows cannot monopolize the working pool.
@@ -1337,7 +1612,7 @@ class PersistentEmbeddingEngine:
         for state in self._states:
             if not state.retain_result or state.call.failure is not None:
                 continue
-            if not state.result_credit:
+            if not self._result_admitted(state):
                 for entries in state.ready.values():
                     while entries:
                         entry = entries.popleft()
@@ -1362,7 +1637,7 @@ class PersistentEmbeddingEngine:
         for state in self._states:
             if (
                 not state.retain_result
-                or not state.result_credit
+                or not self._result_admitted(state)
                 or state.call.failure is not None
             ):
                 continue
@@ -1404,6 +1679,13 @@ class PersistentEmbeddingEngine:
         else:
             self._result_reserved -= state.result_credit
         self._released_calls.discard(state.call)
+        committed = getattr(self.adapter, "embedding_dim", None) or None
+        if committed is not None:
+            self._vector_dim = committed
+        elif not any(owner.call.failure is None for owner in self._states):
+            # No successful adapter-level dimension was committed. Failed
+            # seeds must not constrain the next independent valid operation.
+            self._vector_dim = None
         self._update_view()
         if state.call.failure is not None:
             state.future.set_exception(state.call.failure)
@@ -1417,7 +1699,7 @@ class PersistentEmbeddingEngine:
                 continue
             if (
                 state.retain_result
-                and not state.result_credit
+                and not state.result_ready
                 and state.call.failure is None
             ):
                 continue
@@ -1458,7 +1740,7 @@ class PersistentEmbeddingEngine:
         for state in states:
             if (
                 state.retain_result
-                and not state.result_credit
+                and not state.result_ready
                 and state.call.failure is None
             ):
                 continue
@@ -1478,13 +1760,10 @@ class PersistentEmbeddingEngine:
                     and self._plans < self.capacity
                     and (state.cursor < len(state.inputs) or state.descriptors)
                     and self._descriptor_count < max(1, self.max_bytes // 1024)
-                    and (
-                        not state.retain_result
-                        or state.result_credit
-                        or self._vector_dim is None
-                    )
+                    and self._result_admitted(state)
                     and not (
                         state.retain_result
+                        and state.operation != "prepare"
                         and self._vector_dim is None
                         and len(state.plans)
                         >= min(len(state.context.observations), self.parallelism)
@@ -1530,6 +1809,9 @@ class PersistentEmbeddingEngine:
             for model, owners in self._lanes.items()
         )
         signature = (
+            self.parallelism,
+            self.capacity,
+            self._preflight_renewals_total,
             self._bytes,
             self._peak_bytes,
             self._tokens,
@@ -1573,6 +1855,13 @@ class PersistentEmbeddingEngine:
             "metadata_targets": len(self._observing) + len(self._preflights),
             "metadata_rounds_waiting": len(self._metadata_rounds),
             "packing_candidate_visits": self._packing_candidate_visits,
+            "preflight_renewals": self._preflight_renewals_total,
+            "embedding_parallelism": self.parallelism,
+            "preparation_plan_limit": self.capacity,
+            "control_parallelism": self.control_workers,
+            "working_bytes_limit": self.max_bytes,
+            "completed_result_bytes_limit": self.max_bytes,
+            "pending_token_limit": self.max_tokens,
             "preparation_results_waiting": len(self._publications),
             "http_results_waiting": len(self._http_publications),
             "retained_result_bytes": self._result_bytes,
@@ -1593,6 +1882,22 @@ class PersistentEmbeddingEngine:
             return {
                 **self._view,
                 "ready_by_replica": dict(self._view["ready_by_replica"]),
+                "handoff": self._handoff.snapshot(),
+                "handoff_waiting_replicas": len(self._handoff_blocked),
+                "wait_reason": "handoff_bytes"
+                if self._handoff_blocked
+                else "result_bytes"
+                if self._http_publications
+                else "working_bytes_or_tokens"
+                if self._preparation_blocked
+                else "metadata"
+                if self._observing or self._preflights
+                else None,
+                "original_leases_active": self._http_active,
+                "control_response_body_bound": self.control_workers
+                * getattr(
+                    self.adapter, "embedding_max_response_bytes", 8 * 1024 * 1024
+                ),
             }
 
     def _next_wait(self):
@@ -1651,14 +1956,29 @@ class PersistentEmbeddingEngine:
                 self._incoming.clear()
                 events, self._events = self._events, deque()
                 releases, self._release_results = self._release_results, deque()
-            for call in releases:
+            acknowledgements = []
+            for call, acknowledgement in releases:
                 cost = self._retained.pop(call, 0)
                 self._result_bytes -= cost
                 self._result_reserved -= cost
                 if not cost and any(state.call is call for state in self._states):
                     self._released_calls.add(call)
+                if acknowledgement is not None:
+                    acknowledgements.append(acknowledgement)
+            if acknowledgements:
+                self._update_view()
+                for acknowledgement in acknowledgements:
+                    acknowledgement.set()
+            releases.clear()
+            call = acknowledgement = None
             self._completions(events)
+            # Completion packets own Futures, batches and worker results.
+            # Release that ownership before any new dispatch in this cycle.
+            events.clear()
             self._packing_turns.prune(self._states, self.adapter._replicas)
+            for alias in tuple(self._preflight_renewals):
+                if alias not in self.adapter._replicas or not self._lanes.get(alias):
+                    self._preflight_renewals.pop(alias, None)
             states = list(self._states)
             if states:
                 offset = self._rotation % len(states)
@@ -1701,13 +2021,24 @@ class PersistentEmbeddingEngine:
                     self._task(self._control, "check", state, None, state.call.check)
             self._start_cohorts(states)
             self._update_view()
+            # Loop locals otherwise retain the last completed state's Future
+            # (and its large result) while the coordinator sleeps indefinitely,
+            # even after the caller received a drained release acknowledgement.
+            states.clear()
+            state = None
             # A local transition can release admission without scheduling a
             # worker (for example retiring a seed plan). Settle that transition
             # once more before waiting for external work.
             changed = progress != self._progress
             timeout = self._next_wait()
             with self._condition:
-                if self._closed and not self._states and not self._incoming:
+                if (
+                    self._closed
+                    and not self._states
+                    and not self._incoming
+                    and not self._release_results
+                ):
+                    self._coordinator_stopped = True
                     return
                 if (
                     self._events
@@ -1732,11 +2063,18 @@ class PersistentEmbeddingEngine:
             coordinator.join()
             self._control.shutdown(wait=True, cancel_futures=True)
             self._tokenizer.shutdown(wait=True, cancel_futures=True)
-        self._retained.clear()
+        with self._condition:
+            self._retained.clear()
+            self._result_bytes = self._result_reserved = 0
+            releases, self._release_results = self._release_results, deque()
+            self._update_view()
+            for _call, acknowledgement in releases:
+                if acknowledgement is not None:
+                    acknowledgement.set()
         self._preflights.clear()
         self._metadata_rounds.clear()
         self._observing.clear()
+        self._handoff_blocked.clear()
+        self._handoff.close()
         self._released_calls.clear()
-        self._release_results.clear()
-        self._result_bytes = self._result_reserved = 0
         self._update_view()
