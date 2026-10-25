@@ -129,10 +129,10 @@ by native replay of its actual payloads and per-alias sequence. B4 is immutable
 Only completed, drained numerical failures could continue collection; other
 failures would stop it. Pre/post properties and catalog stayed unchanged in
 all amended routes. Three additional bounded SDK routes checked G=1 and
-separate preparation/drain instrumentation, for **29 actual routes overall**.
+separate preparation/drain instrumentation, for **29 routes in that first collection**.
 
 Every occurrence was correlated by original window/record index, including
-duplicates. All 16 SDK routes passed exact same-request scatter/projection,
+duplicates. All 16 SDK routes in that collection passed exact same-request scatter/projection,
 with max_abs=0 and cosine=1. Each route drained local HTTP to zero. Overlap is
 client HTTP overlap, not a measurement of GPU execution or utilization.
 
@@ -189,7 +189,8 @@ metrics in the private receipt include initialization and warmup explicitly.
 ## Numerical outcome and remaining authority
 
 Thresholds remain **max_abs <= 1e-5, cosine >= 0.999999**. All thirteen native
-replays, including the original stopped baseline route, exceeded them.
+replays in the first collection, including the original stopped baseline route,
+exceeded them.
 In the amended native comparisons, worst max_abs was approximately
 `7.76042e-4`, minimum cosine `0.999982310`. Cross-version/repeated-baseline
 non-self comparisons also failed; their worst max_abs was `0.001331045`, minimum
@@ -216,3 +217,117 @@ block the native implementation.
 Publication/push and consumer updates were not performed. CC ingestion,
 persisted recommendation provenance, lossless splitting and graph/application
 acceptance remain owned by the consumer's separate lifecycle.
+
+
+## Follow-up completion audit
+
+A requirement-by-requirement audit confirmed the native SDK implementation,
+the original full test receipt and the immutable wheel/source module hashes.
+The numerical block was rechecked independently of the SDK coordinator before
+performing the remaining separate performance measurements. No executable
+source, wheel, model, consumer or shared installation was changed.
+
+### Identical native requests, without the SDK scheduler
+
+A fixed 64-input payload was sent directly three times on each of four aliases
+serially, twice concurrently on all four aliases, and as a singleton three
+times on the first alias: **23 native POSTs**. Observed pre/post properties and
+catalog stayed unchanged. Eight out of eight same-alias serial-repeat audits
+failed (worst max_abs `0.000356677`, minimum cosine `0.999996399`); two out of
+two singleton-repeat audits failed (max_abs `0.000291251`, minimum cosine
+`0.999997034`). The existing thresholds were used throughout.
+
+An independent audit also verified all 240 SDK/native payload pairs from the
+amended campaign, representing 480 POSTs: aliases, JSON values, input order and
+output indices matched. For one identical native-to-native baseline body,
+61 of 64 rows matched exactly and three differed. The worst row had raw delta
+`0.000367528`; it was also the nearest corresponding row by a wide margin,
+excluding a simple row permutation. Wire bodies were reconstructed offline
+from captured request dictionaries; no claim of packet capture is made.
+
+This establishes a native repeatability failure without requiring SDK
+scheduler, scatter or HTTP concurrency as its cause. It does not identify a
+specific GPU, kernel, compiler flag or driver defect. Runtime-owner action is
+needed before a full numerical pass is possible under the current constraints.
+
+### Isolated scheduler component and remaining integration
+
+A private experimental copy of immutable dev2 replaced **only**
+`embedding_scheduler.py` with the candidate module; 47 other files were
+unchanged. This variant (SS4) is not a package release or a production legacy
+mode. Its offline G=1/N=4/B=256 check changed a single 256-text quota into four
+64-text quotas, preserving order, occurrences, no-tokenizer behavior and drain.
+
+The declared live sequence was B4/SS4/C4/C4/SS4/B4 for both corpus sizes, each
+followed by exact native payload replay: 24 additional routes. B→SS isolates
+that scheduler component. SS→C is a residual integration delta containing
+resource/control work **and** engine fairness, worker and telemetry changes;
+it is not a clean causal estimate of resource-bound overhead alone.
+
+| Texts | Variant | Two SDK wall samples, seconds | POSTs | GETs |
+| --- | --- | --- | --- | --- |
+| 511 | B4 | 1.6094, 1.6998 | 8 | 21, 21 |
+| 511 | SS4 | 1.5977, 1.6036 | 8 | 21, 21 |
+| 511 | C4 | 1.6304, 1.6275 | 8 | 22, 22 |
+| 2048 | B4 | 6.6160, 6.0962 | 32 | 65, 69 |
+| 2048 | SS4 | 6.5085, 6.4169 | 32 | 66, 67 |
+| 2048 | C4 | 6.2997, 6.4820 | 32 | 69, 68 |
+
+Every SDK scatter passed exactly; all native numerical replays failed the
+unchanged gates. Concurrency peaked at four, with zero tokenizer calls. The
+small, overlapping timing ranges do not demonstrate a stable improvement.
+
+### Connection policy measured separately
+
+The candidate-auto sequence close/reuse/reuse/close used 511 inputs and an
+immediate native replay for each route: eight additional routes. Defaults and
+server configuration were unchanged; no failure was retried with another
+policy. SDK wall samples were 1.607/1.606 s for close and 1.636/1.709 s for
+reuse. Each used eight embedding POSTs plus 21 GETs, with peak four.
+
+Response-header hooks observed 29 distinct socket objects across 29 measured
+SDK responses under close, versus 20 under reuse. All eight native embedding
+responses used distinct socket objects even in the reuse samples. This is
+socket-object observation, not TCP packet capture. Some reuse occurred, but no
+speed benefit or real VPN/proxy qualification is established. Numerical replay
+failed under both policies. The default remains close.
+
+### Bounds, controls and decoder work measured separately
+
+Two more candidate-auto SDK routes and native replays instrumented the actual
+scheduler, snapshot/result/handoff ledgers, metadata methods and JSON-reader
+threads: four additional routes. Instrumentation ran only inside the probe
+process; it did not rewrite installed SDK source. Wall includes waits; CPU
+includes instrumentation/nesting. Overlapping or nested buckets must not be
+summed into a total overhead or subtracted as pure GPU time.
+
+| Component | 511 texts: calls / inclusive CPU | 2048 texts: calls / inclusive CPU |
+| --- | --- | --- |
+| Quota planning | 2 / 0.022 ms | 8 / 0.053 ms |
+| Scheduler dispatch | 8 / 0.136 ms | 32 / 0.440 ms |
+| Snapshot-credit checks | 513 / 0.964 ms | 2056 / 2.496 ms |
+| Result-credit checks | 1225 / 3.524 ms | 4833 / 12.805 ms |
+| Result-transfer passes | 628 / 1.018 ms | 2462 / 3.686 ms |
+| Handoff reservations | 8 / 0.307 ms | 32 / 1.361 ms |
+| Catalog-control method | 7 / 1.310 ms | 30 / 6.429 ms |
+| Props-control method | 8 / 1.244 ms | 32 / 7.664 ms |
+| Control body read/decode | 21 / 2.239 ms | 68 / 7.607 ms |
+| Embedding body read/decode | 8 / 139.943 ms | 32 / 539.378 ms |
+
+The instrumented SDK wall times were 1.649 s and 6.377 s. Catalog-control wall
+sums were 104.654/579.761 ms; props-control wall sums 62.451/1036.660 ms;
+embedding body read/decode wall sums 542.758/2498.837 ms. These are inclusive
+function observations, not a differential proof of each safety change's cost.
+Exact output order and drain passed; native repeatability still failed.
+
+The follow-up adds **36 SDK/native routes** to the first 29, plus the separate
+23-POST native audit. MILE-000034 remains numerically unqualified; this audit
+does not turn the failed gate into acceptance. No further identical runs or
+SDK threshold changes would resolve that external failure. The operator has
+been asked for a build/profile meeting the existing native repeatability gate.
+The optional real-server extension remains outside authorized server changes.
+
+The final source archive is regenerated after this report, so its documentation
+matches the recorded repository revision. It has its own delivery/audit receipt;
+the already qualified wheel and its hash remain unchanged. No release or push
+is implied by this archive refresh.
