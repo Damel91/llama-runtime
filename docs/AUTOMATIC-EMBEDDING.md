@@ -206,27 +206,34 @@ ordered delivery; closing drains all owned requests.
 replicas can each receive up to 128 texts; four can receive up to 64. These are
 text quotas, separate from per-input context, aggregate HTTP token limits and
 native computation batch/microbatch sizes. Quotas can require multiple HTTP
-requests. The existing scheduler respects global `request_parallelism`,
-per-replica configured limits and observed slots. No compulsory accumulation
-timer or second scheduler is introduced.
+requests. Missing/`None` `request_parallelism` admits up to N verified replicas;
+a positive G caps original HTTP work to `min(N,G)` without reducing N-wide
+quotas. Each canonical replica has one original lease; native slots and batch
+settings remain observations. Fixed global owner/memory credits can limit
+actual admission further. No compulsory accumulation timer or second scheduler
+is introduced.
 
 Compatible admitted records accumulate across callers/windows. Source windows
 are delivery boundaries, not forced HTTP fragmentation boundaries. Isolation
 holds the original alias lease and serializes its own descendant calls; workers
-on other aliases remain able to run. A loaded single-slot replica permits one
-embedding HTTP call at a time. Adding an alias does not authorize parallel work
-unless identity and loaded capacity are verified.
+on other aliases remain able to run. Each verified replica permits one original embedding HTTP call at a time,
+independent of its native parallel setting. Adding a synonym does not increase
+capacity; another loaded canonical destination requires content/semantic
+identity verification.
 
 | Setting | Default | Meaning |
 | --- | ---: | --- |
 | `embedding_max_request_bytes` | 8 MiB | Serialized embedding request bound. |
 | `embedding_max_response_bytes` | 8 MiB | Decoded HTTP response bound, including decompressed gzip. |
-| `embedding_max_pending_bytes` | 64 MiB | Pending records and retained-result credit limits. |
+| `request_parallelism` | `None` | Automatic N; positive values are global guards, independent of text quota width. |
+| `embedding_max_pending_owners` | Derived once from guard-or-2 plus queue | Shared sync/async H before retention/pulls; never multiplied by N. |
+| `embedding_max_pending_bytes` | 64 MiB | Separate snapshot, working and complete-result pools; handoff has a separate finite envelope. |
 | `embedding_max_pending_tokens` | 1,048,576 | Queue reservation units for direct inputs; not measured tokens. |
 | `embedding_isolation_max_requests` | 512 | Maximum descendant POSTs per originally failed POST, excluding that root request. |
 | `http_connection_policy` | `"close"` | Independent connections for an owned client; `"reuse"` explicitly enables keep-alive. |
 
-These integer limits must be positive. There is also an overall finite original
+Explicit integer limits must be positive; `request_parallelism` and
+`embedding_max_pending_owners` also allow their documented automatic `None`. There is also an overall finite original
 call/window deadline. Isolation checks cancellation and fresh model/limit
 observations before descendant calls. With N rows the full binary isolation
 tree has at most `2*N-1` POSTs including the root, before the configured cap.
@@ -263,3 +270,8 @@ two-alias HTTP barrier fixtures prove scheduler overlap separately. Reported
 client wall times include networking, preparation and validation, not pure GPU
 time. The existing cross-replica numerical finding remains open; this contract
 does not relax its tolerances or modify consumers or loaded models.
+
+See [concurrency and ownership](CONCURRENCY-AND-DIAGNOSTICS.md) for the separate
+result/handoff lifetimes, finite control JSON, progress reserve and bounded
+HTTP diagnostics. Category 80% and mixed 90% factors, the 2,500-text calibration
+trigger and persisted recommendation are unchanged by this scheduler candidate.

@@ -62,27 +62,34 @@ The finite resource budgets are configurable:
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `embedding_max_pending_bytes` | 67,108,864 bytes | Ceiling for the raw/counted queue pool and, separately, the completed async output pool |
+| `embedding_max_pending_bytes` | 67,108,864 bytes | Separate ceilings for input snapshots, raw/counted queues and complete sync/async outputs; HTTP handoff derives its own finite envelope |
 | `embedding_max_pending_tokens` | 1,048,576 tokens | Bound prepared tokens queued or active for inference |
 | `embedding_max_request_bytes` | 8,388,608 bytes | Bound individual request payloads |
-| `embedding_max_response_bytes` | 8,388,608 bytes | Bound each decoded native JSON body before materialization |
+| `embedding_max_response_bytes` | 8,388,608 bytes | Pre-decode bound for all embedding-path JSON, including controls; handoff can impose a lower per-candidate cap |
 | `embedding_preparation_cache_entries` | 1,024 entries | Bound completed exact-token retention; zero disables |
 | `embedding_preparation_cache_bytes` | 8,388,608 bytes | Cache ceiling, also capped by pending bytes / 4; zero disables |
 
 The first four budgets require positive integers. The two cache limits accept
 nonnegative integers; zero disables retention. Oversized embedding inputs remain
 measurable with `prepare_*` within the configured resource ceilings, but are
-not admitted for inference. The caller's original input and the complete
-result required by the synchronous API remain proportional to that call.
-Transient worker response handoffs have separate bounds from worker count
-and native JSON response limits; they do not borrow the output pool's credits.
+not admitted for inference. The caller's original input remains external. The library reserves complete
+sync and async results before accumulating them; oversized whole outputs fail
+explicitly instead of escaping the result ledger. Exact bulk preparation has
+one unknown-size result accumulator, with parallel tokenizer workers inside it.
+Response handoff uses a separate global normal/progress pool, not credits from
+the working pool required to make those requests progress. Its floor is 64 KiB;
+cold JSON decoding reserves a 64-times-body materialization envelope.
 Async intake also bounds source pulls and
 completed windows waiting for the consumer. Resource accounting does not
 claim a fixed process RSS.
 
 Preparation lookahead and retained work have separate lifetimes.
-`embedding_queue_size` adds to request parallelism to bound active preparation
-plans. A plan releases that phase lease when all its groups have been prepared
+`embedding_queue_size` contributes to a preparation target
+`min(H,max(1,effective_HTTP_capacity+queue_size))`. Fixed global H is controlled
+by `embedding_max_pending_owners`; it is acquired before sync registration or
+async source pulls and does not grow with discovery. HTTP text quotas still
+use N independently of a positive global guard; each replica owns one original
+lease regardless of native slots. A plan releases that phase lease when all its groups have been prepared
 and its preparation workers finish; ready or in-flight records can still be
 retained. Their byte/token credits, result reservations and shared HTTP leases
 are not released early. This lets several small source windows fill a replica's

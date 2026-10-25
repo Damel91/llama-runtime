@@ -37,16 +37,17 @@ The project's engineering lifecycle is managed with
 | Task-aware preparation | Configurable model-specific query/document prefixes and exact server tokenization, including special tokens; measures oversized inputs and safely reuses verified counts. |
 | Batching | Configurable total text windows, balanced quotas across usable replicas and HTTP packing within known input/context and explicitly configured aggregate token budgets; native computation batch sizes remain separate. Inputs are never silently truncated. |
 | Replica discovery | Explicit aliases or automatic discovery using content and semantic identity tags from a compatible server manager; identity pinning and bounded topology refresh. |
-| Shared concurrency | Per-adapter global and per-replica admission, bounded queues, backpressure, separate tokenizer limits and ordered results across concurrent callers. Effective admission is bounded by observed slots and configured global/per-replica limits; unknown capacity falls back to one. |
+| Shared concurrency | One original HTTP lease per verified canonical replica; automatic N-wide capacity or a positive global guard. Shared sync/async owner, memory and payload bounds; separate finite tokenizer/control workers and ordered results. Native slots remain diagnostics. |
 | Async embedding windows | Async text or prepared-input sources, ordered complete windows, bounded intake and buffered results, with the same scheduler and limits used by synchronous callers. |
 | Persistent embedding queues | Prepared records accumulate in adapter-owned queues for each verified replica; batches are formed when execution capacity is available, with the same engine for synchronous and async callers. |
 | Native token inputs | Reuses exact retained token IDs with verified weights, tokenizer build and prefix/special policy, avoiding a second string tokenization in the native embedding handler. |
 | Optional automatic embeddings | Verified loaded-model discovery and direct text inputs using the existing scheduler; an explicit character-budget helper calibrates 2,500 selected hard texts by category when requested. Native 500s isolate rejected inputs through bounded subbatches and preserve successful indexed vectors. |
 | Lifecycle and errors | Typed backend, timeout, cancellation and runaway errors; cooperative cancellation, repetition protection and drained embedding shutdown. Embedding calls have overall deadlines; generation supports bounded HTTP and stream-idle waits. |
 | Optional stream idle | Explicit `stream_idle_timeout_sec=None` waits through quiet prefill; connection/JSON budgets remain finite, with per-request socket interruption for Stop and drained close. |
-| Diagnostics | Optional bounded thinking capture, invocation correlation and final diagnostic sinks, including interrupted calls. |
+| Diagnostics | Bounded HTTP kind/phase counts and wall unions, requested/effective capacity, resource use/wait reasons; optional thinking capture and final sinks, including interrupted calls. |
 | HTTP access | Works with native unpatched llama-server using independent connections by default; explicit keep-alive opt-in, authentication, TLS verification and raw endpoint helpers. |
 | Read-only model catalog | Typed observations of catalog entries and proven loaded models, explicit capability unknowns, identity tags and context provenance; bounded GET-only discovery without model loading. |
+| Optional server-observation SDK | Typed complete snapshots and server-enforced conditional admission for a separately negotiated provider; native fresh checks remain the default. No real-server extension is installed or implied. |
 | Optional embedded VPN client | A separately built Go tsnet helper for Tailscale or Headscale, with consumer-owned configuration, authenticated loopback proxy, verified peer routing, TLS and bounded teardown; no system VPN installation. |
 | MCP data contracts | Validated integration, call, event and result types for consumer-managed MCP execution. |
 
@@ -56,6 +57,41 @@ server build, model and chat template. Responses are not locally validated
 against the forwarded JSON Schema. Splitting source documents and tracking their
 fragments belong to the consuming application. The server's own auto-loading
 policy is supported.
+
+## Development candidate: replica admission and bounded ownership
+
+The candidate uses one original embedding POST per verified canonical replica.
+An absent/`None` `embedding_request_parallelism` (`request_parallelism` on the
+automatic service) uses N loaded replicas; a positive G caps original HTTP work
+to `min(N,G)`. Quotas still use N: with budget 256 and four replicas, G=2 admits
+four 64-text quotas with up to two POSTs active. Native slots and
+batch/microbatch settings do not multiply HTTP permits. Positive legacy
+per-replica caps remain parsable with an effective limit of one.
+
+`embedding_max_pending_owners` adds a fixed shared H before synchronous
+snapshot/registration or async source pulls. Its default resolves once from
+configured G, or seed two, plus the queue size. Discovery does not enlarge H
+or the memory pools. Input snapshots, working records, complete sync/async
+results, exact-ID cache and HTTP handoff have separate finite lifetimes.
+Bulk exact preparation reserves one unknown-size output accumulator, while its
+tokenizer workers remain parallel. A complete output that cannot fit fails
+explicitly rather than escaping the result bound.
+
+HTTP handoff has a separate global envelope with a 64 KiB floor and a progress
+reserve. Cold vector width receives a conservative materialization allowance
+and a per-candidate response-body cap before JSON decode. All embedding control
+JSON paths are bounded too. Eligible singleton statusless observations reuse
+root props within the same boundary; native fresh checks and the default
+connection-close policy remain. Category 80% and mixed 90% calibration margins
+are unchanged, and the automatic path still does not tokenize each input.
+
+The [candidate verification record](docs/verification/REPLICA-OWNERSHIP-CANDIDATE.md)
+records tests, wheel identity, live measurements and qualification boundaries.
+Publication and consumer acceptance are separate outcomes. See
+[concurrency and ownership](docs/CONCURRENCY-AND-DIAGNOSTICS.md),
+[embedding contracts](docs/EMBEDDING-CONTRACTS.md) and the optional
+[server-observation SDK](docs/SERVER-OBSERVATION.md) for scope and migration.
+Consumer installations and server/model configuration are separate actions.
 
 ## Prerelease 0.13.0a1
 
@@ -408,10 +444,10 @@ already prepared by the consumer.
 An adapter can share bounded concurrency and queue limits across callers.
 Optional `embedding_replica_discovery=True` selects loaded replicas using
 content and semantic identity tags published by a compatible server manager.
-Each replica is bounded by its observed slots and configured admission limits;
-unknown capacity falls back to one. Explicit
-replica aliases remain supported. Without discovery or concurrency settings,
-embedding requests remain sequential. See the
+Each verified canonical replica has one original lease; native slots remain
+diagnostics. Explicit multi-alias configurations also require matching content
+and semantic identity. A single unattested alias remains isolated at capacity
+one. Quota width follows N even when a positive guard allows fewer active POSTs. See the
 [integration guide](docs/INTEGRATION.md) and
 [replica discovery contract](docs/AUTOMATIC-EMBEDDING-REPLICAS.md).
 
@@ -439,9 +475,9 @@ async def ingest(embedding):
 
 Each yielded vector list corresponds to one source window, in order.
 `max_pending_windows` includes source pulls, preparation, inference and results
-waiting for the consumer. Global intake is bounded across the adapter's async
-streams; synchronous and asynchronous work share HTTP scheduling and replica
-limits. `batch_size` still controls total-text distribution windows internally.
+waiting for the consumer. Fixed global owner H covers both synchronous calls
+and async streams before retention or source pulls; separate input/result/
+handoff credits complement that count. Both APIs share the same scheduler. `batch_size` still controls total-text distribution windows internally.
 The finite timeout applies separately to each source window, including waiting
 for capacity and the source itself.
 

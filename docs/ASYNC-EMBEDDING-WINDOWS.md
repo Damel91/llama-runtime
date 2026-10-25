@@ -49,11 +49,16 @@ releases that window's lease. There is no additional speculative source read
 beyond the admitted window budget, including when the first window is slow or
 the consumer pauses.
 
-Admission is also bounded across all async streams of the adapter before
-pulling the source. This prevents multiple streams from creating an unbounded
-pending-work registry. The global intake capacity derives from the existing
-positive request parallelism plus queue budget. These are counts of windows,
-not a byte limit on individual strings or memory retained by the caller.
+One global H owner budget covers synchronous callers and all async streams,
+including in-progress source pulls, before snapshot/registration. Set
+`embedding_max_pending_owners` explicitly or let it resolve once from
+`(configured positive guard, otherwise seed 2)+queue_size`, minimum one.
+It never follows the discovered replica count. `max_pending_windows` consumes
+this shared H as a per-stream sublimit. A separate finite input-snapshot byte
+pool validates/freeze-copies a finite sequence before engine registration;
+a shared builder avoids partial-copy credit deadlocks. Caller/source storage
+is external to this ownership envelope. An indivisible impossible window fails
+explicitly; aggregate pressure remains cancellable under its original deadline.
 This intake lease is distinct from an internal preparation-lookahead lease:
 completed preparation can free lookahead for another plan while the original
 window, its records, results and HTTP ownership remain retained. It does not
@@ -63,15 +68,21 @@ The adapter's `batch_size` continues to control total-text windows for replica
 quotas. Source windows are result boundaries and can contain multiple internal
 batch windows. Each registers with the persistent engine, discovery, identity
 and token-count validation, preparation budgets and the single HTTP scheduler.
-Observed slots and configured global/per-replica limits remain authoritative,
-also across concurrent synchronous calls. The async bridge submits work and
+One original POST lease per verified replica is authoritative. An absent or
+`None` global guard uses N replicas; a positive guard caps HTTP concurrency
+without reducing N-wide text quotas. Native slots/batch/microbatch remain
+diagnostics. Fixed H and global working/result/handoff pools can limit actual
+admission below that capacity, including across synchronous callers. The async bridge submits work and
 awaits the engine's completion Future; it does not allocate a blocking
 coordinator thread for every window, route replicas or schedule a second set
 of HTTP jobs. A completion Future is settled only after the owned work drains,
 rather than merely when its waiter has been cancelled.
 
 Engine-owned byte and prepared-token budgets complement window counts; see
-the [resource settings](PROGRESSIVE-EMBEDDING.md). Source windows are delivery
+the [resource families](CONCURRENCY-AND-DIAGNOSTICS.md#admission-and-resource-ownership).
+HTTP completion alone does not release a response handoff while result credits
+are unavailable. Transfer into result credits releases handoff; ordered public
+delivery then releases the result and owner leases. These are separate steps. Source windows are delivery
 boundaries, not HTTP batch boundaries. Compatible prepared records can share a
 POST across windows or callers, retaining each owner's cancellation, deadline
 and output indices. The request target derives from the adapter's text budget

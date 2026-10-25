@@ -1,7 +1,8 @@
 # Automatic embedding replica discovery
 
 The consumer selects an endpoint, a logical model and an inference profile.
-The library discovers physical instances already loaded on that endpoint and
+The library discovers canonical, independently addressable loaded destinations
+on that endpoint and
 manages routing, admission and limits. The server operator owns model files,
 builds, processes and device placement. This document describes the protocol
 and client behavior; it does not certify a server installation.
@@ -37,9 +38,11 @@ recompute their digests.
 ## Selection and routing
 
 Discovery is lazy: constructing an adapter performs no network requests.
-`embedding_replica_discovery=True` opts into automatic discovery. The existing
-explicit `embedding_replicas` mode remains available; the two modes cannot be
-combined. Automatic mode requires no replica list or replica count. The
+`embedding_replica_discovery=True` opts into automatic discovery. Explicit `embedding_replicas` remains available; the two modes cannot be
+combined. An explicit list containing multiple aliases must prove the same
+content and semantic identity. Duplicate synonyms of one catalog entry are
+not separate replicas, and unverified/heterogeneous multi-alias lists fail
+before engine admission. A single unverified legacy alias remains isolated. Automatic mode requires no replica list or replica count. The
 consumer selects an anchor alias, a published logical name or
 `sha256:<content digest>`.
 
@@ -56,22 +59,31 @@ Internal replica identifiers are monotonic operational identifiers; consumers
 should retain the stable content and semantic identities for indexes and
 caches instead.
 
-In the local 0.7.0 candidate, each automatic replica's active HTTP capacity is
-derived from its positive observed `total_slots`, capped by the adapter's global
-`embedding_request_parallelism`. Unknown or malformed capacity permits one
-active request. Explicit replica mode also respects verified slots and its
-configured per-replica ceiling. The client does not set the server's slot count.
+The current development contract admits **one original embedding POST per
+verified canonical replica**. Missing/`None` `embedding_request_parallelism`
+uses all N replicas; a positive G limits original work to `min(N,G)`. Existing
+positive settings stay guards. Positive explicit `max_in_flight` values remain
+accepted for configuration compatibility, but their effective limit is one.
+Requested/effective values and the limiting reason remain visible.
 
-The same bounded scheduler admits ready HTTP batch jobs. Multiple batches of
-one quota can use multiple verified slots; another ready alias can advance
-while an alias is busy, including with a zero-length waiting queue. More slots
-are an admission capacity, not a guarantee of higher throughput or simultaneous
-GPU execution. Increased slot use must be numerically qualified with the
-chosen model, build and loading profile.
+Native `total_slots`, `n_batch` and `n_ubatch` are diagnostics. They do not
+multiply original HTTP permits or prove device placement. The library neither
+assigns native slot identifiers nor changes the server's parallel setting.
+Recovery/isolation children keep their original alias lease and run serially
+inside it; other replicas can advance.
 
-Calls share the adapter's scheduler. Pool changes take effect at a boundary
-with no active calls, using a bounded wait that responds to cancellation and
-closure. Already started work is not replayed. Discovery failure does not
+Quotas use N independently of G. With `batch_size=256,N=4,G=2`, the plan still
+contains up to four 64-text quotas, with at most two original POSTs active.
+Byte/explicit token limits may split a quota further. Fair observation and
+dispatch turns prevent a continuously ready first alias from starving peers
+when `G<N`. Source order and result identity remain unchanged.
+
+Calls share the adapter's scheduler. Pool/executor changes take effect only
+after the previous local topology generation's work and references drain,
+under the original finite cancellation/deadline. A shrink blocks new admission
+without revoking existing leases or results. The fixed global owner and memory
+pools do not grow with N; available resources can admit fewer than `min(N,G)`
+POSTs. Already started work is not replayed. Discovery failure does not
 authorize new requests using stale catalog data. The client neither invokes
 administrative load/unload operations nor probes properties of unloaded
 aliases.
@@ -122,3 +134,18 @@ See [embedding contracts](EMBEDDING-CONTRACTS.md) for API details and
 [verification requirements](REQUIREMENTS.md) for the verification boundary.
 These 0.7.0 candidate changes do not constitute a release, new live
 qualification or consumer migration.
+
+## Local and remote generations
+
+A local scheduling generation protects client ownership; a weight digest does
+not attest loaded context, build, slot count or a same-weight reload. Native
+catalog/props checks therefore remain fresh at POST/recovery boundaries.
+The optional [server-observation SDK](SERVER-OBSERVATION.md) describes the
+stronger, server-enforced contract needed to reuse authorization across POSTs.
+It is not inferred from native tags and has no implicit deployment dependency.
+
+Worker capacity, fixed owner H, snapshot/result/handoff pools and config
+migration details are specified in
+[concurrency and ownership](CONCURRENCY-AND-DIAGNOSTICS.md). Qualification of
+this candidate is recorded separately from historical profile evidence in the
+[pending candidate report](verification/REPLICA-OWNERSHIP-CANDIDATE.md).

@@ -1,6 +1,6 @@
 # Embedding contracts and public preparation
 
-This guide describes embedding semantics in the development 0.10.3 candidate. The
+This guide describes the current development embedding contract. The
 [progressive queue and native token contract](PROGRESSIVE-EMBEDDING.md) extends
 the scheduler shared by synchronous calls and async window sources. Local
 qualification, publication and consumer acceptance remain distinct; see
@@ -10,8 +10,8 @@ qualification, publication and consumer acceptance remain distinct; see
 
 `batch_size` limits the total texts in a distribution window. Only the shared
 adapter scheduler chooses distinct aliases in rotation. The number selected is
-the minimum of texts in the window, usable aliases and the global active-work
-limit. Balanced contiguous quotas use quotient/remainder allocation: 256 texts
+the minimum of texts in the window and N verified usable canonical aliases.
+A configured global HTTP guard does not reduce that quota width. Balanced contiguous quotas use quotient/remainder allocation: 256 texts
 over two aliases gives 128 + 128; over four gives 64 + 64 + 64 + 64. These values
 are examples, not hardcoded limits. `batch_size=8` means eight texts total;
 a consumer wanting windows of 256 must configure 256.
@@ -51,15 +51,19 @@ preparation can flush earlier.
 Later arrivals do not restart it. The per-replica request text target derives
 from the adapter's total-text budget and usable replicas, independent of source
 window size. Accumulated windows neither shrink nor multiply that target.
-A quota can have multiple batches active when verified capacity permits. The shared scheduler
-rotates among eligible replicas and independent callers; a busy alias does
-not prevent another alias's ready work from advancing.
+The shared scheduler rotates among eligible replicas and independent callers;
+a busy alias does not prevent another alias's ready work from advancing.
 
-Effective per-replica concurrency is bounded by positive observed
-`total_slots`, the adapter's global ceiling and an explicit per-replica ceiling
-when configured. Unknown or malformed slot observations fall back to one;
-additional capacity is not assumed. Slot counts describe loaded capacity,
-not currently idle slots or simultaneous GPU execution.
+Each canonical replica has one original HTTP lease, held through all serial
+recovery/isolation children and actual drain. Missing/`None`
+`embedding_request_parallelism` gives capacity N; a positive G gives
+`min(N,G)`, subordinate to ready work and global resources. Native slots and
+batch/microbatch observations do not increase that capacity. Positive legacy
+per-replica `max_in_flight` values remain parsable with effective value one.
+For `N=2,G=1`, 2,048 texts at budget 256 still have sixteen 128-text full POSTs,
+admitted serially with fair alias turns. This intentionally changes the old
+`G<N` plan. Explicit multi-alias configurations now also require matching
+content/semantic attestation; duplicate catalog synonyms do not add N.
 
 ## Exact public preparation
 
@@ -111,18 +115,25 @@ These budgets bound raw/counted-record queue credits, prepared tokens queued
 or active for inference, and individual request payloads. Transient tokenizer
 response handoffs are separately bounded by worker count and native JSON
 response limits. Oversized inputs are measurable within those resource
-ceilings but remain invalid for inference. The caller's original input and
-complete synchronous result are outside any constant-memory claim. Async
-completed outputs remain bounded with their unconsumed windows.
+ceilings but remain invalid for inference. Caller/source memory is external;
+the library's owned complete sync and async outputs now share a separate
+finite result-credit pool before transfer. A synchronous call can fail with a
+typed resource error when its whole output cannot fit; using smaller windows
+or increasing that resource limit is explicit consumer configuration. Exact
+bulk preparation reserves one accumulator for unknown final token/ID sizes;
+its tokenizer workers can still run in parallel. Async completed outputs keep
+their window/owner admission until ordered delivery or cleanup.
 
 `embedding_max_response_bytes` is an independent positive integer, default
-8 MiB, bounding each decoded native JSON response for tokenization and
-embedding. It is enforced before JSON materialization, including decompressed
+8 MiB, bounding each decoded native JSON response on embedding, tokenization,
+health, catalog, props and recovery paths. It is enforced before JSON materialization, including decompressed
 bodies. It does not inherit the request or pending-record ceiling. Overflow or
 incomplete framing fails with a typed error and does not trigger replay or
-partial result publication. Concurrent responses can each reach their own
-bound; decoded JSON objects, worker handoffs and result reservations are
-separate allocations rather than an overall RSS guarantee.
+partial result publication. Embedding handoff has a further global resource envelope, including a
+conservative cold decoder allowance and a per-candidate response limit that
+may be lower. Wire bytes, inflated bytes, materialized objects and result
+reservations remain distinct allocations, not an overall RSS guarantee.
+See the [resource families and progress reserve](CONCURRENCY-AND-DIAGNOSTICS.md#response-handoff-and-progress).
 
 Tokenization and metadata have their own concurrency limits; total HTTP
 capacity is derived from embedding, tokenizer and control capacity. The
@@ -131,7 +142,9 @@ Native exact tokenization still requires calls for distinct new texts; this
 engine does not add a bulk tokenizer endpoint.
 
 Initial metadata observations can be reused coherently across admission work,
-including the catalog already read for pool membership. Loaded identity,
+including the catalog already read for pool membership. In an eligible
+singleton statusless boundary, root props can also serve as selected props,
+removing one duplicate GET. No necessary router check is removed. Loaded identity,
 tokenizer build and limits are still observed at actual dispatch boundaries.
 This reuse does not add a time-based authorization window or remove topology
 and current-limit checks.
@@ -260,7 +273,8 @@ adapter = build_embedding_adapter({
     "base_url": "http://localhost:8080",
     "embedding_replica_discovery": True,
     "batch_size": 256,
-    "embedding_request_parallelism": 4,
+    "embedding_request_parallelism": None,  # Automatic verified replica capacity.
+    "embedding_max_pending_owners": 18,  # Fixed across topology changes.
     "token_count_parallelism": 2,
     "timeout": 120,
     "embedding_prefixes": {
@@ -284,3 +298,25 @@ The configured model must already be available under the server's policy.
 Automatic verified pooling requires the
 [Noxi identity tags](AUTOMATIC-EMBEDDING-REPLICAS.md). Prefixes must match the
 chosen model's task contract; the example's strings are not universal defaults.
+
+## Ownership migration in this candidate
+
+A fixed H owner lease is acquired before synchronous snapshot/registration or
+an async source pull. Input snapshots, working records, completed outputs,
+preparation cache and HTTP handoff use separate finite ledgers. H and memory
+budgets do not multiply when discovery finds more replicas. Source windows
+remain consumer-owned chunk boundaries; no AST, splitting, graph or database
+behavior moves into the library. Ordinary automatic embedding still sends
+text without per-input tokenization; category 80% and mixed 90% calibration
+margins remain unchanged.
+
+Synchronous return waits for acknowledged result-credit transfer; an
+interrupted wait drains before releasing its owner. `close()` also accounts for
+sync snapshots not yet registered in the engine. Reentrant close from a thread
+that owns active sync intake fails before changing shutdown state, avoiding a
+self-wait. Async sources still require `await adapter.aclose()` for full source
+cleanup. Uncooperative user code cannot be forcibly terminated safely.
+
+The [candidate verification record](verification/REPLICA-OWNERSHIP-CANDIDATE.md)
+separates pending final checks, wheel provenance, native live qualification and
+consumer acceptance. This contract text does not itself certify those gates.

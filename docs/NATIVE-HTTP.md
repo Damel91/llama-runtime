@@ -88,3 +88,30 @@ Tool argument fragments are assembled once, while public raw payloads and tool
 snapshots remain isolated from consumer mutation. Repetition detection keeps
 its existing decisions with bounded suffix storage; these optimizations do not
 change the public token, cancellation or error contracts.
+
+## Embedding JSON bounds and native control reuse
+
+The embedding adapter supplies a finite response-body ceiling to health,
+catalog, props, tokenizer, embedding and recovery calls. Native identity,
+gzip/x-gzip and deflate bodies are bounded on the wire and after inflation,
+before JSON decode. Unsupported encodings and oversized/incomplete bodies fail
+explicitly. Error bodies have their own finite reader. An injected client must
+honor the bounded-call interface; a `TypeError` does not silently retry without
+its bounds. Direct raw-client callers remain responsible for the options they
+choose.
+
+Embedding handoff adds a global materialization reservation and may lower a
+POST's response-body cap, especially while vector width is unknown. Body bytes,
+Python objects and retained results have different lifetimes; see
+[resource ownership](CONCURRENCY-AND-DIAGNOSTICS.md). These limits do not change
+HTTP connection policy or introduce POST replay.
+
+Same-boundary catalog reuse remains supported. In an eligible single-entry,
+statusless direct catalog, coherent root props can also satisfy selected props,
+removing one duplicate GET. Loaded router entries still require their fresh
+selected observations. This is a native optimization, not a cache of authority
+across POSTs or a proof that a GET and subsequent POST are atomic.
+
+An optional [server-observation SDK](SERVER-OBSERVATION.md) specifies the
+stronger negotiated producer contract. It is separate from native llama.cpp
+support and does not imply that a real server currently implements it.

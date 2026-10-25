@@ -6,165 +6,161 @@ server, model or device configuration.
 
 ## Embedding and external replicas
 
-In development version 0.10.3, `embedding_request_parallelism` limits active
-embedding HTTP work across an adapter. Its default is 4 with automatic replica
-discovery and 1 otherwise. `embedding_queue_size` defaults to 16 and adds
-bounded preparation lookahead to the request-parallelism budget; zero retains
-only that base preparation capacity. These budgets are shared across callers
-and complement the byte, token, result and async-intake limits below.
+The development candidate uses one persistent model engine and one embedding
+HTTP scheduler for synchronous calls and async windows. `N` is the number of
+independently addressable, loaded canonical replicas in the verified local
+topology. Both weight-content and embedding-semantic identities must agree;
+synonyms of one catalog entry do not add capacity. Explicit multi-alias lists
+also require that verification. A single unattested legacy alias remains an
+isolated capacity-one fallback; it cannot authorize pooling.
 
-`batch_size` limits the total texts in one distribution window, with balanced
-quotas assigned to distinct aliases. Explicit adapter and per-replica
-`batch_token_limit` settings bound aggregate tokens in each HTTP request.
-Native `n_batch`/`n_ubatch` are execution observations, not aggregate HTTP limits.
-Context limits apply to individual inputs; an unpublished backend splitting
-capability stays unknown. A quota can require several HTTP requests.
-`token_count_parallelism` is a global adapter limit, including public
-preparation. Results preserve input order and cardinality exactly.
+`embedding_request_parallelism=None`, including an absent setting, selects
+automatic capacity `C=N`. A positive integer `G` is an upper guard:
+`C=min(N,G)`. Persisted positive settings retain their meaning as guards; they
+are not silently promoted to automatic. Each replica admits **one original
+embedding POST**. Positive `EmbeddingReplicaConfig.max_in_flight` values remain
+parsable, but their effective value is one. This is an intentional behavioral
+change, not a claim that old concurrency behavior is unchanged.
 
-`embedding_replicas` explicitly lists destinations on the same endpoint. Each
-`EmbeddingReplicaConfig` provides `model`, `max_in_flight` and, when needed,
-`max_input_tokens` and `batch_token_limit`. An empty list uses the profile's
-model. Available replicas are selected round-robin under global and
-per-replica limits. Alias suffixes do not identify devices; the server operator
-controls processes, loading and device assignment. Automatic discovery has
-its own attestation rules in [replica discovery](AUTOMATIC-EMBEDDING-REPLICAS.md).
+`total_slots`, `n_batch` and `n_ubatch` remain native execution observations.
+They do not multiply HTTP permits. An array POST can already supply several
+native sequences. Replica aliases do not prove GPU/process placement, and
+HTTP concurrency does not guarantee simultaneous GPU execution or a speedup.
+The server operator owns loading, slots, builds and hardware.
 
-Loaded `total_slots` caps per-replica HTTP concurrency together with global and
-configured per-replica ceilings. Unknown slot capacity falls back to one;
-observed slots are not currently idle slots or a GPU speed guarantee.
-Reductions drain already admitted work, and increases can admit additional
-ready batches. Topology replacement remains a separate drained boundary.
+`batch_size=B` is a total-text budget. Quotas and HTTP text targets use `N`,
+independently of `G`: the target is `ceil(B/min(B,N))`. A window with fewer
+texts uses at most `min(texts,N)` nonempty destinations. Quotient/remainder
+allocation rotates the uneven shares. For 256 texts, two replicas receive up
+to 128 each and four receive up to 64 each. With `N=2,G=1`, 2,048 texts still
+have sixteen full 128-text POSTs, admitted one at a time. Byte and explicit
+HTTP token limits can require additional POSTs. `N=0` is unavailable.
 
-One persistent engine owns input admission and ready queues for each verified
-replica. Its fixed worker pools overlap exact remote tokenization, metadata and
-embedding HTTP. Batch contents are selected when execution capacity is
-available, so records prepared during a previous POST can join the next batch.
-The engine can skip a busy alias and rotates among independent ready callers.
-The synchronous and async APIs submit to that same engine; there is no
-blocking coordinator thread per async window or second embedding scheduler.
+Queues accumulate compatible records across source windows and callers.
+`embedding_batch_wait_sec=0.0` fills from preparation/capacity events, without
+a required timer; sparse work or resource pressure may flush partial batches.
+Positive finite values opt into bounded coalescing in this same engine.
+Original occurrence indices preserve ordered scatter, cardinality and owner
+boundaries. Replica observation and dispatch take fair turns even when `G<N`;
+consumer and source-window fairness remain separate. A dispatch turn advances
+only when work is actually admitted.
 
-Readiness summaries update incrementally when ready entries enter or leave a
-queue. Packing uses iterators for the needed prefix and constant-time owner
-rotation, avoiding whole-backlog copies on every preparation event. It does not
-retain a frozen candidate batch across capacity or metadata waits. This changes
-local scheduling work, not native tokenization, inference or numerical limits.
-Diagnostic `packing_candidate_visits` is a cumulative integer counting records
-actually examined by `_pack`; it is not elapsed time or GPU work. An adapter
-snapshot can include preliminary checks as well as the main pipeline.
+A root POST and its bounded isolation descendants retain one original alias
+lease through real transport drain. Descendants run serially on that alias;
+other replicas may advance. Cumulative POST count therefore differs from the
+number of simultaneous original leases. No ambiguous native POST is retried.
 
-A partial preflight is renewed when another useful owner arrives during its
-metadata checks. New rows require that fresh membership observation; they do
-not inherit the earlier snapshot. Admission still in progress can help fill a
-batch, while topology-busy or result-credit-blocked owners cannot prevent old
-work from draining. Full batches, resource pressure and an explicitly elapsed
-coalescing wait retain progress.
+Topology and HTTP executors change only after the previous local generation's
+work and references drain. Existing row affinity/results are not silently
+redistributed or replayed. HTTP capacity follows the current verified topology;
+tokenizer and control pools remain separately finite. A local generation is
+not a remote loading-generation attestation. Discovery does not resize the
+worker pool on which it is itself running.
 
-A preparation plan holds its lookahead lease only while it has input groups
-left to prepare or preparation workers still running. Once those groups are
-exhausted and its workers have finished, that phase credit can admit more
-preparation even if the earlier plan retains ready records or active HTTP.
-Its records, token/byte credits, results and shared HTTP ownership remain held
-until their own publication or drain boundaries. Releasing preparation credit
-does not release an HTTP permit or discard retained work. Diagnostic
-`active_plans` counts preparation leases; `retained_plans` also includes plans
-whose preparation phase ended but whose records or HTTP still remain.
+## Admission and resource ownership
 
-`embedding_batch_wait_sec=0.0` remains the default and fills batches from
-preparation and capacity events without a required timer. One ready input does
-not force dispatch while compatible admitted work can still fill the batch.
-Positive finite values retain optional bounded coalescing in the same engine.
-Compatible records from different windows or callers can share an HTTP request.
-The target derives from the adapter's text budget and usable replicas;
-small source windows neither shrink nor multiply it. Sparse input and resource
-pressure can still cause partial batches.
+`embedding_max_pending_owners=H` is a positive optional global owner ceiling.
+When absent, it resolves once as `max(1,(G if configured else 2)+queue_size)`.
+The seed two is an admission default, not a replica count. The same H survives
+topology changes. A synchronous call acquires it before snapshot/registration;
+an async window acquires it before pulling its source. A stream's positive
+`max_pending_windows` is a sublimit consuming H, not another global allowance.
+A completed but unconsumed async window still holds its owner lease.
+Preparation lookahead is separately bounded by `min(H,max(1,C+queue_size))`.
 
-Finite queue resource budgets complement work/window counts:
-`embedding_max_pending_bytes=67108864`,
-`embedding_max_pending_tokens=1048576`, and
-`embedding_max_request_bytes=8388608`. They bound raw/counted-record queue
-credits, prepared tokens queued or active for inference, and individual
-request payloads. A separate completed-async-output credit pool has the same
-`embedding_max_pending_bytes` ceiling; it is not shared with the raw-record
-pool. Result reservations follow submission order, including windows still
-awaiting metadata. Cold-start response handoffs are bounded by active HTTP
-workers until the first result establishes dimensions. Tokenizer and embedding
-response handoffs also have native JSON response limits. Original caller inputs
-and a synchronous call's complete output still occupy proportional memory;
-these separate pools and transient handoffs do not claim a total process RSS
-ceiling. Async completed windows retain their admission until consumed.
+| Resource family | Ownership limit and release |
+| --- | --- |
+| Input snapshots | A separate `embedding_max_pending_bytes` pool covers immutable input references/text envelopes before copying. A shared snapshot builder prevents partial-copy credit deadlocks. Release follows caller transfer or real cleanup. |
+| Raw/counted/ready records | Existing `embedding_max_pending_bytes` working pool; record credits remain through queued and active HTTP until drain. |
+| Prepared tokens / direct reservations | `embedding_max_pending_tokens`, default 1,048,576; direct-path reservations are not measured token consumption. |
+| Complete results | A separate `embedding_max_pending_bytes` pool covers **sync and async** outputs, including prepare results, before accumulation/transfer. Sync release is acknowledged by the coordinator before returning. |
+| Exact preparation cache | Separate LRU, at most configured entries and `min(embedding_preparation_cache_bytes, embedding_max_pending_bytes//4)` bytes. |
+| Embedding HTTP handoff | Separate global envelope `L=max(65536,embedding_max_pending_bytes)`, never multiplied by N; retained until result-credit transfer or discard after drain. |
+| Control/tokenizer responses | Separate finite workers and body bounds, independent of embedding handoff credits so observations needed for progress cannot be starved by held responses. |
 
-Completed exact IDs use an additional adapter-owned LRU pool. Its configurable
-entry/byte limits default to 1,024 and 8 MiB; effective retained bytes are
-`min(embedding_preparation_cache_bytes, embedding_max_pending_bytes // 4)`.
-Zero entries or bytes disables retention. Entries require
-verified identity, tokenizer build and task/prefix/special policy; raw text
-must match exactly. Unknown identity/build bypasses the cache. It has no TTL
-or singleflight, and concurrent cold misses can perform separate tokenizations.
-Eviction and adapter close release entries. `health_status` exposes cache
-occupancy, hits, misses and eviction counters; these bytes are separate from
-raw/ready and result reservations and are not a process RSS limit.
-`embedding_max_response_bytes` separately bounds each decoded native JSON body
-before materialization (default 8 MiB), independently of request and queue
-budgets. In-flight response bodies and materialized objects remain transient
-resources bounded by worker concurrency and per-response limits.
-Ready-record byte accounting also reserves a conservative extra 128 bytes per
-record for the finite-limit summary index. Dispatch removes ready references,
-but the record's byte/token credits stay held until actual HTTP drain. Fixed
-container overhead and operating-system RSS are not an exact accounting claim.
+Defaults remain 64 MiB pending bytes, 8 MiB request bytes, 8 MiB response bytes,
+1,024 preparation-cache entries and 8 MiB configured cache bytes. These are
+separate ownership ledgers, not a combined process RSS ceiling. Caller/source
+storage, arbitrary custom `__str__` behavior, Python/transport overhead and
+uncooperative source/provider code are not covered by an exact RSS promise.
+An indivisible impossible input fails with a typed resource/limit/requested
+error; aggregate pressure waits under the original cancellation/deadline.
+Snapshots freeze once and are not reread from a mutable source for dispatch.
 
-Tokenizer and metadata HTTP use their own bounded capacity. The total HTTP
-ceiling derives from embedding, tokenizer and control limits; the embedding
-limit alone is not a count of all HTTP requests. Metadata waits and HTTP run
-outside scheduler locks and do not block the coordinator thread.
-Coherent admission observations avoid duplicate catalog reads without removing
-fresh loaded identity, build and limit checks at actual dispatch boundaries.
+Bulk exact preparation has unknown final token/ID sizes. One accumulator
+reserves the global result pool, checks each prepared output before retaining
+it, then shrinks the reservation at transfer. Tokenizer workers remain parallel
+inside that owner; other bulk-preparation accumulators wait. This prevents
+partial result owners from each retaining credits needed by the other to finish.
+An oversized input can still be measured only within these finite resources.
 
-The coordinator records wake generations under its condition lock, including
-notifications received before entering a wait. It waits until a worker/resource
-event, owner deadline, optional coalescing deadline or the next required
-cancellation-probe check. Non-notifiable cancellation probes and custom clocks
-retain finite checks; there is no fixed global 10 ms poll. Diagnostic snapshots
-are republished only when their observable values change. Plan counts and
-preparing counts are maintained by that same coordinator, preserving the
-existing owner/model ordering and distinct preparation/result/HTTP lifetimes.
+### Response handoff and progress
 
-Independent owners retain their cancellation, deadline, output indices and typed
-outcomes in a shared batch. Cancelling or expiring one owner removes its pending
-work and discards its portion of a response without aborting survivors. Shared
-HTTP has a finite deadline fixed from the latest initial member deadline.
-That owner's Future waits for actual shared transport drain, even beyond its
-own work deadline; the active lease remains held until cleanup. All-member
-cancellation or adapter close stops and drains the transport. Cancelling an
-awaiting Future alone does not release its lease.
+Three quarters of L fund normal admission; one quarter is reserved for the
+oldest eligible owner's progress. Normal capacity is tried first, including
+parallel POSTs belonging to the same owner on distinct aliases. Every candidate
+must fit the progress partition; the scheduler trims oversized candidates,
+and a single impossible row fails explicitly. Later ready membership of the
+oldest owner invalidates a previously resource-blocked dispatch observation.
 
-A synchronous embedding/preparation call retains its engine Future while
-waiting. If an external `BaseException` abandons that wait, it stops its owner,
-wakes the coordinator and drains the actual Future before reraising the original
-exception. Repeated interruptions during this cleanup do not replace that
-exception or release resources early. Completed typed worker errors propagate
-unchanged. Surviving shared owners and the shared adapter/client remain open;
-the abandoned owner can wait past its work deadline for shared HTTP cleanup.
+Known-width handoff reserves actual request-envelope bytes, a finite body,
+and a conservative materialization envelope. Cold width uses a per-candidate
+body limit `min(default_body,max(1,(L//4-request_wire)//65))`: one body plus a
+64-times-body materialization allowance must fit progress before the POST.
+The known-width default body cap is `min(embedding_max_response_bytes,L//16)`.
+A body bound is checked before JSON decode, also for compressed responses;
+it is not a vector-size guarantee or a promise about total RSS. A transport
+Future completing does not release handoff bytes while an owner still lacks
+result credits. Cleanup does not acquire new credits merely to destroy data.
 
-Identity, tokenizer build and limits are observed again after waiting and at
-actual batch boundaries. Stable limits require linear admission passes; a
-changed limit revalidates pending inputs. Adaptive splitting after a recognized
-capacity error stays on the same replica, revalidates pending children and
-does not replay completed inputs. Configured and observed limits remain
-distinguishable; an absent property remains unknown.
-The owned native client never replays a failed or ambiguous embedding POST.
-Recognized capacity recovery remains available for injected clients with the
-existing explicit recovery contract; its children retain the same HTTP lease.
-Dimensions and normalization are validated before publishing the complete
-result. Owner-local validation, deadline and cancellation failures stop that
-owner's submissions and drain its started work without cancelling survivors.
-A transport or backend failure of a shared POST fails all participating
-owners; unrelated calls outside that POST remain independent. Failed or
-ambiguous shared requests are not replayed.
+## Metadata, worker work and diagnostics
 
-Server reachability and model availability are distinct observations. Router
-aliases must be loaded. A direct server may omit router state, but must expose
-model identity.
+All embedding-adapter health/catalog/props, tokenizer, embedding and recovery
+JSON paths receive a finite pre-decode body limit. Wire and inflated bodies
+are bounded before materialization; error bodies are bounded too. Injected
+clients must support the bounded-call contract; a `TypeError` does not cause
+an unbounded compatibility retry.
+
+Fresh full-pool identity, loaded-limit and build checks remain after waits and
+at POST/recovery boundaries. Same-boundary catalog sharing already exists.
+An eligible singleton statusless observation can also reuse its attested root
+props as selected props, saving one GET at that boundary. Router observations
+retain their necessary checks. Frozen membership and endpoint/alias/authority
+provenance prevent late owners from inheriting an earlier snapshot. Revoked
+local generations cannot be revived by late responses. There is no TTL cache
+of inference authorization or weight digest used as proof of loaded context.
+A partial preflight can renew for useful arrivals without renewing indefinitely
+and starving dispatch.
+
+Ready summaries, iterator packing and incremental plan counts avoid repeated
+whole-backlog work. The coordinator uses remembered notifications, deadlines
+and necessary cancellation/custom-clock checks rather than a fixed global poll.
+`packing_candidate_visits` counts local record visits, not token or GPU work.
+
+`health_status()` exposes bounded scheduler/engine/intake/cache snapshots:
+requested/effective capacity and reason, replica/native observations, current
+and peak working/result/handoff/snapshot credits, owner counts, active original
+leases and resource wait reasons. Resource counters exclude text/token arrays,
+credentials and private source paths. The engine's HTTP bound describes its
+embedding, tokenizer and control workers; it is not a count of unrelated
+consumer-owned HTTP work. Reports must count metadata/tokenization/POSTs per
+phase and distinguish client wall-time unions, CPU and replica-seconds. None
+is automatically pure GPU time or a stable throughput guarantee.
+
+An optional [server-observation SDK](SERVER-OBSERVATION.md) defines complete
+snapshots and server-enforced conditional admission. It does not make an
+unpatched server expose that capability, add a new scheduler, or replace the
+native fresh-control path by default. Its real-server deployment qualification
+remains a separate obligation.
+
+Independent owners retain deadlines, cancellation, indices and typed outcomes
+inside a shared POST. Stop/expiry withdraws only that owner's pending work and
+response portion. The shared transport deadline is fixed at dispatch from its
+initial participants; survivors do not acquire a reset or extended deadline.
+The stopped owner waits for real shared drain even beyond its own work budget.
+All-member Stop or adapter close cancels and drains the transport. Synchronous
+interruption retains the engine Future, stops only that owner and preserves
+the primary exception through repeated cleanup interruptions.
 
 ## Transport ownership and closure
 

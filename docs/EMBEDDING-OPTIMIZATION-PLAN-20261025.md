@@ -1,14 +1,22 @@
 # Piano di ottimizzazione embedding — 25 ottobre 2026
 
 Continuazione autorizzata: il successivo messaggio umano del 25 ottobre ha
-avviato lo sviluppo e la qualifica con due repliche EmbeddingGemma su GPU
-separate, parallel 4. La revisione 5 è ora adottata; il ciclo Flower
+avviato lo sviluppo e la qualifica. Il successivo aggiornamento umano porta
+il profilo a quattro repliche EmbeddingGemma, due per GPU, tutte parallel 4. La revisione 5 è ora adottata; il ciclo Flower
 `BOOT-000029` governa i packet `PACKET-000032`–`PACKET-000038` delle milestone
 29–35. Le sezioni seguenti conservano la fotografia della progettazione;
 non costituiscono un risultato delle nuove prove. L'estensione opzionale
 rimane distinta dall'effettiva implementazione/verifica del server remoto.
 
-**Stato: progettazione, senza implementazione o nuove prove.** Piano concordato
+Lo stato di implementazione, test, wheel e qualifica è riportato nel
+[verbale del candidato](verification/REPLICA-OWNERSHIP-CANDIDATE.md).
+
+## Fotografia storica della sola progettazione
+
+Le dichiarazioni di stato in questa sezione descrivono il momento precedente
+all'autorizzazione esecutiva; non sostituiscono il ciclo `BOOT-000029`.
+
+**Stato iniziale: progettazione, senza implementazione o nuove prove.** Piano concordato
 fra la chat runtime e la chat CodingCastle: runtime possiede il filone scheduler;
 CC ha revisionato limiti operativi, lifecycle e overhead dal lato consumer.
 Flower MCP è l'autorità canonica del progetto `llama-runtime`; questo documento
@@ -28,8 +36,8 @@ e scope requisiti/criteri non pianificato nei packet: è il lavoro di dettaglio
 esecutivo da aprire nel prossimo ciclo, non una dichiarazione di implementazione
 completa. Requisiti, dipendenze ed exit policy delle milestone sono registrati.
 
-L'autorizzazione attuale riguarda soltanto la progettazione coordinata. Il
-server di inferenza è offline: non sono stati eseguiti test, probe o inferenze,
+L'autorizzazione iniziale riguardava soltanto la progettazione coordinata. Il
+server di inferenza era offline: non sono stati eseguiti test, probe o inferenze,
 né prodotti nuovi wheel. Nessuna modifica a consumer, modelli, database, job,
 servizi, configurazioni o installazioni. Nessun push o rilascio fa parte del
 piano. Per l'esecuzione servirà un ciclo governato distinto.
