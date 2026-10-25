@@ -1,5 +1,11 @@
 # Functional requirements
 
+The [offline optimization plan dated 2026-10-25](EMBEDDING-OPTIMIZATION-PLAN-20261025.md)
+projects Flower requirements `REQ-000046`–`REQ-000060` and planned milestones
+`MILE-000029`–`MILE-000035`. It describes proposed future behavior, separately
+from the implemented contracts below; no implementation or qualification is
+inferred from registration.
+
 The public contract covers Python adapters for an externally managed
 llama.cpp HTTP server. This guide maps the requirements to the technical
 documents and deterministic tests. It does not describe a private lifecycle
