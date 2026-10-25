@@ -83,7 +83,7 @@ from runtime_llama.adapters.embedding import LlamaCppEmbeddingAdapter
 from runtime_llama.factory import build_adapter, build_embedding_adapter
 from runtime_llama.tailnet import TailnetConfig, TailnetError, TailnetHelper
 
-__version__ = "0.14.0.dev1"
+__version__ = "0.14.0"
 
 __all__ = [
     "EmbeddingSourceSpan",
