@@ -6,6 +6,11 @@ networks. The Python distribution is `runtime-llama` and the import namespace is
 `runtime_llama`. Python 3.11 or later is required. Runtime dependencies are
 `requests` and `urllib3`.
 
+The current stable release is **0.14.0**. See the
+[release assets](https://github.com/Damel91/llama-runtime/releases/tag/v0.14.0)
+and [verification record](docs/verification/PUBLIC-RELEASE-0.14.0.md), including
+the accepted numerical limitation of the measured server/model profile.
+
 ## Why this library exists
 
 `llama-runtime` was created to give agents, coding tools, retrieval pipelines
@@ -47,7 +52,7 @@ The project's engineering lifecycle is managed with
 | Diagnostics | Bounded HTTP kind/phase counts and wall unions, requested/effective capacity, resource use/wait reasons; optional thinking capture and final sinks, including interrupted calls. |
 | HTTP access | Works with native unpatched llama-server using independent connections by default; explicit keep-alive opt-in, authentication, TLS verification and raw endpoint helpers. |
 | Read-only model catalog | Typed observations of catalog entries and proven loaded models, explicit capability unknowns, identity tags and context provenance; bounded GET-only discovery without model loading. |
-| Optional server-observation SDK | Typed complete snapshots and server-enforced conditional admission for a separately negotiated provider; native fresh checks remain the default. No real-server extension is installed or implied. |
+| Optional server-observation SDK | Typed snapshot and conditional-admission contracts for a separately negotiated provider; native fresh checks remain the default. No real-server extension is installed or implied. |
 | Optional embedded VPN client | A separately built Go tsnet helper for Tailscale or Headscale, with consumer-owned configuration, authenticated loopback proxy, verified peer routing, TLS and bounded teardown; no system VPN installation. |
 | MCP data contracts | Validated integration, call, event and result types for consumer-managed MCP execution. |
 
@@ -58,9 +63,9 @@ against the forwarded JSON Schema. Splitting source documents and tracking their
 fragments belong to the consuming application. The server's own auto-loading
 policy is supported.
 
-## Development candidate: replica admission and bounded ownership
+## Release 0.14.0: replica admission and bounded ownership
 
-The candidate uses one original embedding POST per verified canonical replica.
+Version 0.14.0 uses one original embedding POST per verified canonical replica.
 An absent/`None` `embedding_request_parallelism` (`request_parallelism` on the
 automatic service) uses N loaded replicas; a positive G caps original HTTP work
 to `min(N,G)`. Quotas still use N: with budget 256 and four replicas, G=2 admits
@@ -85,15 +90,25 @@ root props within the same boundary; native fresh checks and the default
 connection-close policy remain. Category 80% and mixed 90% calibration margins
 are unchanged, and the automatic path still does not tokenize each input.
 
-The [candidate verification record](docs/verification/REPLICA-OWNERSHIP-CANDIDATE.md)
-records tests, wheel identity, live measurements and qualification boundaries.
-Publication and consumer acceptance are separate outcomes. See
+Four verified loaded EmbeddingGemma replicas were exercised with native
+llama.cpp, including automatic capacity, explicit guards, ordered delivery and
+drained close. Numerical repeatability exceeded the existing strict thresholds
+even for identical serial native requests without the SDK scheduler. The
+operator accepted that observed profile limitation for this stable library
+release; the failed numerical evidence remains recorded and the thresholds
+are unchanged. No retrieval-quality degradation was established by those tests.
+
+The [release verification record](docs/verification/PUBLIC-RELEASE-0.14.0.md)
+separates current package checks, scheduling evidence and that known limitation.
+The earlier [candidate record](docs/verification/REPLICA-OWNERSHIP-CANDIDATE.md)
+is preserved as historical evidence. Publication and consumer acceptance are
+separate outcomes. See
 [concurrency and ownership](docs/CONCURRENCY-AND-DIAGNOSTICS.md),
 [embedding contracts](docs/EMBEDDING-CONTRACTS.md) and the optional
 [server-observation SDK](docs/SERVER-OBSERVATION.md) for scope and migration.
 Consumer installations and server/model configuration are separate actions.
 
-## Prerelease 0.13.0a1
+## Earlier prerelease 0.13.0a1
 
 The automatic embedding corpus contains the 500 densest measured texts from
 each of five categories, selected reproducibly from the original 10,000
@@ -120,14 +135,15 @@ pure GPU timings or a comparison against earlier two-replica runs.
 See the [automatic API](docs/AUTOMATIC-EMBEDDING.md),
 [consumer recovery contract](docs/HALVING-CONSUMER.md) and
 [publication record](docs/verification/PUBLIC-RELEASE-0.13.0a1.md).
-The earlier cross-replica numerical finding remains open; stable **0.11.1**
-remains the latest stable release. Publication does not update consumers.
+The earlier cross-replica numerical finding remains in the historical record;
+stable **0.14.0** documents the current profile's numerical limitation separately.
+Publication does not update consumers.
 
 SDK stability and a server/model profile's numerical qualification are separate
 decisions. A precision difference caused by model loading settings does not by
 itself make the Python library a prerelease.
 
-## Release 0.11.1
+## Earlier release 0.11.1
 
 The automatic embedding config now exposes the existing finite request,
 decoded-response, pending-byte and pending-token budgets. Defaults stay at
@@ -288,10 +304,10 @@ results and deployment boundaries.
 With Python 3.11 or later, install the tagged source:
 
 ```bash
-python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.11.1'
+python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.14.0'
 ```
 
-Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.11.1),
+Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.14.0),
 or run the following from a checkout:
 
 ```bash
@@ -372,7 +388,7 @@ directory, hostname, enrollment credentials when needed, coordination server
 and inference endpoint. The Python wheel remains portable and contains no
 native binary. Importing or constructing the library never launches a VPN.
 
-The [release](https://github.com/Damel91/llama-runtime/releases/tag/v0.11.1)
+The [release](https://github.com/Damel91/llama-runtime/releases/tag/v0.14.0)
 provides separate helper archives for macOS ARM64, Linux AMD64 and Windows
 AMD64. Go is needed to build the helper from source, not to run a supplied
 binary. Both Tailscale's coordinator and an explicit HTTPS Headscale
