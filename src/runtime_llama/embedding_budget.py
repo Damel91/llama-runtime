@@ -41,8 +41,6 @@ _POLICY = {
     "context_scope": "exact-effective-input-token-limit",
 }
 EMBEDDING_BUDGET_POLICY_ID = hashlib.sha256(_canonical(_POLICY)).hexdigest()
-_MAX_STATE_BYTES = 16384
-_MAX_INTEGER = 2**53 - 1
 _GATES_LOCK = Lock()
 _GATES = WeakValueDictionary()
 
@@ -57,9 +55,9 @@ class LearnedBudgetState:
     effective_context_tokens: int
 
 
-def _positive(value, name, *, maximum=_MAX_INTEGER):
-    if type(value) is not int or not 0 < value <= maximum:
-        raise ValueError(f"{name} must be a positive bounded integer")
+def _positive(value, name):
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
     return value
 
 
@@ -97,7 +95,7 @@ def _binding_digest(binding):
     ):
         raise ValueError("learned budget prefix is invalid")
     if normalized["vocab_size"] is not None:
-        _positive(normalized["vocab_size"], "vocab_size", maximum=2**31 - 1)
+        _positive(normalized["vocab_size"], "vocab_size")
     return hashlib.sha256(_canonical(normalized)).hexdigest()
 
 
@@ -107,7 +105,7 @@ def budget_context_scope_id(binding: dict, effective_context_tokens: int) -> str
     A different effective context deliberately creates a new scope. Existing
     lessons remain intact; they are never implicitly rescaled or carried over.
     """
-    _positive(effective_context_tokens, "effective_context_tokens", maximum=2**31 - 1)
+    _positive(effective_context_tokens, "effective_context_tokens")
     return hashlib.sha256(
         _canonical(
             {
@@ -140,16 +138,15 @@ def _unique_object(pairs):
 
 
 def _read(path, scope, binding_digest, effective_context_tokens):
+    payload = value = None
     try:
         with path.open("rb") as stream:
-            payload = stream.read(_MAX_STATE_BYTES + 1)
+            payload = stream.read()
     except FileNotFoundError:
         return None
     except OSError as exc:
         raise LLMBackendError("llamacpp_embedding_learned_budget_read_failed") from exc
     try:
-        if len(payload) > _MAX_STATE_BYTES:
-            raise ValueError("oversized learned budget")
         value = json.loads(payload, object_pairs_hook=_unique_object)
         if (
             type(value) is not dict
@@ -177,10 +174,15 @@ def _read(path, scope, binding_digest, effective_context_tokens):
             _positive(value["max_input_chars"], "max_input_chars"),
             effective_context_tokens,
         )
-    except (UnicodeError, TypeError, ValueError, RecursionError) as exc:
+    except (UnicodeError, TypeError, ValueError, RecursionError):
         # A corrupt learned ceiling must not silently disappear and restore a
         # larger initial recommendation. Recovery requires explicit repair.
-        raise LLMBackendError("llamacpp_embedding_learned_budget_invalid") from exc
+        # Raise after the decoder's exception scope ends: JSONDecodeError.doc
+        # and its traceback can otherwise retain the complete failed payload.
+        pass
+    finally:
+        payload = value = None
+    raise LLMBackendError("llamacpp_embedding_learned_budget_invalid") from None
 
 
 def load_learned_budget(

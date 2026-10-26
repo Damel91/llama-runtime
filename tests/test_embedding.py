@@ -161,6 +161,7 @@ def test_preflight_and_embedding_are_progressive_by_item_batch():
             batch_size=2,
             embedding_queue_size=1,
             embedding_max_pending_tokens=8,
+            embedding_capacity_limits=True,
         ),
         client=client,
     )
@@ -427,16 +428,25 @@ def test_normalization_handles_extreme_finite_values_and_zero_vectors():
     assert result[1] == [0, 0]
 
 
-def test_context_capacity_error_splits_and_remembers_bounded_batch_size():
+@pytest.mark.parametrize("batch_size", [None, 4])
+def test_context_capacity_error_splits_only_the_failed_request(batch_size):
     client = Client(
         responses=[ClientHTTPError(400, error_type="exceed_context_size_error")]
     )
-    adapter = LlamaCppEmbeddingAdapter(profile(batch_size=4), client=client)
-    assert len(adapter.embed_texts(["a", "b", "c", "d"])) == 4
-    assert [len(call[0]) for call in client.embedding_calls] == [4, 2, 2]
-    assert adapter.health_status()["effective_batch_size"] == 2
-    adapter.embed_texts(["a", "b", "c", "d"])
-    assert [len(call[0]) for call in client.embedding_calls[-2:]] == [2, 2]
+    adapter = LlamaCppEmbeddingAdapter(profile(batch_size=batch_size), client=client)
+    texts = ["a", "b", "c", "d"]
+    try:
+        assert (
+            len(adapter._request_batch_adaptive(texts, replica=adapter._primary)) == 4
+        )
+        assert [len(call[0]) for call in client.embedding_calls] == [4, 2, 2]
+        assert adapter.health_status()["effective_batch_size"] == batch_size
+        adapter._request_batch_adaptive(texts, replica=adapter._primary)
+        assert len(client.embedding_calls) == 4
+        assert client.embedding_calls[-1][0] == texts
+        assert adapter._current_batch_size(4, adapter._primary) == 4
+    finally:
+        adapter.close()
 
 
 @pytest.mark.parametrize(
@@ -467,98 +477,41 @@ def test_single_input_context_error_is_not_truncated_or_retried():
     assert [call[0] for call in client.embedding_calls] == [["keep full input"]]
 
 
-def test_adaptive_children_do_not_count_as_capacity_recovery_successes():
-    client = Client(
-        responses=[ClientHTTPError(400, error_type="exceed_context_size_error")]
-    )
-    adapter = LlamaCppEmbeddingAdapter(profile(batch_size=4), client=client)
-    adapter.embed_texts(["a", "b", "c", "d"])
-    assert adapter.health_status()["batch_recovery"]["successes"] == 0
-    for _ in range(32):
-        adapter.embed_texts(["a", "b"])
-    assert adapter.health_status()["effective_batch_size"] == 4
-
-
-def test_flapping_capacity_requires_longer_stability_before_each_recovery():
+@pytest.mark.parametrize("batch_size", [None, 4])
+def test_repeated_native_fit_failures_never_create_persistent_text_backoff(batch_size):
     client = Client()
-    adapter = LlamaCppEmbeddingAdapter(profile(batch_size=4), client=client)
+    adapter = LlamaCppEmbeddingAdapter(profile(batch_size=batch_size), client=client)
     texts = ["first", "second", "third", "fourth"]
-
-    for required_successes in (32, 64, 128):
-        client.responses.append(
-            ClientHTTPError(400, error_type="exceed_context_size_error")
-        )
-        assert len(adapter.embed_texts(texts)) == 4
-        reduced = adapter.health_status()
-        assert reduced["effective_batch_size"] == 2
-        assert reduced["batch_recovery"]["successes"] == 0
-        assert reduced["batch_recovery"]["success_window"] == required_successes
-
-        # A flapping backend must not immediately receive another large batch.
-        start = len(client.embedding_calls)
-        for _ in range(required_successes - 1):
-            assert len(adapter.embed_texts(texts[:2])) == 2
-        assert adapter.health_status()["effective_batch_size"] == 2
-        assert all(len(call[0]) == 2 for call in client.embedding_calls[start:])
-
-        assert len(adapter.embed_texts(texts[:2])) == 2
-        assert adapter.health_status()["effective_batch_size"] == 4
-        assert len(adapter.embed_texts(texts)) == 4
-        assert client.embedding_calls[-1][0] == texts
-
-
-def test_success_started_before_capacity_reduction_cannot_restore_capacity_early():
-    client = Client(
-        responses=[ClientHTTPError(400, error_type="exceed_context_size_error")],
-        total_slots=2,
-    )
-    adapter = LlamaCppEmbeddingAdapter(
-        profile(batch_size=8, embedding_request_parallelism=2), client=client
-    )
-    assert len(adapter.embed_texts([f"initial-{index}" for index in range(8)])) == 8
-    assert adapter.health_status()["effective_batch_size"] == 4
-    assert adapter._primary.total_slots == 2
-    assert adapter._scheduler.snapshot()["effective_parallelism"] == 1
-    assert (
-        adapter._scheduler.snapshot()["replicas"]["embed-model"]["max_in_flight"] == 1
-    )
-
-    old_texts = [f"old-{index}" for index in range(4)]
-    old_started, release_old = Event(), Event()
-    embeddings = client.embeddings
-
-    def controlled_embeddings(input, **kwargs):
-        if input == old_texts:
-            old_started.set()
-            assert release_old.wait(10)
-        return embeddings(input, **kwargs)
-
-    client.embeddings = controlled_embeddings
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        pending = executor.submit(adapter.embed_texts, old_texts)
-        try:
-            assert old_started.wait(3)
-            # One original lease per replica prevents a second concurrent
-            # POST, even though native props advertise two sequence slots.
-            # Inject the adaptive-generation transition directly to retain
-            # the stale-success regression without inventing HTTP capacity.
-            adapter._tighten_adaptive_batch_size(2, replica=adapter._primary)
-            assert adapter.health_status()["effective_batch_size"] == 2
-            release_old.set()
-            assert len(pending.result(timeout=3)) == 4
-            status = adapter.health_status()
-            assert status["effective_batch_size"] == 2
-            assert status["batch_recovery"]["successes"] == 0
-
-            # Complete all but one of the new stability window's successes.
-            for _ in range(63):
-                assert len(adapter.embed_texts(["stable-a", "stable-b"])) == 2
-            assert adapter.health_status()["batch_recovery"]["successes"] == 63
-
-            assert len(adapter.embed_texts(["stable-a", "stable-b"])) == 2
-            assert adapter.health_status()["effective_batch_size"] == 4
-        finally:
-            release_old.set()
+    try:
+        for _ in range(3):
+            client.responses.append(
+                ClientHTTPError(400, error_type="exceed_context_size_error")
+            )
+            start = len(client.embedding_calls)
+            assert (
+                len(adapter._request_batch_adaptive(texts, replica=adapter._primary))
+                == 4
+            )
+            assert [len(call[0]) for call in client.embedding_calls[start:]] == [
+                4,
+                2,
+                2,
+            ]
+            # Successful siblings finish once; a later request is independent
+            # and does not wait for an arbitrary count of successful batches.
+            assert (
+                len(adapter._request_batch_adaptive(texts, replica=adapter._primary))
+                == 4
+            )
+            assert client.embedding_calls[-1][0] == texts
+        status = adapter.health_status()
+        assert status["effective_batch_size"] == batch_size
+        assert status["batch_recovery"] == {
+            "scope": "failed-native-post-only",
+            "persistent_text_cap": None,
+        }
+    finally:
+        adapter.close()
 
 
 def test_timeout_and_cancel_stay_request_local_and_load_is_readiness_only():
@@ -675,7 +628,7 @@ def test_actual_profile_and_http_client_integrate_without_runtime_or_sdk():
     session = Session()
     client = LlamaCppClient(configured.base_url, session=session)
     adapter = LlamaCppEmbeddingAdapter(configured, client=client)
-    assert adapter.batch_size == 32
+    assert adapter.batch_size is None
     assert adapter.embed_texts(["one", "two"]) == [[0, 1], [0.6, 0.8]]
     assert adapter.max_input_tokens == 4
     assert all(

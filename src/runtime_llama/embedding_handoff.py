@@ -1,15 +1,18 @@
-"""Finite response handoff with reserved progress for the oldest eligible owner.
+"""Track response ownership with an optional independent byte policy.
 
-Working records never fund their own response. The coordinator first tries the
-normal lane; it may use the reserved lane only for its oldest eligible owner.
-Every candidate fits that lane, so younger responses cannot prevent progress.
+Every original POST retains its ticket through response transfer or discard.
+Without explicit capacity opt-in, accounting observes ownership and never
+creates an admission quota from another resource's settings.
 """
 
 from __future__ import annotations
 
 from threading import Lock
 
-from runtime_llama.embedding_resources import EmbeddingResourceLimitError, _positive
+from runtime_llama.embedding_resources import (
+    EmbeddingResourceLimitError,
+    _optional_positive,
+)
 from runtime_llama.errors import LLMBackendError
 
 
@@ -34,23 +37,22 @@ class HandoffTicket:
 
 
 class HandoffReservations:
-    """One adapter-wide pool, never multiplied by replica count.
+    """Adapter-wide ownership, optionally bounded by an explicit byte policy.
 
-    ``max_bytes`` derives from the configured working-byte budget with a fixed
-    64 KiB minimum transport envelope. It is a separate ownership bound, not RSS
-    or permission to enlarge input/result budgets. Three quarters fund normal
-    admission, one quarter preserves progress. Root and recovery descendants
-    retain the same original ticket until every retained response is transferred
-    or discarded; control/recovery observations have their own separate bound.
+    Pending inputs and response-reader limits do not derive this pool's size.
+    Root and recovery descendants retain the original ticket until every
+    response is transferred or discarded. Accounting is not a measurement of
+    process RSS or a promise about caller-owned output retention.
     """
 
     def __init__(self, max_bytes, configured_response_bytes, *, notify=None):
-        self.limit = max(65536, _positive(max_bytes, "max_bytes"))
-        configured = _positive(configured_response_bytes, "configured_response_bytes")
-        self.progress_limit = self.limit // 4
-        self.normal_limit = self.limit - self.progress_limit
-        self.max_batch_bytes = self.progress_limit
-        self.response_limit = min(configured, max(1, self.limit // 16))
+        self.limit = _optional_positive(max_bytes, "max_bytes")
+        self.normal_limit = self.limit
+        self.progress_limit = None
+        self.max_batch_bytes = self.limit
+        self.response_limit = _optional_positive(
+            configured_response_bytes, "configured_response_bytes"
+        )
         self._notify = notify
         self._lock = Lock()
         self._used = {"normal": 0, "progress": 0}
@@ -91,41 +93,35 @@ class HandoffReservations:
         request_wire = wire_overhead + sum(
             self._wire_cost(record) for record in records
         )
-        if dimension is None:
-            # A tiny numeric JSON value can occupy many bytes as a Python float
-            # and list slot. Bound the cold decoder's body *before* allocation;
-            # 64x covers owned materialization independently of unknown width.
-            response_limit = min(
-                self.response_limit,
-                max(1, (self.progress_limit - request_wire) // 65),
-            )
-            materialized = 64 * response_limit
-        else:
-            response_limit = self.response_limit
-            materialized = 64 + (96 * dimension + 64) * len(records)
-        return request_wire + response_limit + materialized, response_limit
+        # Observational accounting is independent of admission. No capacity
+        # policy is inferred from working bytes, response bytes or cold width.
+        materialized = (
+            0 if dimension is None else 64 + (40 * dimension + 96) * len(records)
+        )
+        return request_wire + materialized, self.response_limit
 
     def estimate(self, records, dimension=None, *, wire_overhead=64):
-        """Return the conservative owned-byte reservation for a candidate."""
+        """Return the estimated owned-byte accounting for a candidate."""
         return self._envelope(records, dimension, wire_overhead=wire_overhead)[0]
 
     def try_acquire(self, records, dimension=None, *, progress=False, wire_overhead=64):
         amount, response_limit = self._envelope(
             records, dimension, wire_overhead=wire_overhead
         )
-        # The coordinator trims a candidate until it can always fit progress.
-        # Reject an indivisible row explicitly instead of admitting unsafe work.
-        if amount > self.max_batch_bytes:
+        # Only a deliberately configured policy can constrain a candidate.
+        # An indivisible row exceeding that policy fails explicitly.
+        if self.max_batch_bytes is not None and amount > self.max_batch_bytes:
             raise EmbeddingResourceLimitError(
                 "handoff_bytes", self.max_batch_bytes, amount
             )
         with self._lock:
             if self._closed:
                 raise LLMBackendError("llamacpp_embedding_adapter_closed")
-            if self._used["normal"] + amount <= self.normal_limit:
+            if (
+                self.normal_limit is None
+                or self._used["normal"] + amount <= self.normal_limit
+            ):
                 family = "normal"
-            elif progress and self._used["progress"] + amount <= self.progress_limit:
-                family = "progress"
             else:
                 return None
             self._used[family] += amount

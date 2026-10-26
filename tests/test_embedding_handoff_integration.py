@@ -21,7 +21,7 @@ class WireRecord:
     token_count: int = 1
 
 
-def test_oldest_becoming_ready_reopens_blocked_handoff_without_freeing_normal_bytes(
+def test_explicit_handoff_pressure_waits_for_actual_ticket_release(
     monkeypatch,
 ):
     async def scenario():
@@ -46,13 +46,14 @@ def test_oldest_becoming_ready_reopens_blocked_handoff_without_freeing_normal_by
             batch_size=1,
             embedding_request_parallelism=1,
             embedding_queue_size=1,
+            embedding_capacity_limits=True,
             embedding_max_pending_owners=2,
             token_count_parallelism=2,
             embedding_batch_wait_sec=0,
             timeout=8,
         )
         engine = adapter._engine
-        reservations = HandoffReservations(65536, 8192, notify=engine.wake)
+        reservations = HandoffReservations(65536, None, notify=engine.wake)
         engine._handoff = reservations
         held = []
         while (ticket := reservations.try_acquire([WireRecord()], 2)) is not None:
@@ -80,13 +81,20 @@ def test_oldest_becoming_ready_reopens_blocked_handoff_without_freeing_normal_by
             assert blocked[-1] is False
             assert reservations.snapshot()["normal_used"] == normal_used
             assert not client.embedding_calls
-            # No handoff bytes or oldest-owner identity changes here. Only its
-            # newly ready membership can invalidate the previous blocked epoch.
+            # Newly ready work may invalidate the observed epoch, but cannot
+            # bypass the caller's explicit pool with a hidden progress reserve.
             release_old.set()
+            await wait_until(
+                lambda: bool(engine._handoff_blocked.get("embed_0", (False,))[-1])
+            )
+            assert reservations.snapshot()["normal_used"] == normal_used
+            assert not client.embedding_calls
+            for ticket in held:
+                ticket.release()
             assert await asyncio.wait_for(pending, 3) == [vector("older")]
             assert await asyncio.wait_for(anext(stream), 3) == [vector("younger")]
-            assert reservations.snapshot()["normal_used"] == normal_used
-            assert selected_families == ["progress", "progress"]
+            assert reservations.snapshot()["normal_used"] == 0
+            assert selected_families == ["normal", "normal"]
             assert Counter(
                 text for _, batch in client.embedding_calls for text in batch
             ) == Counter(["older", "younger"])

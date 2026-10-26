@@ -348,11 +348,9 @@ def test_oldest_window_completion_refills_fast_replica_before_next_slow_result()
             assert snapshot["embedding_in_flight"] == 1
             assert snapshot["ready_by_replica"]["embed_0"] == 0
             assert snapshot["peak_active_plans"] <= 4
-            assert snapshot["peak_pending_bytes"] <= adapter.embedding_max_pending_bytes
-            assert (
-                snapshot["peak_result_reserved_bytes"]
-                <= adapter.embedding_max_pending_bytes
-            )
+            assert adapter.embedding_max_pending_bytes is None
+            assert snapshot["peak_pending_bytes"] > 0
+            assert snapshot["peak_result_reserved_bytes"] > 0
             client.unblock()
             await asyncio.wait_for(consumer, 5)
             assert delivered == [

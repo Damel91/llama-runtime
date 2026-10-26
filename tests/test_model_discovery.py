@@ -255,9 +255,7 @@ def test_duplicate_ids_and_cross_entry_alias_collisions_rejected(endpoint, entri
     [
         {"id": ""},
         {"id": True},
-        {"id": "x" * 1025},
         {"id": "bad\ud800"},
-        fixture_entry(aliases=["x"] * 65),
         fixture_entry(aliases=[1]),
         fixture_entry(aliases=["bad\udfff"]),
         fixture_entry(status=True),
@@ -268,7 +266,6 @@ def test_duplicate_ids_and_cross_entry_alias_collisions_rejected(endpoint, entri
         fixture_entry(capabilities={"embeddings": "true"}),
         fixture_entry(meta={"n_embd": True}),
         fixture_entry(meta={"n_ctx": -1}),
-        fixture_entry(meta={"n_ctx_train": 2**31}),
         fixture_entry(context_length="8192"),
         fixture_entry(tags=["noxi-content-sha256-v1:bad"]),
         fixture_entry(tags=["noxi-model-name-v1:%ZZ"]),
@@ -277,7 +274,7 @@ def test_duplicate_ids_and_cross_entry_alias_collisions_rejected(endpoint, entri
         fixture_entry(tags=[False]),
     ],
 )
-def test_malformed_or_unbounded_selected_fields_are_sanitized(endpoint, entry):
+def test_malformed_selected_fields_are_sanitized(endpoint, entry):
     base_url, observed = fixture_server(endpoint, [entry])
     with pytest.raises(LLMBackendError, match="invalid_catalog") as caught:
         discover_models(base_url)
@@ -333,9 +330,7 @@ def test_model_count_and_response_bytes_bound_before_optional_requests(endpoint)
         {"verify_ssl": 1},
         {"cancellation_probe": True},
         {"max_models": 0},
-        {"max_models": 4097},
         {"max_response_bytes": True},
-        {"max_response_bytes": 16 * 1024 * 1024 + 1},
         {"api_key": "one", "api_key_env": "OTHER"},
         {"api_key": ""},
         {"api_key": "bad\nheader"},

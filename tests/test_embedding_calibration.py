@@ -261,7 +261,7 @@ def test_unknown_category_rejected(tmp_path, small_corpus, category):
         profile.stats_for(category)
 
 
-@pytest.mark.parametrize("context", [0, -1, True, None, 1.5, "512", 2**31])
+@pytest.mark.parametrize("context", [0, -1, True, None, 1.5, "512"])
 def test_invalid_context_budget_rejected(tmp_path, small_corpus, context):
     profile = load_or_calibrate(tmp_path, binding(), fake_tokens, check)
     with pytest.raises(ValueError):
@@ -333,7 +333,7 @@ def test_corpus_change_invalidates_all_category_statistics(tmp_path, small_corpu
     assert first.profile_id != second.profile_id
 
 
-@pytest.mark.parametrize("value", [0, -1, True, 1.5, None, "7", 2**31])
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, None, "7"])
 def test_bad_native_counts_never_persist(tmp_path, small_corpus, value):
     with pytest.raises(LLMBackendError, match="invalid_token_count"):
         load_or_calibrate(tmp_path, binding(), lambda text: value, check)
@@ -549,10 +549,50 @@ def test_invalid_or_oversized_cache_is_recalibrated(tmp_path, small_corpus, payl
     assert len(calls) == 15
 
 
-@pytest.mark.parametrize("workers", [0, -1, True, None, 1.5, 33])
+@pytest.mark.parametrize("workers", [0, -1, True, None, 1.5])
 def test_invalid_worker_budget_rejected(tmp_path, small_corpus, workers):
     with pytest.raises(ValueError):
         load_or_calibrate(tmp_path, binding(), fake_tokens, check, workers=workers)
+
+
+def test_explicit_worker_count_above_old_ceiling_is_supported(tmp_path, small_corpus):
+    profile = load_or_calibrate(tmp_path, binding(), fake_tokens, check, workers=33)
+    assert profile.stats_for("mixed").sample_count == 15
+
+
+def test_binding_and_cache_above_old_byte_ceilings_reuse_completed_calibration(
+    tmp_path, small_corpus
+):
+    selected = {**binding(), "prefix": "x" * 150000}
+    calls = []
+
+    def tokenize(text):
+        calls.append(text)
+        return fake_tokens(text)
+
+    first = load_or_calibrate(tmp_path, selected, tokenize, check)
+    assert len(calls) == 15
+    assert load_or_calibrate(tmp_path, selected, tokenize, check) == first
+    assert len(calls) == 15
+    assert first.max_input_chars(2**31) > 0
+
+
+def test_native_positive_token_count_has_no_local_integer_ceiling(
+    tmp_path, small_corpus
+):
+    profile = load_or_calibrate(tmp_path, binding(), lambda _text: 2**31, check)
+    assert profile.stats_for("mixed").total_tokens == 15 * 2**31
+
+
+def test_calibration_binding_rejects_cycles_instead_of_fixed_depth():
+    nested = "value"
+    for _ in range(20):
+        nested = {"nested": nested}
+    assert module._binding_payload({"values": nested}) == {"values": nested}
+    circular = {}
+    circular["self"] = circular
+    with pytest.raises(ValueError, match="cycle"):
+        module._binding_payload(circular)
 
 
 @pytest.mark.parametrize(
@@ -594,7 +634,7 @@ def test_modified_shipped_corpus_is_rejected_before_remote_calls(
 ):
     original = module._read_bounded
 
-    def tamper(resource, limit):
+    def tamper(resource, limit=None):
         payload = original(resource, limit)
         if resource.name == target:
             if target == "manifest.json":

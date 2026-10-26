@@ -86,6 +86,7 @@ def test_absent_guard_uses_all_four_verified_copies_with_64_text_quotas(facade):
                 "base_url": "http://runtime.example:8080",
                 "model": "embed_0",
                 "embedding_prefixes": {"query": "", "document": ""},
+                "batch_size": 256,
                 "normalize": False,
                 "timeout": 5,
             },

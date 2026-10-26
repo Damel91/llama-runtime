@@ -276,24 +276,26 @@ def test_batch_packing_counts_complete_prefixed_inputs(make_adapter):
     assert [content for content, _ in client.tokenize_calls] == ["D: a", "D: b"]
 
 
-def test_adaptive_capacity_split_does_not_apply_prefix_twice(make_adapter):
+def test_capacity_recovery_preserves_prefixes_without_reducing_future_batches(
+    make_adapter,
+):
     client = RecordingClient(
         responses=[ClientHTTPError(400, error_type="exceed_context_size_error")]
     )
     adapter, _ = make_adapter(client, batch_size=4, embedding_batch_wait_sec=0.5)
     expected = ["D: a", "D: b", "D: c", "D: d"]
     assert adapter.embed_texts(["a", "b", "c", "d"]) == [vector(t) for t in expected]
-    assert [batch for batch, _, _ in client.embedding_calls] == [
-        expected,
-        expected[:2],
-        expected[2:],
-    ]
+    batches = [batch for batch, _, _ in client.embedding_calls]
+    assert batches[0] == expected
+    assert Counter(tuple(batch) for batch in batches[1:]) == Counter(
+        (tuple(expected[:2]), tuple(expected[2:]))
+    )
     assert [content for content, _ in client.tokenize_calls] == expected
+    before = len(client.embedding_calls)
     assert adapter.embed_texts(["a", "b", "c", "d"]) == [vector(t) for t in expected]
-    assert [batch for batch, _, _ in client.embedding_calls[-2:]] == [
-        expected[:2],
-        expected[2:],
-    ]
+    # Recovery applies only to its failed original POST; the next request
+    # retains the caller's chosen batch budget and applies its prefix once.
+    assert [batch for batch, _, _ in client.embedding_calls[before:]] == [expected]
 
 
 def test_prefixes_are_shared_by_replicas_with_stable_result_order(make_adapter):

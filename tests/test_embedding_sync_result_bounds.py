@@ -27,6 +27,7 @@ from test_embedding_contracts import (
 
 def adapter_for(client, **changes):
     values = {
+        "embedding_capacity_limits": True,
         "embedding_max_pending_bytes": 65536,
         "embedding_batch_wait_sec": 0,
         "dimension": 2,
@@ -203,6 +204,7 @@ def test_rejection_growth_waits_for_missing_delta_before_publication(monkeypatch
     service = AutomaticEmbeddingService(
         {
             "base_url": "http://runtime.example",
+            "embedding_capacity_limits": True,
             "embedding_max_pending_bytes": 8192,
             "normalize": False,
             "timeout": 3,

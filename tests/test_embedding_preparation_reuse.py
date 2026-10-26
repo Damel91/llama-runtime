@@ -53,6 +53,8 @@ class ReuseClient(ContractClient):
 
 
 def runtime(client, **changes):
+    changes.setdefault("embedding_capacity_limits", True)
+    changes.setdefault("embedding_preparation_cache_enabled", True)
     return configured(client, embedding_batch_wait_sec=0, timeout=10, **changes)
 
 
@@ -109,9 +111,9 @@ def test_configured_small_lru_evicts_exact_tokens_and_close_drains_storage():
 
 @pytest.mark.parametrize(
     "configured_bytes,pending_bytes,expected",
-    [(4096, 65536, 4096), (32768, 65536, 16384), (0, 65536, 0)],
+    [(4096, 65536, 4096), (32768, 65536, 32768), (0, 65536, 0)],
 )
-def test_configured_cache_bytes_are_separate_and_clipped_to_pending_fraction(
+def test_configured_cache_bytes_are_independent_of_pending_budget(
     configured_bytes, pending_bytes, expected
 ):
     client = ReuseClient(1)
@@ -132,12 +134,10 @@ def test_configured_cache_bytes_are_separate_and_clipped_to_pending_fraction(
 @pytest.mark.parametrize(
     "name,value",
     [
-        ("embedding_max_response_bytes", None),
         ("embedding_max_response_bytes", 0),
         ("embedding_max_response_bytes", True),
         ("embedding_preparation_cache_entries", -1),
         ("embedding_preparation_cache_entries", True),
-        ("embedding_preparation_cache_bytes", None),
         ("embedding_preparation_cache_bytes", 1.5),
     ],
 )
@@ -418,7 +418,12 @@ def test_unsuccessful_tokenizations_never_enter_cache_and_recovery_retries(failu
 
 def test_public_cache_diagnostics_observe_bound_eviction_oversize_skip_and_close():
     client = ReuseClient(1)
-    adapter = runtime(client, embedding_max_pending_bytes=8192)
+    adapter = runtime(
+        client,
+        embedding_max_pending_bytes=8192,
+        embedding_preparation_cache_entries=1024,
+        embedding_preparation_cache_bytes=2048,
+    )
     try:
         # Exercise LRU turnover without retaining twenty sealed public records
         # in a single 8 KiB output window. Each result transfers before the next.

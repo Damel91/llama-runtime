@@ -24,9 +24,8 @@ from typing import Any, Callable, Protocol
 from runtime_llama.client import CancellationProbe, _cancelled, _safe_failure, _timeout
 from runtime_llama.errors import LLMBackendError, LLMTimeoutError
 
-_IDENTIFIER = re.compile(r"[A-Za-z0-9_.:-]{1,256}\Z")
+_IDENTIFIER = re.compile(r"[A-Za-z0-9_.:-]+\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
-_MAX_REPLICAS = 4096
 __all__ = [
     "ServerObservationCapability",
     "ServerObservationScope",
@@ -41,7 +40,7 @@ __all__ = [
 
 def _identifier(value: str) -> None:
     if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value):
-        raise ValueError("observation identifiers must be bounded opaque identifiers")
+        raise ValueError("observation identifiers must be opaque identifiers")
 
 
 def _hash(value: str) -> None:
@@ -52,13 +51,13 @@ def _hash(value: str) -> None:
 def _alias(value: str) -> None:
     if (
         not isinstance(value, str)
-        or not 0 < len(value) <= 1024
+        or not value
         or any(
             ord(char) < 32 or 127 <= ord(char) <= 159 or 0xD800 <= ord(char) <= 0xDFFF
             for char in value
         )
     ):
-        raise ValueError("observation aliases must be bounded non-control strings")
+        raise ValueError("observation aliases must be non-control strings")
 
 
 @dataclass(frozen=True)
@@ -133,7 +132,7 @@ class ObservedServerReplica:
         _hash(self.content_sha256)
         _hash(self.embedding_sha256)
         for value in (self.context_length, self.n_batch, self.n_ubatch, self.slots):
-            if type(value) is not int or not 0 < value <= 2**31 - 1:
+            if type(value) is not int or value <= 0:
                 raise ValueError(
                     "effective observation limits must be positive integers"
                 )
@@ -156,12 +155,12 @@ class CoherentServerSnapshot:
         _identifier(self.observation_revision)
         if (
             not isinstance(self.replicas, tuple)
-            or not 0 < len(self.replicas) <= _MAX_REPLICAS
+            or not self.replicas
             or not all(
                 isinstance(item, ObservedServerReplica) for item in self.replicas
             )
         ):
-            raise ValueError("snapshot requires a bounded immutable replica tuple")
+            raise ValueError("snapshot requires a nonempty immutable replica tuple")
         if len({r.replica_id for r in self.replicas}) != len(self.replicas) or len(
             {r.alias for r in self.replicas}
         ) != len(self.replicas):
@@ -177,10 +176,10 @@ class CoherentServerSnapshot:
         if (
             isinstance(self.valid_for_seconds, bool)
             or not isinstance(self.valid_for_seconds, (float, int))
-            or not 0 < self.valid_for_seconds <= 3600
+            or self.valid_for_seconds <= 0
             or not math.isfinite(self.valid_for_seconds)
         ):
-            raise ValueError("snapshot validity must be finite and at most one hour")
+            raise ValueError("snapshot validity must be finite and positive")
 
 
 @dataclass(frozen=True)
@@ -232,7 +231,7 @@ class ServerObservationProvider(Protocol):
         timeout: float,
         cancel: CancellationProbe,
         cancel_wait: bool,
-        max_response_bytes: int,
+        max_response_bytes: int | None,
     ) -> CoherentServerSnapshot: ...
 
     def embeddings(
@@ -244,7 +243,7 @@ class ServerObservationProvider(Protocol):
         timeout: float,
         cancel: CancellationProbe,
         cancel_wait: bool,
-        max_response_bytes: int,
+        max_response_bytes: int | None,
     ) -> Any: ...
 
 
@@ -267,12 +266,14 @@ class ServerObservationSession:
         scope: ServerObservationScope,
         provider: ServerObservationProvider,
         *,
-        max_response_bytes: int = 8 * 1024 * 1024,
+        max_response_bytes: int | None = None,
     ) -> None:
         if not isinstance(scope, ServerObservationScope):
             raise ValueError("session requires a typed observation scope")
-        if type(max_response_bytes) is not int or max_response_bytes <= 0:
-            raise ValueError("max_response_bytes must be a positive integer")
+        if max_response_bytes is not None and (
+            type(max_response_bytes) is not int or max_response_bytes <= 0
+        ):
+            raise ValueError("max_response_bytes must be a positive integer or None")
         self.scope = scope
         self.provider = provider
         self.max_response_bytes = max_response_bytes

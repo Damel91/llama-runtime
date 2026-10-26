@@ -68,10 +68,8 @@ def test_small_source_windows_fill_the_configured_model_budget(
             snapshot = adapter._engine.snapshot()
             cap = adapter._scheduler.text_cap(budget)
             assert all(len(batch) == cap for _, batch in client.embedding_calls)
-            assert (
-                snapshot["peak_active_plans"]
-                <= parallelism + adapter.embedding_queue_size
-            )
+            assert adapter.embedding_queue_size is None
+            assert snapshot["peak_active_plans"] >= parallelism
             assert snapshot["retained_plans"] >= len(sizes)
             assert snapshot["pending_bytes"] > 0
             assert adapter._scheduler.snapshot()["queued"] == 0
@@ -111,6 +109,7 @@ def test_resource_pressure_flushes_partial_model_batch_without_a_timer(pressure)
         embedding_request_parallelism=1,
         embedding_queue_size=0,
         embedding_batch_wait_sec=0,
+        embedding_capacity_limits=True,
         **limits,
     )
     adapter._batch_now = lambda: 0.0
@@ -119,8 +118,14 @@ def test_resource_pressure_flushes_partial_model_batch_without_a_timer(pressure)
         assert len(client.embedding_calls) > 1
         assert all(len(batch) < 8 for _, batch in client.embedding_calls)
         snapshot = adapter._engine.snapshot()
-        assert snapshot["peak_pending_bytes"] <= adapter.embedding_max_pending_bytes
-        assert snapshot["peak_pending_tokens"] <= adapter.embedding_max_pending_tokens
+        if pressure == "bytes":
+            assert snapshot["peak_pending_bytes"] <= adapter.embedding_max_pending_bytes
+            assert adapter.embedding_max_pending_tokens is None
+        else:
+            assert (
+                snapshot["peak_pending_tokens"] <= adapter.embedding_max_pending_tokens
+            )
+            assert adapter.embedding_max_pending_bytes is None
         assert Counter(
             text for _, batch in client.embedding_calls for text in batch
         ) == Counter(incoming)
@@ -207,8 +212,9 @@ def test_worker_rejected_owner_releases_its_unsent_backlog_after_shared_drain():
             dimension=2,
             embedding_request_parallelism=1,
             embedding_queue_size=1,
-            # Three owners are intentional here: prime holds HTTP while the
-            # two queued owners prepare. The default H=G+Q would admit two.
+            # Prime owns HTTP while two further owners prepare; admission is
+            # explicitly chosen independently of the scheduler's queue budget.
+            embedding_capacity_limits=True,
             embedding_max_pending_owners=3,
             embedding_batch_wait_sec=0,
         )

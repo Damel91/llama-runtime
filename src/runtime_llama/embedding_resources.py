@@ -36,6 +36,10 @@ def _positive(value, name):
     return value
 
 
+def _optional_positive(value, name):
+    return None if value is None else _positive(value, name)
+
+
 class ByteLease:
     """One idempotent byte reservation, released only after real ownership ends."""
 
@@ -63,7 +67,7 @@ class ByteBudget:
     """
 
     def __init__(self, limit, *, name="handoff_bytes", notify=None):
-        self.limit = _positive(limit, "limit")
+        self.limit = _optional_positive(limit, "limit")
         self.name, self._notify = name, notify
         self._condition = Condition()
         self._used = self._peak = self._leases = 0
@@ -72,12 +76,12 @@ class ByteBudget:
     def try_acquire(self, amount, family="embedding"):
         if isinstance(amount, bool) or not isinstance(amount, int) or amount < 0:
             raise ValueError("amount must be a nonnegative integer")
-        if amount > self.limit:
+        if self.limit is not None and amount > self.limit:
             raise EmbeddingResourceLimitError(self.name, self.limit, amount)
         with self._condition:
             if self._closed:
                 raise LLMBackendError("llamacpp_embedding_adapter_closed")
-            if self._used + amount > self.limit:
+            if self.limit is not None and self._used + amount > self.limit:
                 return None
             self._used += amount
             self._leases += 1
@@ -111,8 +115,10 @@ class EmbeddingIntake:
     """
 
     def __init__(self, owner_limit, max_snapshot_bytes, *, notify=None):
-        self.owner_limit = _positive(owner_limit, "owner_limit")
-        self.max_snapshot_bytes = _positive(max_snapshot_bytes, "max_snapshot_bytes")
+        self.owner_limit = _optional_positive(owner_limit, "owner_limit")
+        self.max_snapshot_bytes = _optional_positive(
+            max_snapshot_bytes, "max_snapshot_bytes"
+        )
         self._notify = notify
         self._condition = Condition()
         self._owners = self._peak_owners = self._bytes = self._peak_bytes = 0
@@ -175,9 +181,8 @@ class EmbeddingIntake:
                 call.check()
                 with self._condition:
                     self._check_locked()
-                    if (
-                        self._owner_waiters[0] is ticket
-                        and self._owners < self.owner_limit
+                    if self._owner_waiters[0] is ticket and (
+                        self.owner_limit is None or self._owners < self.owner_limit
                     ):
                         self._owner_waiters.popleft()
                         lease = self._new_owner_locked(call)
@@ -222,7 +227,9 @@ class EmbeddingIntake:
             self._owner_waiters.append(ticket)
 
         def admitted():
-            if self._owner_waiters[0] is ticket and self._owners < self.owner_limit:
+            if self._owner_waiters[0] is ticket and (
+                self.owner_limit is None or self._owners < self.owner_limit
+            ):
                 self._owner_waiters.popleft()
                 lease = self._new_owner_locked(call, asynchronous=True)
                 self._changed_locked()
@@ -320,7 +327,10 @@ class OwnerLease:
         size = len(values)
         # Both the building list and the frozen tuple are covered at transfer.
         base = sys.getsizeof([]) + sys.getsizeof(()) + 2 * _REFERENCE_BYTES * size
-        if base > self.intake.max_snapshot_bytes:
+        if (
+            self.intake.max_snapshot_bytes is not None
+            and base > self.intake.max_snapshot_bytes
+        ):
             raise EmbeddingResourceLimitError(
                 "snapshot_bytes", self.intake.max_snapshot_bytes, base
             )
@@ -346,6 +356,10 @@ class OwnerLease:
 
     def _builder_ready(self):
         self.intake._check_locked(self)
+        if self.intake.max_snapshot_bytes is None:
+            if self in self.intake._builder_waiters:
+                self.intake._builder_waiters.remove(self)
+            return True
         if self.intake._builder is None and self.intake._builder_waiters[0] is self:
             self.intake._builder_waiters.popleft()
             self.intake._builder = self
@@ -355,11 +369,17 @@ class OwnerLease:
     def _reserve_ready(self, extra):
         self.intake._check_locked(self)
         wanted = self._bytes + extra
-        if wanted > self.intake.max_snapshot_bytes:
+        if (
+            self.intake.max_snapshot_bytes is not None
+            and wanted > self.intake.max_snapshot_bytes
+        ):
             raise EmbeddingResourceLimitError(
                 "snapshot_bytes", self.intake.max_snapshot_bytes, wanted
             )
-        if self.intake._bytes + extra > self.intake.max_snapshot_bytes:
+        if (
+            self.intake.max_snapshot_bytes is not None
+            and self.intake._bytes + extra > self.intake.max_snapshot_bytes
+        ):
             self._waiting_bytes = True
             return None
         self._waiting_bytes = False

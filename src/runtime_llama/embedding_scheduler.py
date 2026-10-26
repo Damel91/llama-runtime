@@ -25,7 +25,7 @@ class EmbeddingScheduler:
     """Plan text quotas and admit ready affine jobs on one bounded queue."""
 
     def __init__(
-        self, parallelism: int | None, queue_size: int, replicas: dict[str, int]
+        self, parallelism: int | None, queue_size: int | None, replicas: dict[str, int]
     ):
         if parallelism is not None and (
             not isinstance(parallelism, int)
@@ -33,7 +33,7 @@ class EmbeddingScheduler:
             or parallelism <= 0
         ):
             raise ValueError("parallelism must be None or a positive integer")
-        if (
+        if queue_size is not None and (
             not isinstance(queue_size, int)
             or isinstance(queue_size, bool)
             or queue_size < 0
@@ -106,6 +106,8 @@ class EmbeddingScheduler:
         Small source windows keep their own distribution credits, but do not
         reduce the ceiling of an HTTP batch assembled from several windows.
         """
+        if text_budget is None:
+            return None
         if (
             not isinstance(text_budget, int)
             or isinstance(text_budget, bool)
@@ -353,7 +355,7 @@ class EmbeddingScheduler:
         if self._can_dispatch(job.model) and not same_alias_queued:
             self._dispatch(job)
             return True
-        if len(self._queue) < self.queue_size:
+        if self.queue_size is None or len(self._queue) < self.queue_size:
             self._queue.append(job)
             self._peak_queued = max(self._peak_queued, len(self._queue))
             return True

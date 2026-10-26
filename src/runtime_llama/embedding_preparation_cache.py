@@ -100,11 +100,12 @@ class PreparationCache:
     callbacks or network operations, so closing cannot strand a waiting owner.
     """
 
-    def __init__(self, max_entries: int, max_bytes: int):
+    def __init__(self, max_entries: int | None, max_bytes: int | None, *, enabled=True):
         for name, value in (("max_entries", max_entries), ("max_bytes", max_bytes)):
-            if type(value) is not int or value < 0:
+            if value is not None and (type(value) is not int or value < 0):
                 raise ValueError(f"{name} must be a nonnegative integer")
         self.max_entries, self.max_bytes = max_entries, max_bytes
+        self.enabled = enabled
         self._lock = Lock()
         self._entries = OrderedDict()
         self._bytes = self._peak_entries = self._peak_bytes = 0
@@ -129,15 +130,23 @@ class PreparationCache:
         with self._lock:
             if self._closed:
                 return False
-            if not self.max_entries or cost > self.max_bytes:
+            if (
+                not self.enabled
+                or self.max_entries == 0
+                or self.max_bytes == 0
+                or (self.max_bytes is not None and cost > self.max_bytes)
+            ):
                 self._oversized_skips += 1
                 return False
             previous = self._entries.pop(key, None)
             if previous is not None:
                 self._bytes -= previous[1]
             while self._entries and (
-                len(self._entries) >= self.max_entries
-                or self._bytes + cost > self.max_bytes
+                (
+                    self.max_entries is not None
+                    and len(self._entries) >= self.max_entries
+                )
+                or (self.max_bytes is not None and self._bytes + cost > self.max_bytes)
             ):
                 _, (_, removed) = self._entries.popitem(last=False)
                 self._bytes -= removed
@@ -158,6 +167,7 @@ class PreparationCache:
     def snapshot(self):
         with self._lock:
             return {
+                "enabled": self.enabled,
                 "entries": len(self._entries),
                 "bytes": self._bytes,
                 "peak_entries": self._peak_entries,

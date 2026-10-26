@@ -125,14 +125,15 @@ def test_gzip_members_share_one_total_envelope():
         _bounded_json_body(iter([gzip.compress(b"x" * 300)] * 2), "gzip", 512)
 
 
-def test_tiny_gzip_exact_decoded_boundary_and_finite_empty_member_wire_guard():
+def test_tiny_gzip_decoded_policy_does_not_add_a_hidden_wire_guard():
     body = b'{"ok":1}'
     encoded = gzip.compress(body)
     assert len(encoded) > len(body)
     assert _bounded_json_body(iter([encoded]), "gzip", len(body)) == body
     padded = gzip.compress(b"") * 4000 + encoded
+    assert _bounded_json_body(iter([padded]), "gzip", len(body)) == body
     with pytest.raises(LLMBackendError, match="json_response_too_large"):
-        _bounded_json_body(iter([padded]), "gzip", len(body))
+        _bounded_json_body(iter([gzip.compress(body + b" ")]), "gzip", len(body))
 
 
 @pytest.mark.parametrize("style", ["truncated", "malformed", "bad-gzip", "br"])
@@ -152,7 +153,9 @@ def test_invalid_framing_or_encoding_drains_and_does_not_replay(endpoint, style)
     assert len(observed) == 1
 
 
-def test_error_body_has_small_envelope_and_preserves_only_status(endpoint, monkeypatch):
+def test_error_body_honors_requested_bound_without_hidden_smaller_envelope(
+    endpoint, monkeypatch
+):
     decoded = []
     monkeypatch.setattr(
         transport.requests.Response,
@@ -168,7 +171,7 @@ def test_error_body_has_small_envelope_and_preserves_only_status(endpoint, monke
         assert caught.value.status_code == 503
         assert caught.value.error_code is None
         assert not api._streams
-    assert decoded == []
+    assert decoded == [True]
     assert len(observed) == 1
 
 

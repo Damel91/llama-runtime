@@ -19,6 +19,7 @@ def test_sync_owner_prevents_async_source_pull_until_result_transfer():
             client,
             embedding_request_parallelism=1,
             embedding_queue_size=0,
+            embedding_capacity_limits=True,
             embedding_max_pending_owners=1,
             embedding_batch_wait_sec=0,
             timeout=5,
@@ -63,6 +64,7 @@ def test_completed_async_result_keeps_sync_caller_outside_registration():
             client,
             embedding_request_parallelism=1,
             embedding_queue_size=0,
+            embedding_capacity_limits=True,
             embedding_max_pending_owners=1,
             embedding_batch_wait_sec=0,
             timeout=5,
@@ -105,7 +107,9 @@ def test_impossible_sync_snapshot_fails_before_source_reads_or_registration(meth
             raise AssertionError("input copied before its finite bound was checked")
 
     client = ContractClient(1)
-    adapter = configured(client, embedding_max_pending_bytes=512)
+    adapter = configured(
+        client, embedding_capacity_limits=True, embedding_max_pending_bytes=512
+    )
     try:
         with pytest.raises(EmbeddingResourceLimitError, match="snapshot_bytes_limit"):
             getattr(adapter, method)(ImpossibleWindow())
@@ -120,7 +124,9 @@ def test_impossible_sync_snapshot_fails_before_source_reads_or_registration(meth
 def test_oversized_async_snapshot_does_not_register_or_send_embedding():
     async def scenario():
         client = ContractClient(1)
-        adapter = configured(client, embedding_max_pending_bytes=512)
+        adapter = configured(
+            client, embedding_capacity_limits=True, embedding_max_pending_bytes=512
+        )
         stream = adapter.astream_texts(WindowSource([["large" * 1000]]))
         try:
             async with stream:

@@ -201,7 +201,9 @@ def test_real_http_one_original_per_replica_and_bounded_shared_queue():
 
         state.action = action
         adapter = LlamaCppEmbeddingAdapter(
-            configured(url, embedding_max_pending_tokens=12)
+            configured(
+                url, embedding_capacity_limits=True, embedding_max_pending_tokens=12
+            )
         )
         first = [f"item-{index}" for index in range(16)]
         second = [f"item-{index}" for index in range(100, 116)]
@@ -361,9 +363,15 @@ def test_real_http_failure_stops_unsent_batches_and_next_call_recovers():
             )
         )
         try:
-            with pytest.raises(ClientHTTPError):
+            with pytest.raises(ClientHTTPError) as caught:
                 adapter.embed_texts([f"item-{index}" for index in range(30)])
-            assert state.calls == [("embed", ("item-0", "item-1"))]
+            assert caught.value.status_code == 500
+            assert caught.value.error_type == "server_error"
+            # The independent replica may complete work before the primary
+            # failure arrives; no unsent batch may follow that failure.
+            failed = ("embed", ("item-0", "item-1"))
+            assert state.calls[-1] == failed and state.calls.count(failed) == 1
+            assert len([text for _, batch in state.calls for text in batch]) < 30
             assert adapter.embedding_dim == 2
             assert adapter.embed_query("item-99") == [99, 1]
         finally:

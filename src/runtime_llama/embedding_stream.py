@@ -1,4 +1,4 @@
-"""Bounded async window intake over the shared persistent embedding engine."""
+"""Async window intake over the shared persistent embedding engine."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import math
 from threading import Event
 from typing import Any, AsyncIterable, Callable, Literal, Sequence
+from weakref import WeakSet
 
 from runtime_llama.embedding_preparation import PreparedEmbeddingInput
 from runtime_llama.errors import LLMBackendError
@@ -67,7 +68,9 @@ class _EmbeddingWindowBridge:
         self.adapter = adapter
         self.capacity = adapter._intake.owner_limit
         self.loop = None
-        self.streams = set()
+        # Membership observes live streams; it must not itself keep an
+        # abandoned, otherwise completed stream and all its results alive.
+        self.streams = WeakSet()
         self.used = 0
         self.changed = None
 
@@ -95,8 +98,8 @@ class _EmbeddingWindowBridge:
             previous.set()
 
     async def acquire(self, call):
-        # The same fixed adapter-wide owner budget also covers synchronous
-        # registration. Acquire it before touching the source iterator.
+        # An explicitly configured owner policy also covers synchronous
+        # registration. Ownership starts before touching the source iterator.
         lease = await self.adapter._intake.acquire_owner_async(call)
         try:
             call.check()
@@ -133,7 +136,7 @@ class _EmbeddingWindowBridge:
 
 
 class EmbeddingWindowStream:
-    """Ordered async embedding windows with bounded, shared intake leases.
+    """Ordered async embedding windows with shared ownership tracking.
 
     Use ``async with`` or ``aclose`` after an early break. Source iterators are
     borrowed unless ``close_source=True`` is requested explicitly.
@@ -146,19 +149,19 @@ class EmbeddingWindowStream:
         *,
         prepared: bool = False,
         input_type: Literal["document", "query", "raw"] = "document",
-        max_pending_windows: int = 2,
+        max_pending_windows: int | None = None,
         timeout: float | None = None,
         cancel: Callable[[], bool] | None = None,
         close_source: bool = False,
         _direct_policy=None,
         _admission_scope=None,
     ):
-        if (
+        if max_pending_windows is not None and (
             isinstance(max_pending_windows, bool)
             or not isinstance(max_pending_windows, int)
             or max_pending_windows <= 0
         ):
-            raise ValueError("max_pending_windows must be a positive integer")
+            raise ValueError("max_pending_windows must be a positive integer or None")
         if not callable(getattr(windows, "__aiter__", None)):
             raise ValueError("windows must be an async iterable")
         if not isinstance(close_source, bool):
@@ -220,6 +223,8 @@ class EmbeddingWindowStream:
         except BaseException:
             bridge.retire(self)
             self._closed = True
+            self._source = self._iterator = None
+            self._adapter = self._bridge = self._loop = self._changed = None
             raise
         self._producer = loop.create_task(self._produce())
 
@@ -234,7 +239,8 @@ class EmbeddingWindowStream:
             self._pull_call.stop.set()
         for window in self._pending:
             window.call.stop.set()
-        self._adapter._engine.wake()
+        if self._adapter is not None:
+            self._adapter._engine.wake()
         self._notify()
 
     def _fail(self, exc):
@@ -245,9 +251,10 @@ class EmbeddingWindowStream:
 
     def _adapter_closed(self):
         self._stop.set()
-        if self._loop is not None:
+        loop = self._loop
+        if loop is not None:
             try:
-                self._loop.call_soon_threadsafe(self._closed_on_loop)
+                loop.call_soon_threadsafe(self._closed_on_loop)
             except RuntimeError:
                 pass
 
@@ -269,7 +276,7 @@ class EmbeddingWindowStream:
         try:
             while not self._stop.is_set():
                 changed = self._changed
-                if len(self._pending) >= self._maximum:
+                if self._maximum is not None and len(self._pending) >= self._maximum:
                     await changed.wait()
                     continue
                 call = self._adapter._stream_call(self._cancel, self._timeout)
@@ -323,6 +330,8 @@ class EmbeddingWindowStream:
             self._notify()
 
     def _completed(self, future):
+        if self._closed:
+            return
         if not self._stop.is_set():
             if future.cancelled():
                 self._fail(LLMBackendError("llamacpp_embedding_adapter_closed"))
@@ -340,6 +349,8 @@ class EmbeddingWindowStream:
             self._bridge.release(window.call)
 
     def _ensure_cleanup(self):
+        if self._closed:
+            return self._cleanup_task
         if self._cleanup_task is None and self._loop is not None:
             self._cleanup_task = self._loop.create_task(self._cleanup())
             # Retain the exception for awaiters without an unobserved-task warning.
@@ -377,6 +388,18 @@ class EmbeddingWindowStream:
             self._closed = True
             self._notify()
             self._bridge.retire(self)
+            # A closed iterator may be retained by user code. It must not
+            # thereby retain the borrowed source, its last pulled window,
+            # completed producer Tasks, a failure traceback or the adapter.
+            self._source = self._iterator = None
+            self._pull = self._pull_call = self._producer = None
+            if self._error_reported:
+                self._failure = None
+            self._cancel = None
+            self._direct_policy = self._admission_scope = None
+            self._packing_group = None
+            self._adapter = self._bridge = None
+            self._cleanup_task = self._changed = self._loop = None
 
     async def __anext__(self) -> list[list[float]]:
         self._check_loop()
@@ -389,7 +412,11 @@ class EmbeddingWindowStream:
                 changed = self._changed
                 if self._failure is not None and not self._error_reported:
                     self._error_reported = True
-                    await _drain(self._ensure_cleanup(), primary=self._failure)
+                    failure, self._failure = self._failure, None
+                    task = self._ensure_cleanup()
+                    if task is None:
+                        raise failure
+                    await _drain(task, primary=failure)
                 if self._closed or self._stop.is_set():
                     task = self._ensure_cleanup()
                     if task is not None:
@@ -431,11 +458,39 @@ class EmbeddingWindowStream:
 
     async def aclose(self) -> None:
         self._check_loop()
+        if self._closed:
+            return
         if self._loop is None:
             self._closed = True
+            self._source = self._iterator = None
+            self._cancel = self._direct_policy = self._admission_scope = None
+            self._packing_group = self._adapter = self._bridge = None
             return
         self._request_stop()
-        await _drain(self._ensure_cleanup())
+        try:
+            await _drain(self._ensure_cleanup())
+        finally:
+            self._failure = None
+
+    def __del__(self):
+        # Explicit async context management remains the deterministic ownership
+        # boundary. If a finite stream is instead discarded after its producer
+        # and response callbacks finish, weak bridge membership permits this
+        # fallback to retire its otherwise undelivered results.
+        try:
+            if (
+                not self._closed
+                and self._loop is not None
+                and not self._loop.is_closed()
+            ):
+                self._loop.call_soon_threadsafe(self._abandon)
+        except (AttributeError, RuntimeError):
+            pass
+
+    def _abandon(self):
+        if not self._closed:
+            self._request_stop()
+            self._ensure_cleanup()
 
 
 async def _close_embedding_adapter(adapter):

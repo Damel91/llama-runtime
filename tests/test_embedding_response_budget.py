@@ -128,6 +128,7 @@ def adapter_for(url, **changes):
                 "batch_size": 1,
                 "embedding_input_format": "text",
                 "embedding_request_parallelism": 2,
+                "embedding_capacity_limits": True,
                 "embedding_max_request_bytes": 256,
                 "embedding_max_response_bytes": 16384,
                 **changes,

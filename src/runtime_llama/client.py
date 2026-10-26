@@ -38,36 +38,30 @@ from ._http_interrupt import RequestInterrupt, bind_interrupt, unbind_interrupt
 CancellationProbe = Callable[[], bool]
 _SAFE_CODE = re.compile(r"[A-Za-z0-9_.-]{1,64}\Z")
 _END = object()
-_MAX_FRAME = 8 * 1024 * 1024
-_MAX_ERROR_BODY = 64 * 1024
-_MAX_ERROR_BODY_SECONDS = 5.0
 _INHERIT_IDLE_TIMEOUT = object()
 
 
 def _bounded_json_body(chunks: Iterator[bytes], encoding: str, bound: int) -> bytes:
-    """Bound wire and inflated bytes without an unbounded decoder allocation.
+    """Apply an explicit decoded-body bound before decoder allocation.
 
     ``urllib3``'s decoded reads may inflate a compressed chunk before returning
     it. Reading the wire and using zlib's hard ``max_length`` output limit keeps
     that transient allocation inside a finite envelope. ``bound`` retains its
-    decoded-body meaning; a distinct derived wire guard admits compression
-    headers even for a tiny valid JSON body. This is not a claim about Python
-    objects allocated by the JSON decoder.
+    decoded-body meaning. Wire overhead is not another silently derived
+    capacity policy. This is not a claim about Python objects allocated by
+    the JSON decoder.
     """
     encoding = encoding.strip().lower()
     if encoding not in {"", "identity", "gzip", "x-gzip", "deflate"}:
         raise LLMBackendError("llama_server_json_unsupported_encoding")
     body = bytearray()
-    wire_bytes = 0
-    wire_bound = bound if encoding in {"", "identity"} else max(65536, 2 * bound)
     decoder: Any = None
     prefix = b""
     completed = False
     for chunk in chunks:
-        wire_bytes += len(chunk)
-        if wire_bytes > wire_bound:
-            raise LLMBackendError("llama_server_json_response_too_large")
         if encoding in {"", "identity"}:
+            if len(body) + len(chunk) > bound:
+                raise LLMBackendError("llama_server_json_response_too_large")
             body.extend(chunk)
             continue
         pending = prefix + chunk
@@ -194,7 +188,9 @@ def _http_error(
     return ClientHTTPError(int(response.status_code), error_code=code, error_type=kind)
 
 
-def _sse(chunks: Iterator[bytes | str]) -> Iterator[dict[str, Any]]:
+def _sse(
+    chunks: Iterator[bytes | str], *, max_frame_chars: int | None = None
+) -> Iterator[dict[str, Any]]:
     """Decode SSE data across UTF-8, CR/LF and HTTP chunk boundaries."""
     decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
     parts: list[str] = []
@@ -268,7 +264,10 @@ def _sse(chunks: Iterator[bytes | str]) -> Iterator[dict[str, Any]]:
                 if segment:
                     parts.append(segment)
                     line_size += len(segment)
-                    if line_size + frame_size > _MAX_FRAME:
+                    if (
+                        max_frame_chars is not None
+                        and line_size + frame_size > max_frame_chars
+                    ):
                         raise LLMBackendError("llama_server_sse_frame_too_large")
             else:
                 payload = line("".join(parts))
@@ -384,6 +383,10 @@ class _HTTPCall:
                 self._interrupt.detach()
                 unbind_interrupt(self._session, self._interrupt)
             self._client._release_session(self._session)
+        # The returned payload is separate from the response object. Once
+        # transport cleanup ends this call no longer owns request/body/session
+        # references, including when a caller retains a closed stream.
+        self._body = self._response = self._session = None
         self._drained.set()
 
     def _chunks(self, *, json_body: bool = False) -> Iterator[bytes | str]:
@@ -481,18 +484,9 @@ class _HTTPCall:
         return self._response.json()
 
     def _read_error_json(self) -> Any:
-        # Preserve caller-owned opaque response behavior only for explicitly
-        # unbounded borrowed calls. All finite embedding/control paths and all
-        # real streamed responses use the smaller sanitized error envelope.
-        if self._max_response_bytes is None and not isinstance(
-            self._response, requests.Response
-        ):
-            return self._read_json()
-        return self._read_json(
-            max_response_bytes=min(
-                self._max_response_bytes or _MAX_ERROR_BODY, _MAX_ERROR_BODY
-            )
-        )
+        # An explicit response policy applies equally to success and failure.
+        # Do not replace it with an implicit smaller error envelope.
+        return self._read_json()
 
     def _signal_close(self) -> None:
         self._stop.set()
@@ -584,7 +578,8 @@ class _JSONCall(_HTTPCall):
                     raise LLMBackendError("llama_server_client_closed")
                 if self._error is not None:
                     raise self._error
-                return self._result
+                result, self._result = self._result, None
+                return result
         except BaseException:
             self.close()
             raise
@@ -595,7 +590,9 @@ class _SSEStream(_HTTPCall, Iterator[dict[str, Any]]):
 
     def __init__(self, *args: Any) -> None:
         super().__init__(*args)
-        self._queue: Queue[Any] = Queue(maxsize=64)
+        self._queue: Queue[Any] = Queue(
+            maxsize=self._client.max_sse_pending_events or 0
+        )
         self._worker = Thread(
             target=self._read, daemon=True, name="runtime_llama_sse_reader"
         )
@@ -612,15 +609,10 @@ class _SSEStream(_HTTPCall, Iterator[dict[str, Any]]):
                 continue
 
     def _bounded_http_error(self) -> ClientHTTPError:
-        """Keep structured codes without making error-body reads unlimited."""
+        """Keep HTTP status under the caller's finite original body deadline."""
         assert self._interrupt is not None
-        bound = min(
-            _MAX_ERROR_BODY,
-            self._max_response_bytes
-            if self._max_response_bytes is not None
-            else _MAX_ERROR_BODY,
-        )
-        budget = min(self._timeout, _MAX_ERROR_BODY_SECONDS)
+        bound = self._max_response_bytes
+        budget = self._timeout
         deadline = time.monotonic() + budget
         expired = Event()
 
@@ -658,7 +650,9 @@ class _SSEStream(_HTTPCall, Iterator[dict[str, Any]]):
                 if self._idle_timeout is None:
                     raise self._bounded_http_error()
                 raise _http_error(self._response, self._read_error_json)
-            for payload in _sse(self._chunks()):
+            for payload in _sse(
+                self._chunks(), max_frame_chars=self._client.max_sse_frame_chars
+            ):
                 if self._stop.is_set():
                     break
                 self._put(payload)
@@ -703,6 +697,16 @@ class _SSEStream(_HTTPCall, Iterator[dict[str, Any]]):
             self.close()
             raise
 
+    def close(self) -> None:
+        super().close()
+        # A closed iterator must not retain buffered payloads merely because
+        # the consumer keeps its handle. The stopped reader cannot enqueue.
+        while True:
+            try:
+                self._queue.get_nowait()
+            except Empty:
+                break
+
 
 class LlamaCppClient:
     """HTTP only: raw llama-server native and /v1 responses, no implicit retry."""
@@ -722,6 +726,8 @@ class LlamaCppClient:
         trust_env: bool = True,
         proxy_url: str | None = None,
         connection_policy: str = "close",
+        max_sse_frame_chars: int | None = None,
+        max_sse_pending_events: int | None = None,
     ) -> None:
         invalid_url = (
             "base_url must be an HTTP(S) server URL without "
@@ -757,6 +763,13 @@ class LlamaCppClient:
         }:
             raise ValueError("connection_policy must be close or reuse")
         self.connection_policy = connection_policy
+        for name, value in (
+            ("max_sse_frame_chars", max_sse_frame_chars),
+            ("max_sse_pending_events", max_sse_pending_events),
+        ):
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ValueError(f"{name} must be a positive integer or None")
+            setattr(self, name, value)
         self.proxy_url = normalize_proxy_url(proxy_url)
         if self.proxy_url is not None and session is not None:
             raise ValueError("explicit proxy routing requires an owned session")
@@ -894,7 +907,7 @@ class LlamaCppClient:
     ) -> dict[str, Any] | list[Any] | Iterator[dict[str, Any]]:
         """Read JSON or SSE; optionally bound decompressed JSON/error bodies.
 
-        ``max_response_bytes`` does not change the existing SSE frame limit.
+        ``max_response_bytes`` does not change the separate optional SSE frame policy.
         The bound is enforced while reading network responses, before buffering
         additional bytes. Bounded requests accept identity, gzip and deflate;
         wire and inflated byte limits precede JSON decoding. Opaque custom
@@ -906,8 +919,8 @@ class LlamaCppClient:
         budget. Explicit ``None`` disables SSE idle on owned sessions, with
         socket interruption for cancellation. JSON calls remain finite.
         Disabled-idle HTTP errors preserve sanitized codes within a separate
-        finite body budget (at most five seconds and 64 KiB, or lower caller
-        limits). Incomplete, excessive or late bodies retain only the status.
+        finite caller deadline and the optional explicit response-byte policy.
+        Incomplete, excessive or late bodies retain only the status.
         """
         _cancelled(cancel)
         if idle_timeout is not _INHERIT_IDLE_TIMEOUT:

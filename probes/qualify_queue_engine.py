@@ -450,7 +450,8 @@ def qualify_reuse(runtime, config, client, budget, report, artifacts):
     texts = [
         f"Reuse document {i}: whitespace \t Unicode città 🔬 end {i}." for i in range(8)
     ]
-    adapter = runtime.build_embedding_adapter(config, client=client)
+    reuse_config = dict(config, embedding_preparation_cache_enabled=True)
+    adapter = runtime.build_embedding_adapter(reuse_config, client=client)
     report.update(
         mode="separate prepared/raw reuse; fresh adapter; not cold timing", phases={}
     )

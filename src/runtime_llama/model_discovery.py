@@ -1,4 +1,4 @@
-"""Bounded, read-only observations of an explicitly selected llama-server.
+"""Read-only observations of an explicitly selected llama-server.
 
 Catalog membership is not proof that a model is loaded. No inference, model
 selection, loading or administrative request is performed by this module.
@@ -114,11 +114,10 @@ def _invalid() -> None:
     raise LLMBackendError("llama_server_discovery_invalid_catalog") from None
 
 
-def _text(value: Any, *, limit: int = 1024) -> str:
+def _text(value: Any) -> str:
     if (
         not isinstance(value, str)
         or not value
-        or len(value) > limit
         or any(
             ord(char) < 32 or 127 <= ord(char) <= 159 or 0xD800 <= ord(char) <= 0xDFFF
             for char in value
@@ -131,18 +130,18 @@ def _text(value: Any, *, limit: int = 1024) -> str:
 def _integer(value: Any, source: ObservationSource) -> ObservedInt | None:
     if value is None:
         return None
-    if type(value) is not int or not 1 <= value <= 2**31 - 1:
+    if type(value) is not int or value <= 0:
         _invalid()
     return ObservedInt(value, source)
 
 
 def _identity(entry: dict[str, Any]) -> ModelIdentity:
     tags = entry.get("tags", [])
-    if not isinstance(tags, list) or len(tags) > 128:
+    if not isinstance(tags, list):
         _invalid()
     values: dict[str, str] = {}
     for tag in tags:
-        _text(tag, limit=4096)
+        _text(tag)
         for prefix in (_CONTENT, _EMBEDDING, _NAME):
             if tag.startswith(prefix):
                 value = tag[len(prefix) :]
@@ -173,7 +172,7 @@ def _identity(entry: dict[str, Any]) -> ModelIdentity:
 def _observe(entry: dict[str, Any], diagnostics: set[str]) -> ModelObservation:
     model = _text(entry.get("id"))
     aliases = entry.get("aliases", [])
-    if not isinstance(aliases, list) or len(aliases) > 64:
+    if not isinstance(aliases, list):
         _invalid()
     for alias in aliases:
         _text(alias)
@@ -186,7 +185,7 @@ def _observe(entry: dict[str, Any], diagnostics: set[str]) -> ModelObservation:
     if failed is not None and not isinstance(failed, bool):
         _invalid()
     if value is not None:
-        _text(value, limit=128)
+        _text(value)
     state: ModelState = value if value in _STATES else "unknown"
     if state == "loaded" and failed is True:
         _invalid()
@@ -285,8 +284,8 @@ def discover_models(
     timeout: float = 5.0,
     verify_ssl: bool = True,
     cancellation_probe: CancellationProbe | None = None,
-    max_response_bytes: int = 1048576,
-    max_models: int = 256,
+    max_response_bytes: int | None = None,
+    max_models: int | None = None,
     proxy_url: str | None = None,
     http_connection_policy: str = "close",
 ) -> ModelCatalog:
@@ -318,9 +317,9 @@ def discover_models(
         raise ValueError("discovery verify_ssl must be a boolean")
     if cancellation_probe is not None and not callable(cancellation_probe):
         raise ValueError("discovery cancellation_probe must be callable")
-    for value, upper in ((max_response_bytes, 16 * 1024 * 1024), (max_models, 4096)):
-        if type(value) is not int or not 1 <= value <= upper:
-            raise ValueError("discovery limit is outside its supported bounds")
+    for value in (max_response_bytes, max_models):
+        if value is not None and (type(value) is not int or value <= 0):
+            raise ValueError("discovery limit must be a positive integer or None")
     if api_key is not None and api_key_env is not None:
         raise ValueError("discovery accepts one explicit authentication source")
     if api_key_env is not None:
@@ -333,7 +332,7 @@ def discover_models(
             )
     if api_key is not None and (
         not isinstance(api_key, str)
-        or not 1 <= len(api_key) <= 8192
+        or not api_key
         or any(ord(char) < 32 or ord(char) == 127 for char in api_key)
     ):
         raise ValueError("discovery authentication value is invalid")
@@ -368,7 +367,7 @@ def discover_models(
         entries = catalog.get("data") if isinstance(catalog, dict) else None
         if not isinstance(entries, list):
             _invalid()
-        if len(entries) > max_models:
+        if max_models is not None and len(entries) > max_models:
             raise LLMBackendError("llama_server_discovery_model_limit_exceeded")
         observations: list[ModelObservation] = []
         claimed: set[str] = set()

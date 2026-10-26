@@ -184,6 +184,7 @@ def test_prefix_is_not_materialized_before_its_actual_byte_admission(monkeypatch
     client = ContractClient(1)
     adapter = configured(
         client,
+        embedding_capacity_limits=True,
         embedding_max_pending_bytes=1024,
         embedding_prefixes={"document": "p" * 1024},
     )
@@ -218,6 +219,7 @@ def test_exact_json_request_budget_packs_unicode_without_changing_outputs():
     adapter = configured(
         client,
         embedding_input_format="text",
+        embedding_capacity_limits=True,
         embedding_max_request_bytes=200,
         embedding_batch_wait_sec=0.5,
     )
@@ -256,7 +258,9 @@ def test_cancellation_callbacks_never_run_on_the_coordinator_thread():
 @pytest.mark.parametrize("text", ['"' * 70, "🧪" * 10])
 def test_tokenizer_json_envelope_is_admitted_before_http(text):
     client = ContractClient(1)
-    adapter = configured(client, embedding_max_request_bytes=200)
+    adapter = configured(
+        client, embedding_capacity_limits=True, embedding_max_request_bytes=200
+    )
     try:
         assert len(text.encode("utf-8")) < 200
         with pytest.raises(LLMBackendError, match="request_bytes_limit"):
@@ -299,7 +303,7 @@ def test_nonqueueing_scheduler_dispatch_never_freezes_waiting_work():
 def test_result_credits_follow_source_order_when_earlier_discovery_is_slow(monkeypatch):
     class SlowFirstStart(ContractClient):
         def __init__(self):
-            super().__init__(1)
+            super().__init__(2)
             self.first_props, self.release = Event(), Event()
             self.count = 0
 
@@ -320,9 +324,12 @@ def test_result_credits_follow_source_order_when_earlier_discovery_is_slow(monke
         client = SlowFirstStart()
         adapter = configured(
             client,
+            embedding_replica_discovery=False,
+            embedding_replicas=[{"model": "embed_0"}, {"model": "embed_1"}],
             embedding_request_parallelism=2,
             embedding_queue_size=2,
             embedding_batch_wait_sec=0,
+            embedding_capacity_limits=True,
             embedding_max_pending_bytes=1024,
             token_count_parallelism=1,
             timeout=5,

@@ -139,6 +139,7 @@ def test_rejection_metadata_obeys_retained_result_limit_and_drains():
     client = ContractClient(1)
     adapter = configured(
         client,
+        embedding_capacity_limits=True,
         embedding_max_pending_bytes=2048,
         embedding_batch_wait_sec=0,
         embedding_request_parallelism=1,
@@ -252,6 +253,7 @@ def test_paused_all_rejected_windows_keep_bounded_credits_and_resume_on_release(
         embedding_batch_wait_sec=0,
         embedding_request_parallelism=1,
         embedding_queue_size=7,
+        embedding_capacity_limits=True,
         embedding_max_pending_bytes=4096,
         timeout=5,
     )

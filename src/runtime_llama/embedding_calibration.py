@@ -37,9 +37,6 @@ CATEGORY_SAFETY_FACTOR = 0.80
 MIXED_SAFETY_FACTOR = 0.90
 _CORPUS_SCHEMA = "runtime-llama-calibration-corpus-v2"
 _PROFILE_SCHEMA = "runtime-llama-embedding-calibration-v1"
-_MAX_CACHE_BYTES = 128 * 1024
-_MAX_CORPUS_FILE_BYTES = 16 * 1024 * 1024
-_MAX_TEXT_CHARACTERS = 32000
 _FLIGHT_LOCK = Lock()
 _FLIGHTS: dict[tuple[str, str], Event] = {}
 
@@ -101,8 +98,8 @@ class CalibrationProfile:
         return mean * factor
 
     def max_input_chars(self, context_tokens: int, category: str = "mixed") -> int:
-        if type(context_tokens) is not int or not 0 < context_tokens <= 2**31 - 1:
-            raise ValueError("context_tokens must be a positive bounded integer")
+        if type(context_tokens) is not int or context_tokens <= 0:
+            raise ValueError("context_tokens must be a positive integer")
         return math.floor(context_tokens * self.safe_chars_per_token(category))
 
 
@@ -116,10 +113,10 @@ def _corpus_error():
     return LLMBackendError("llamacpp_embedding_calibration_invalid_corpus")
 
 
-def _read_bounded(resource, limit):
+def _read_bounded(resource, limit=None):
     with resource.open("rb") as stream:
-        result = stream.read(limit + 1)
-    if len(result) > limit:
+        result = stream.read() if limit is None else stream.read(limit + 1)
+    if limit is not None and len(result) > limit:
         raise _corpus_error()
     return result
 
@@ -129,7 +126,7 @@ def _load_manifest(check: Callable[[], None]):
     check()
     directory = resources.files("runtime_llama").joinpath("calibration_corpus")
     try:
-        manifest = json.loads(_read_bounded(directory.joinpath("manifest.json"), 32768))
+        manifest = json.loads(_read_bounded(directory.joinpath("manifest.json")))
         categories = manifest["categories"]
         if (
             manifest["schema"] != _CORPUS_SCHEMA
@@ -159,7 +156,7 @@ def _load_manifest(check: Callable[[], None]):
                 or type(description["count"]) is not int
                 or description["count"] != 500
                 or type(description["bytes"]) is not int
-                or not 0 < description["bytes"] <= _MAX_CORPUS_FILE_BYTES
+                or description["bytes"] <= 0
                 or type(description["total_characters"]) is not int
                 or description["total_characters"] <= 0
             ):
@@ -179,9 +176,7 @@ def _load_corpus(check: Callable[[], None]):
         for category in CALIBRATION_CATEGORIES:
             check()
             description = manifest["categories"][category]
-            payload = _read_bounded(
-                directory.joinpath(description["file"]), _MAX_CORPUS_FILE_BYTES
-            )
+            payload = _read_bounded(directory.joinpath(description["file"]))
             if (
                 len(payload) != description["bytes"]
                 or hashlib.sha256(payload).hexdigest() != description["sha256"]
@@ -203,7 +198,7 @@ def _load_corpus(check: Callable[[], None]):
                     or type(record["language"]) is not str
                     or not record["language"]
                     or type(record["text"]) is not str
-                    or not 0 < len(record["text"]) <= _MAX_TEXT_CHARACTERS
+                    or not record["text"]
                     or record["id"] in seen_ids
                     or record["text"] in seen_texts
                 ):
@@ -224,17 +219,27 @@ def _load_corpus(check: Callable[[], None]):
 def _binding_payload(binding: dict) -> dict:
     """Accept JSON builtins only, avoiding consumer callbacks during cache I/O."""
 
-    def validate(value, depth=0):
-        if depth > 8:
-            raise ValueError("embedding calibration binding is too deeply nested")
-        if type(value) is dict:
-            if any(type(key) is not str for key in value):
-                raise ValueError("embedding calibration binding keys must be strings")
-            for item in value.values():
-                validate(item, depth + 1)
-        elif type(value) is list:
-            for item in value:
-                validate(item, depth + 1)
+    active = set()
+
+    def validate(value):
+        if type(value) in (dict, list):
+            marker = id(value)
+            if marker in active:
+                raise ValueError("embedding calibration binding contains a cycle")
+            active.add(marker)
+            try:
+                if type(value) is dict:
+                    if any(type(key) is not str for key in value):
+                        raise ValueError(
+                            "embedding calibration binding keys must be strings"
+                        )
+                    items = value.values()
+                else:
+                    items = value
+                for item in items:
+                    validate(item)
+            finally:
+                active.remove(marker)
         elif value is not None and type(value) not in (str, int, float, bool):
             raise ValueError("embedding calibration binding must contain JSON builtins")
 
@@ -242,8 +247,6 @@ def _binding_payload(binding: dict) -> dict:
         raise ValueError("embedding calibration binding must be a nonempty dictionary")
     validate(binding)
     encoded = _canonical(binding)
-    if len(encoded) > 32768:
-        raise ValueError("embedding calibration binding is too large")
     return json.loads(encoded)
 
 
@@ -268,17 +271,16 @@ def _decode_stats(value, expected_count, expected_characters):
     if type(value) is not dict or set(value) != fields:
         raise ValueError("invalid calibration statistics")
     for field in ("sample_count", "total_characters", "total_tokens"):
-        if type(value[field]) is not int or not 0 < value[field] <= 2**53:
+        if type(value[field]) is not int or value[field] <= 0:
             raise ValueError("invalid calibration integer")
     if (
         value["sample_count"] != expected_count
         or value["total_characters"] != expected_characters
-        or value["total_tokens"] > expected_count * (2**31 - 1)
     ):
         raise ValueError("calibration statistics do not match the corpus")
     for field in fields - {"sample_count", "total_characters", "total_tokens"}:
         if type(value[field]) not in (int, float) or not (
-            math.isfinite(value[field]) and 0 < value[field] <= _MAX_TEXT_CHARACTERS
+            math.isfinite(value[field]) and 0 < value[field] <= expected_characters
         ):
             raise ValueError("invalid calibration ratio")
     minimum, maximum = value["min_chars_per_token"], value["max_chars_per_token"]
@@ -298,9 +300,7 @@ def _decode_stats(value, expected_count, expected_characters):
 def _load_cached(path, manifest, binding, profile_id):
     try:
         with path.open("rb") as stream:
-            data = stream.read(_MAX_CACHE_BYTES + 1)
-        if len(data) > _MAX_CACHE_BYTES:
-            return None
+            data = stream.read()
         value = json.loads(data)
         if (
             type(value) is not dict
@@ -448,7 +448,7 @@ def _calibrate(records, tokenize, check, workers):
         check()
         count = tokenize(record.text)
         check()
-        if type(count) is not int or not 0 < count <= 2**31 - 1:
+        if type(count) is not int or count <= 0:
             raise LLMBackendError("llamacpp_embedding_calibration_invalid_token_count")
         return record.category, len(record.text), count
 
@@ -556,8 +556,8 @@ def load_or_calibrate(
     Cold persistence is checked before any remote tokenization; a complete
     readable cache does not require write permission.
     """
-    if type(workers) is not int or not 1 <= workers <= 32:
-        raise ValueError("calibration workers must be between 1 and 32")
+    if type(workers) is not int or workers <= 0:
+        raise ValueError("calibration workers must be a positive integer")
     if not callable(tokenize) or not callable(check):
         raise TypeError("calibration requires tokenize and check callbacks")
     if validate is not None and not callable(validate):

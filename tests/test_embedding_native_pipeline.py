@@ -217,6 +217,7 @@ def test_preparation_credit_releases_while_charged_http_rows_bound_lookahead():
         batch_size=1,
         embedding_request_parallelism=1,
         embedding_queue_size=0,
+        embedding_capacity_limits=True,
         embedding_max_pending_bytes=1024,
         # This test isolates working-record pressure across eight admitted
         # owners; admission outside H has separate coverage below.
@@ -478,6 +479,8 @@ def test_close_drains_pending_preparation_and_all_global_admission_waiters():
         batch_size=1,
         embedding_request_parallelism=1,
         embedding_queue_size=0,
+        embedding_capacity_limits=True,
+        embedding_max_pending_owners=1,
         timeout=5,
     )
     try:

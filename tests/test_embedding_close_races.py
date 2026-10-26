@@ -25,6 +25,7 @@ def test_close_during_pending_work_preserves_typed_first_failure(
         embedding_request_parallelism=1,
         embedding_queue_size=0,
         # This case targets engine-queued work, distinct from H admission.
+        embedding_capacity_limits=True,
         embedding_max_pending_owners=2 if phase == "queued" else 1,
     )
     metadata_entered, release_metadata = Event(), Event()
@@ -154,6 +155,7 @@ def test_close_stops_sync_owner_waiting_before_engine_registration():
         token_count_parallelism=1,
         embedding_request_parallelism=1,
         embedding_queue_size=0,
+        embedding_capacity_limits=True,
         embedding_max_pending_owners=1,
     )
     try:

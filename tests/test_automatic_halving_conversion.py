@@ -87,7 +87,7 @@ def test_task_cancellation_during_conversion_waits_for_worker_and_drains(
             release.set()
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(pending, 2)
-            assert stream._closed and stream._delegate._closed
+            assert stream._closed and stream._delegate is None
             assert not service._streams and not client.token_calls
             assert service._adapter._engine.snapshot()["result_reserved_bytes"] == 0
         finally:

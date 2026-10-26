@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import CancelledError
 from dataclasses import asdict, dataclass, field
+from functools import wraps
 import math
 import json
 import os
@@ -86,14 +87,28 @@ class _TextInputs(Sequence):
         return self.prefix + str(self.texts[self.indices[index]]), self.input_type
 
 
+def _release_exception_frames(function):
+    """Retained public errors must not keep completed SDK executions alive."""
+
+    @wraps(function)
+    def invoke(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        except BaseException as failure:
+            PersistentEmbeddingEngine._detach_worker_tracebacks(failure)
+            raise failure.with_traceback(None)
+        finally:
+            args = kwargs = None
+
+    return invoke
+
+
 @dataclass
 class _Replica:
     model: str
     max_in_flight: int
     configured_max_input_tokens: int | None
     batch_token_limit: int | None
-    adaptive_batch_size: int
-    recovery_ceiling: int
     replica_id: int | None = None
     identity: ReplicaIdentity | None = None
     context_length: int | None = None
@@ -105,10 +120,6 @@ class _Replica:
     props_identity_verified: bool = False
     vocab_size: int | None = None
     accepted_aliases: set[str] = field(default_factory=set)
-    recovery_window: int = 32
-    recovery_successes: int = 0
-    reductions: int = 0
-    generation: int = 0
     lock: Any = field(default_factory=Lock)
 
 
@@ -151,7 +162,7 @@ class _DirectEmbeddingPolicy:
 
     content_sha256: str
     embedding_sha256: str
-    tokenizer_build: str
+    tokenizer_build: str | None
     policy: str
     prefix: str
 
@@ -164,10 +175,12 @@ class _DirectEmbeddingPolicy:
                 or any(char not in "0123456789abcdef" for char in value)
             ):
                 raise ValueError(f"{name} must be a lowercase SHA-256 digest")
-        for name in ("tokenizer_build", "policy"):
-            value = getattr(self, name)
-            if not isinstance(value, str) or not value:
-                raise ValueError(f"{name} must be a nonempty string")
+        if self.tokenizer_build is not None and (
+            not isinstance(self.tokenizer_build, str) or not self.tokenizer_build
+        ):
+            raise ValueError("tokenizer_build must be a nonempty string or None")
+        if not isinstance(self.policy, str) or not self.policy:
+            raise ValueError("policy must be a nonempty string")
         if not isinstance(self.prefix, str):
             raise ValueError("prefix must be a string")
 
@@ -352,9 +365,6 @@ class _BatchCall:
 class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
     """Validate embeddings from a server whose runtime policy remains external."""
 
-    _BATCH_RECOVERY_SUCCESS_WINDOW = 32
-    _BATCH_RECOVERY_MAX_WINDOW = 1024
-
     def __init__(
         self, profile: AdapterProfile, *, client: LlamaCppClient | None = None
     ) -> None:
@@ -371,53 +381,52 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         self.role_id = profile.role_id
         self.model_name = profile.model
         self.base_url = profile.base_url
-        self.batch_size = profile.batch_size or 32
+        self.batch_size = profile.batch_size
         self.embedding_batch_wait_sec = _finite(
             getattr(profile, "embedding_batch_wait_sec", 0.0),
             "embedding_batch_wait_sec",
         )
         if self.embedding_batch_wait_sec < 0:
             raise ValueError("embedding_batch_wait_sec must be nonnegative")
-        self.embedding_max_pending_bytes = getattr(
-            profile, "embedding_max_pending_bytes", 64 * 1024 * 1024
+        self.embedding_capacity_limits = getattr(
+            profile, "embedding_capacity_limits", False
         )
-        self.embedding_max_pending_tokens = getattr(
-            profile, "embedding_max_pending_tokens", 1_048_576
+
+        def capacity(name):
+            value = getattr(profile, name, None)
+            if (
+                name.startswith("embedding_preparation_cache_")
+                or name == "embedding_queue_size"
+            ):
+                if value is not None:
+                    _nonnegative_int(value, name)
+            else:
+                _positive_int(value, name)
+            return value if self.embedding_capacity_limits else None
+
+        self.embedding_max_pending_bytes = capacity("embedding_max_pending_bytes")
+        self.embedding_max_pending_tokens = capacity("embedding_max_pending_tokens")
+        self.embedding_max_request_bytes = capacity("embedding_max_request_bytes")
+        self.embedding_max_response_bytes = capacity("embedding_max_response_bytes")
+        self.embedding_max_handoff_bytes = capacity("embedding_max_handoff_bytes")
+        self.embedding_isolation_max_requests = capacity(
+            "embedding_isolation_max_requests"
         )
-        self.embedding_max_request_bytes = getattr(
-            profile, "embedding_max_request_bytes", 8 * 1024 * 1024
+        self.embedding_preparation_cache_entries = capacity(
+            "embedding_preparation_cache_entries"
         )
-        self.embedding_max_response_bytes = getattr(
-            profile, "embedding_max_response_bytes", 8 * 1024 * 1024
+        self.embedding_preparation_cache_bytes = capacity(
+            "embedding_preparation_cache_bytes"
         )
-        self.embedding_isolation_max_requests = _positive_int(
-            getattr(profile, "embedding_isolation_max_requests", 512),
-            "embedding_isolation_max_requests",
-        )
-        if self.embedding_isolation_max_requests is None:
-            raise ValueError(
-                "embedding_isolation_max_requests must be a positive integer"
-            )
-        if (
-            _positive_int(
-                self.embedding_max_response_bytes, "embedding_max_response_bytes"
-            )
-            is None
-        ):
-            raise ValueError("embedding_max_response_bytes must be a positive integer")
-        self.embedding_preparation_cache_entries = _nonnegative_int(
-            getattr(profile, "embedding_preparation_cache_entries", 1024),
-            "embedding_preparation_cache_entries",
-        )
-        self.embedding_preparation_cache_bytes = _nonnegative_int(
-            getattr(profile, "embedding_preparation_cache_bytes", 8 * 1024 * 1024),
-            "embedding_preparation_cache_bytes",
-        )
+        configured_replicas = getattr(profile, "embedding_replicas", ())
+        self._dynamic_tokenizers = profile.token_count_parallelism is None
         self.embedding_input_format = getattr(profile, "embedding_input_format", "auto")
         if self.embedding_input_format not in ("auto", "text", "tokens"):
             raise ValueError("embedding_input_format must be auto, text or tokens")
         self.batch_token_limit = profile.batch_token_limit
-        self.token_count_parallelism = int(profile.token_count_parallelism or 1)
+        self.token_count_parallelism = profile.token_count_parallelism or max(
+            1, len(configured_replicas)
+        )
         self.normalize = bool(profile.normalize)
         self.configured_max_input_tokens = profile.max_input_tokens
         self.embedding_dim = int(profile.dimension or 0)
@@ -453,32 +462,25 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         self._calls_condition = Condition(self._calls_lock)
         self._calls: set[_Call] = set()
         self._async_window_bridge = None
-        self._tokenizer_permits = BoundedSemaphore(self.token_count_parallelism)
+        self._tokenizer_permits = (
+            None
+            if self._dynamic_tokenizers
+            else BoundedSemaphore(self.token_count_parallelism)
+        )
         self._preparation_key = secrets.token_bytes(32)
         self._preparation_cache = PreparationCache(
             max_entries=self.embedding_preparation_cache_entries,
-            max_bytes=max(
-                0,
-                min(
-                    self.embedding_preparation_cache_bytes,
-                    self.embedding_max_pending_bytes // 4,
-                ),
-            ),
+            max_bytes=self.embedding_preparation_cache_bytes,
+            enabled=getattr(profile, "embedding_preparation_cache_enabled", False),
         )
         self._dimension_lock = Lock()
         self._direct_token_accounting = Event()
         self._requested_embedding_parallelism = getattr(
             profile, "embedding_request_parallelism", None
         )
-        self.embedding_queue_size = int(getattr(profile, "embedding_queue_size", 16))
-        self.embedding_control_parallelism = max(
-            1, min(4, self._requested_embedding_parallelism or 2)
-        )
-        self.embedding_max_pending_owners = getattr(
-            profile, "embedding_max_pending_owners", None
-        ) or max(
-            1, (self._requested_embedding_parallelism or 2) + self.embedding_queue_size
-        )
+        self.embedding_queue_size = capacity("embedding_queue_size")
+        self.embedding_control_parallelism = max(1, len(configured_replicas))
+        self.embedding_max_pending_owners = capacity("embedding_max_pending_owners")
         self._intake = EmbeddingIntake(
             self.embedding_max_pending_owners, self.embedding_max_pending_bytes
         )
@@ -509,8 +511,6 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 1,
                 replica.max_input_tokens,
                 replica.batch_token_limit,
-                self.batch_size,
-                self.batch_size,
             )
             for replica in configured_replicas
         } or {
@@ -519,8 +519,6 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 1,
                 None,
                 None,
-                self.batch_size,
-                self.batch_size,
             )
         }
         self._primary = next(iter(self._replicas.values()))
@@ -660,8 +658,6 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                             1,
                             self._minimum(*(r.max_input_tokens for r in configured)),
                             self._minimum(*(r.batch_token_limit for r in configured)),
-                            self.batch_size,
-                            self.batch_size,
                             replica_id=self._replica_ids[key],
                             identity=pool.identity,
                             accepted_aliases=set(observed.aliases),
@@ -676,7 +672,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                     retired = [
                         key for key in self._replica_ids if key not in active_keys
                     ]
-                    for key in retired[:-1024]:
+                    for key in retired:
                         del self._replica_ids[key]
                     scheduler = EmbeddingScheduler(
                         self._requested_embedding_parallelism,
@@ -696,6 +692,9 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                     previous_scheduler = self._scheduler
                     self._scheduler = scheduler
                     self.embedding_request_parallelism = scheduler.parallelism
+                    self.embedding_control_parallelism = max(1, len(replicas))
+                    if self._dynamic_tokenizers:
+                        self.token_count_parallelism = max(1, len(replicas))
                     self._replicas = replicas
                     self._primary = next(iter(replicas.values()))
                     self._loaded_context_length = None
@@ -1135,7 +1134,8 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         }
         # JSON escaping and the tokenizer envelope also consume wire bytes.
         if (
-            len(json.dumps(payload, ensure_ascii=True))
+            self.embedding_max_request_bytes is not None
+            and len(json.dumps(payload, ensure_ascii=True))
             > self.embedding_max_request_bytes
         ):
             raise LLMBackendError("llamacpp_embedding_request_bytes_limit")
@@ -1143,8 +1143,11 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         try:
             while not acquired:
                 call.check()
-                acquired = self._tokenizer_permits.acquire(
-                    timeout=min(0.05, call.remaining())
+                acquired = (
+                    self._tokenizer_permits is None
+                    or self._tokenizer_permits.acquire(
+                        timeout=min(0.05, call.remaining())
+                    )
                 )
             result = self._http_call(
                 "tokenize",
@@ -1170,29 +1173,25 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 raise LLMBackendError("llamacpp_embedding_invalid_tokenization")
             return tuple(tokens)
         finally:
-            if acquired:
+            if acquired and self._tokenizer_permits is not None:
                 self._tokenizer_permits.release()
 
     def _token_count(self, text: str, replica: _Replica, call: _Call) -> int:
         return len(self._tokenize_input(text, replica, call))
 
     def _engine_response_options(self, call=None):
-        # Custom clients own decoding and may not expose the native bound.
-        return (
-            {
-                "max_response_bytes": min(
-                    self.embedding_max_response_bytes,
-                    getattr(
-                        call,
-                        "_embedding_response_limit",
-                        self.embedding_max_response_bytes,
-                    ),
-                )
-            }
-            if isinstance(self._client, _NATIVE_CLIENT_CLASS)
-            or getattr(self._client, "supports_bounded_json", False) is True
-            else {}
+        limit = self._minimum(
+            self.embedding_max_response_bytes,
+            getattr(call, "_embedding_response_limit", None),
         )
+        if limit is None:
+            return {}
+        if (
+            isinstance(self._client, _NATIVE_CLIENT_CLASS)
+            or getattr(self._client, "supports_bounded_json", False) is True
+        ):
+            return {"max_response_bytes": limit}
+        raise LLMBackendError("llamacpp_embedding_explicit_response_limit_unsupported")
 
     def _embedding_input(self, texts, records, replica, observation):
         if records is not None and any(
@@ -1256,15 +1255,12 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 raise LLMBackendError("llamacpp_embedding_invalid_direct_input")
             text, input_type = item
             self._validate_direct_observation(direct, input_type, replica, observation)
-            context_limit = self._minimum(
-                context_limit, observation.native_microbatch_tokens
-            )
             if not text.startswith(direct.prefix):
                 raise LLMBackendError("llamacpp_embedding_direct_prefix_mismatch")
             # The direct path never measures or estimates this input. Reserve
             # a complete observed input allowance solely for bounded intake.
             # The native server remains authoritative for actual token usage.
-            reservation = context_limit
+            reservation = 0
             call.check()
             return _DirectInput(
                 text=text,
@@ -1429,35 +1425,12 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             )
         return [indexed[index] for index in range(expected_count)]
 
-    def _tighten_adaptive_batch_size(self, value: int, *, replica: _Replica) -> None:
-        with replica.lock:
-            current = replica.adaptive_batch_size
-            if value < current:
-                replica.adaptive_batch_size = max(1, value)
-                if replica.reductions:
-                    replica.recovery_window = min(
-                        self._BATCH_RECOVERY_MAX_WINDOW, replica.recovery_window * 2
-                    )
-                replica.reductions += 1
-                replica.recovery_successes = 0
-                replica.generation += 1
-
-    def _record_batch_success(
-        self, size: int, generation: int, replica: _Replica
-    ) -> None:
-        with replica.lock:
-            current, ceiling = replica.adaptive_batch_size, replica.recovery_ceiling
-            if generation != replica.generation or current >= ceiling or size < current:
-                return
-            replica.recovery_successes += 1
-            if replica.recovery_successes >= replica.recovery_window:
-                replica.adaptive_batch_size = min(ceiling, current * 2)
-                replica.recovery_successes = 0
-                replica.generation += 1
-
-    def _current_batch_size(self, remaining: int, replica: _Replica) -> int:
-        with replica.lock:
-            return min(remaining, replica.adaptive_batch_size)
+    def _current_batch_size(
+        self, remaining: int | None, replica: _Replica
+    ) -> int | None:
+        # A token-fit failure constrains only that POST's inputs. It does not
+        # establish a text-count limit for future requests with different text.
+        return remaining
 
     def _request_batch_adaptive(
         self,
@@ -1566,8 +1539,6 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                         return
             if cancel is not None and cancel():
                 raise LLMCancelledError()
-            with replica.lock:
-                generation = replica.generation
             post_call = (
                 _BatchCall(owners[index] for index in indices)
                 if isolation is not None and owners
@@ -1582,7 +1553,10 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                     current_timeout = post_call.remaining()
                     post_cancel = post_call.probe
                 if isolation is not None:
-                    if isolation[0] >= self.embedding_isolation_max_requests:
+                    if (
+                        self.embedding_isolation_max_requests is not None
+                        and isolation[0] >= self.embedding_isolation_max_requests
+                    ):
                         raise LLMBackendError(
                             "llamacpp_embedding_isolation_request_limit"
                         ) from isolation[1]
@@ -1677,9 +1651,6 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 ):
                     raise
                 midpoint = size // 2
-                self._tighten_adaptive_batch_size(
-                    max(midpoint, size - midpoint), replica=replica
-                )
                 send(indices[:midpoint], True)
                 send(indices[midpoint:], True)
                 return
@@ -1687,8 +1658,6 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             for index, vector in zip(indices, vectors):
                 results[index] = vector
             pending.difference_update(indices)
-            if not recovering:
-                self._record_batch_success(len(indices), generation, replica)
 
         send(tuple(range(len(texts))), recovery_child, observation)
         # A withdrawn shared owner has no result. Its empty internal row is
@@ -1885,7 +1854,10 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             [record.text for record in records], records, replica, observation
         )
         wire_bytes = len(json.dumps({"input": wire, "model": model}, ensure_ascii=True))
-        if wire_bytes > self.embedding_max_request_bytes:
+        if (
+            self.embedding_max_request_bytes is not None
+            and wire_bytes > self.embedding_max_request_bytes
+        ):
             raise LLMBackendError("llamacpp_embedding_request_bytes_exceeded")
         vectors = self._request_batch_adaptive(
             [record.text for record in records],
@@ -2006,6 +1978,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             self._engine_finish(call, False)
             raise
 
+    @_release_exception_frames
     def _execute(self, inputs, *, operation, timeout, cancel, call=None):
         call = _Call(self, cancel, timeout) if call is None else call
         future = None
@@ -2053,6 +2026,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             lease.release()
             raise
 
+    @_release_exception_frames
     def embed_texts(
         self,
         texts: list[str],
@@ -2096,11 +2070,13 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             raise LLMBackendError("llamacpp_embedding_direct_identity_unverified")
         if identity.key != expected or observation.identity_key != expected:
             raise LLMBackendError("llamacpp_embedding_direct_identity_changed")
-        if observation.tokenizer_build != policy.tokenizer_build:
+        if (
+            policy.tokenizer_build is not None
+            and observation.tokenizer_build != policy.tokenizer_build
+        ):
             raise LLMBackendError("llamacpp_embedding_direct_tokenizer_changed")
-        if observation.context_token_limit is None:
-            raise LLMBackendError("llamacpp_embedding_direct_context_unknown")
 
+    @_release_exception_frames
     def _embed_texts_direct(
         self,
         texts,
@@ -2133,7 +2109,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         *,
         policy: _DirectEmbeddingPolicy,
         input_type="document",
-        max_pending_windows=2,
+        max_pending_windows=None,
         timeout=None,
         cancel=None,
         close_source=False,
@@ -2191,12 +2167,33 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
     def _stream_release_result(self, call):
         self._engine.release_result(call)
 
+    def aiter_texts(
+        self,
+        texts,
+        *,
+        input_type="document",
+        timeout=None,
+        cancel=None,
+        close_source=False,
+    ):
+        """Return per-occurrence progressive results without caller-made windows."""
+        from runtime_llama.embedding_records import stream_text_records
+
+        return stream_text_records(
+            self,
+            texts,
+            input_type=input_type,
+            timeout=timeout,
+            cancel=cancel,
+            close_source=close_source,
+        )
+
     def astream_texts(
         self,
         windows: AsyncIterable[Sequence[str]],
         *,
         input_type: Literal["document", "query", "raw"] = "document",
-        max_pending_windows: int = 2,
+        max_pending_windows: int | None = None,
         timeout: float | None = None,
         cancel: CancellationProbe | None = None,
         close_source: bool = False,
@@ -2217,7 +2214,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         self,
         windows: AsyncIterable[Sequence[PreparedEmbeddingInput]],
         *,
-        max_pending_windows: int = 2,
+        max_pending_windows: int | None = None,
         timeout: float | None = None,
         cancel: CancellationProbe | None = None,
         close_source: bool = False,
@@ -2237,6 +2234,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         """Drain async intake/source ownership, then shared HTTP work off-loop."""
         await _close_embedding_adapter(self)
 
+    @_release_exception_frames
     def prepare_texts(
         self,
         texts: Sequence[str],
@@ -2270,6 +2268,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             [text], input_type="query", timeout=timeout, cancel=cancel
         )[0]
 
+    @_release_exception_frames
     def embed_prepared(
         self,
         inputs: Sequence[PreparedEmbeddingInput],
@@ -2399,6 +2398,10 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
     def _engine_health_snapshot(self):
         snapshot = self._engine.snapshot()
         snapshot["intake"] = self._intake.snapshot()
+        snapshot["capacity_limits_enabled"] = self.embedding_capacity_limits
+        snapshot["preparation_cache_enabled"] = getattr(
+            self.profile, "embedding_preparation_cache_enabled", False
+        )
         snapshot["http_metrics"] = self._http_metrics.snapshot()
         snapshot["control_json_bounds"] = (
             "owned_reader"
@@ -2409,8 +2412,8 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         )
         if self._direct_token_accounting.is_set():
             snapshot = dict(snapshot)
-            snapshot["token_accounting"] = "may_include_context_reservations"
-            snapshot["preparation_work_includes_direct_reservations"] = True
+            snapshot["token_accounting"] = "exact_preparation_only_direct_unknown"
+            snapshot["preparation_work_includes_direct_reservations"] = False
         return snapshot
 
     def health_status(self) -> dict[str, Any]:
@@ -2459,12 +2462,10 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                     "replica_id": replica.replica_id,
                     "readiness": readiness["models"][model],
                     "max_in_flight": replica.max_in_flight,
-                    "effective_batch_size": replica.adaptive_batch_size,
+                    "effective_batch_size": self.batch_size,
                     "batch_recovery": {
-                        "ceiling": replica.recovery_ceiling,
-                        "successes": replica.recovery_successes,
-                        "success_window": replica.recovery_window,
-                        "reductions": replica.reductions,
+                        "scope": "failed-native-post-only",
+                        "persistent_text_cap": None,
                     },
                     "configured_max_input_tokens": replica.configured_max_input_tokens,
                     "batch_token_limit": self._minimum(

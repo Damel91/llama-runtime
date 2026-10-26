@@ -421,7 +421,7 @@ def test_router_catalog_without_status_never_selects_an_unloaded_alias():
         runtime.close()
 
 
-def test_ids_survive_catalog_order_and_topology_replacement():
+def test_ids_survive_catalog_order_but_retired_alias_state_is_released():
     client = Client()
     runtime = adapter(client)
     try:
@@ -441,7 +441,7 @@ def test_ids_survive_catalog_order_and_topology_replacement():
         client.catalog = [entry("embed_0"), entry("embed_1")]
         assert (
             runtime.health_status()["replicas"]["embed_0"]["replica_id"]
-            == original["embed_0"]
+            > changed["embed_2"]["replica_id"]
         )
     finally:
         runtime.close()

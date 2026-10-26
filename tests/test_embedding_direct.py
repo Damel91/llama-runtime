@@ -78,8 +78,10 @@ def test_direct_511_texts_skip_tokenizer_and_preserve_balanced_order(make_adapte
     assert len({model for model, _ in client.embedding_calls}) == 2
     assert all(client.alias_peak[model] <= 1 for model in client.alias_peak)
     status = adapter.health_status()
-    assert status["engine"]["token_accounting"] == "may_include_context_reservations"
-    assert status["engine"]["preparation_work_includes_direct_reservations"] is True
+    assert (
+        status["engine"]["token_accounting"] == "exact_preparation_only_direct_unknown"
+    )
+    assert status["engine"]["preparation_work_includes_direct_reservations"] is False
     assert_drained(adapter, client)
 
 
@@ -135,9 +137,7 @@ def test_cold_direct_call_needs_no_calibration_or_tokenizer(make_adapter, monkey
     assert client.embedding_calls == [("embed_0", ("cold input",))]
 
 
-def test_direct_records_reserve_context_without_inspecting_source_length(
-    make_adapter, monkeypatch
-):
+def test_direct_records_do_not_invent_token_counts(make_adapter, monkeypatch):
     adapter, client = make_adapter(embedding_prefixes={"document": "long prefix: "})
     seen = []
     prepare = adapter._engine_prepare
@@ -153,7 +153,7 @@ def test_direct_records_reserve_context_without_inspecting_source_length(
     assert adapter._embed_texts_direct(incoming, policy=chosen) == [
         vector(chosen.prefix + text) for text in incoming
     ]
-    assert [item.reserved_tokens for item in seen] == [2048, 2048, 2048]
+    assert [item.reserved_tokens for item in seen] == [0, 0, 0]
     assert all(item.token_count == item.reserved_tokens for item in seen)
     assert all(type(item) is _DirectInput for item in seen)
     assert all(item._token_ids is None for item in seen)
@@ -161,8 +161,8 @@ def test_direct_records_reserve_context_without_inspecting_source_length(
     assert not client.token_calls
 
 
-@pytest.mark.parametrize(("budget", "expected"), [(4096, [2, 2]), (8192, [4])])
-def test_context_reservations_conservatively_pack_explicit_http_budget(
+@pytest.mark.parametrize(("budget", "expected"), [(4096, [4]), (8192, [4])])
+def test_direct_text_does_not_fabricate_counts_for_a_token_budget(
     make_adapter, budget, expected
 ):
     adapter, client = make_adapter(
@@ -203,7 +203,7 @@ def test_unverified_alias_fallback_is_not_accepted_for_automatic_mode(make_adapt
     assert not client.token_calls and not client.embedding_calls
 
 
-def test_missing_loaded_context_is_explicit_failure(make_adapter, monkeypatch):
+def test_direct_embedding_does_not_require_loaded_context(make_adapter, monkeypatch):
     adapter, client = make_adapter()
     original = client.props
 
@@ -213,13 +213,15 @@ def test_missing_loaded_context_is_explicit_failure(make_adapter, monkeypatch):
         return result
 
     monkeypatch.setattr(client, "props", props)
-    with pytest.raises(LLMBackendError, match="direct_context_unknown"):
-        adapter._embed_texts_direct(["source"], policy=policy(adapter))
-    assert not client.token_calls and not client.embedding_calls
+    assert adapter._embed_texts_direct(["source"], policy=policy(adapter)) == [
+        vector("source")
+    ]
+    assert not client.token_calls
+    assert len(client.embedding_calls) == 1
 
 
 @pytest.mark.parametrize("native_limit", [False, True])
-def test_direct_reservation_uses_context_and_microbatch_without_local_admission(
+def test_direct_does_not_reserve_context_or_microbatch_tokens(
     make_adapter, monkeypatch, native_limit
 ):
     client = ContractClient(1, context=100)
@@ -239,7 +241,7 @@ def test_direct_reservation_uses_context_and_microbatch_without_local_admission(
     monkeypatch.setattr(adapter, "_engine_prepare", record)
     text = "x" * 31
     assert adapter._embed_texts_direct([text], policy=policy(adapter)) == [vector(text)]
-    assert reservations == [10]
+    assert reservations == [0]
     assert not client.token_calls
     assert client.embedding_calls == [("embed_0", (text,))]
 
@@ -354,7 +356,9 @@ def test_native_rejection_retains_typed_direct_outcome_without_tokenization(
 
 
 def test_byte_bound_is_still_hard_for_direct_source(make_adapter):
-    adapter, client = make_adapter(embedding_max_request_bytes=80)
+    adapter, client = make_adapter(
+        embedding_capacity_limits=True, embedding_max_request_bytes=80
+    )
     with pytest.raises(LLMBackendError, match="request_bytes"):
         adapter._embed_texts_direct(["🙂" * 30], policy=policy(adapter))
     assert not client.token_calls and not client.embedding_calls
@@ -436,7 +440,7 @@ def test_async_direct_stream_is_inert_ordered_and_uses_shared_bridge():
                 [vector("東京🙂")],
                 [vector("last")],
             ]
-            assert stream._bridge is adapter._stream_bridge()
+            assert stream._bridge is None
             assert not client.token_calls
             assert_drained(adapter, client)
         finally:

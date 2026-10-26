@@ -145,7 +145,7 @@ def test_zero_budget_disables_retention(entries, budget):
     assert cache.snapshot()["entries"] == cache.snapshot()["bytes"] == 0
 
 
-@pytest.mark.parametrize("invalid", [-1, True, 1.5, None, "10"])
+@pytest.mark.parametrize("invalid", [-1, True, 1.5, "10"])
 @pytest.mark.parametrize("field", ["max_entries", "max_bytes"])
 def test_invalid_budgets_are_rejected(field, invalid):
     values = {"max_entries": 10, "max_bytes": 1024}
@@ -260,6 +260,7 @@ def test_close_clears_storage_and_rejects_late_worker_publication():
 def test_snapshot_is_detached_and_has_only_bounded_storage_counters():
     cache = PreparationCache(2, 8192)
     assert set(cache.snapshot()) == {
+        "enabled",
         "entries",
         "bytes",
         "peak_entries",

@@ -137,21 +137,22 @@ def test_total_error_body_budget_cannot_be_extended_by_slow_bytes(endpoint, styl
     assert len(observed) == 1
 
 
-def test_error_body_budget_is_capped_below_large_finite_http_timeout(endpoint):
-    release = Event()
-    endpoint.release_on_cleanup(release)
-
+def test_error_body_uses_original_deadline_without_hidden_five_second_cap(endpoint):
     def respond(handler, _body):
-        error_headers(handler, length=100)
-        release.wait(timeout=7)
+        body = json.dumps(OVERFLOW).encode()
+        error_headers(handler, length=len(body))
+        time.sleep(5.1)
+        handler.wfile.write(body)
+        handler.wfile.flush()
 
     base_url, observed = endpoint(respond)
-    with LlamaCppClient(base_url, timeout=20, trust_env=False) as api:
+    with LlamaCppClient(base_url, timeout=8, trust_env=False) as api:
         stream = api.complete("fixture", stream=True, idle_timeout=None)
         with ThreadPoolExecutor(max_workers=1) as executor:
             with pytest.raises(ClientHTTPError) as caught:
-                executor.submit(list, stream).result(timeout=6)
-        assert_status_only(caught.value)
+                executor.submit(list, stream).result(timeout=7)
+        assert caught.value.error_code == "400"
+        assert caught.value.error_type == "exceed_context_size_error"
         assert not api._streams and not watchdogs()
     assert len(observed) == 1
 
@@ -180,7 +181,7 @@ def test_unusable_or_excessive_body_keeps_status_and_discards_partial_codes(
             }
         }
     ).encode()
-    kwargs = {}
+    kwargs = {"max_response_bytes": 65536}
     if variant in {"caller-limit", "truncated"}:
         body = json.dumps(OVERFLOW).encode()
     if variant == "caller-limit":

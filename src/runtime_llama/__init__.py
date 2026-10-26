@@ -83,9 +83,13 @@ from runtime_llama.adapters.embedding import LlamaCppEmbeddingAdapter
 from runtime_llama.factory import build_adapter, build_embedding_adapter
 from runtime_llama.tailnet import TailnetConfig, TailnetError, TailnetHelper
 
-__version__ = "0.14.0"
+from runtime_llama.embedding_records import EmbeddingRecordResult, EmbeddingRecordStream
+
+__version__ = "0.15.0"
 
 __all__ = [
+    "EmbeddingRecordResult",
+    "EmbeddingRecordStream",
     "EmbeddingSourceSpan",
     "EmbeddingHalvingInput",
     "EmbeddingCompletedInput",

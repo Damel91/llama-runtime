@@ -278,22 +278,20 @@ def test_progressive_balanced_quotas_and_odd_tails_preserve_every_position(
 
 
 @pytest.mark.parametrize("native_batch", [4, 2048])
-@pytest.mark.parametrize("trigger", ["http-budget", "adaptive-cap"])
-def test_progressive_flush_respects_explicit_http_budget_or_adaptive_text_cap(
+@pytest.mark.parametrize("trigger", ["http-budget", "text-target"])
+def test_progressive_flush_respects_explicit_http_budget_or_text_target(
     monkeypatch, native_batch, trigger
 ):
     client = TokenClient(1, native_batch=native_batch)
     incoming = texts(5)
     client.counts.update(dict.fromkeys(incoming, 5))
     adapter = adapter_for(
-        client, batch_token_limit=10 if trigger == "http-budget" else None
+        client,
+        batch_token_limit=10 if trigger == "http-budget" else None,
+        batch_size=2 if trigger == "text-target" else 128,
     )
     monkeypatch.setattr(adapter, "_batch_now", BatchClock())
     try:
-        if trigger == "adaptive-cap":
-            adapter.health_status()
-            for replica in adapter._replicas.values():
-                replica.adaptive_batch_size = 2
         assert adapter.embed_texts(incoming) == [vector(text) for text in incoming]
         assert sorted(wire_text_count(payload) for _, payload in client.wire_calls) == [
             1,
@@ -329,7 +327,10 @@ def test_progressive_ready_pressure_remains_bounded_across_shared_callers(monkey
         embedding_request_parallelism=1,
         embedding_queue_size=0,
         token_count_parallelism=1,
+        embedding_capacity_limits=True,
+        embedding_max_pending_owners=1,
         embedding_max_pending_bytes=4096,
+        embedding_max_pending_tokens=1024,
         timeout=5,
     )
     monkeypatch.setattr(adapter, "_batch_now", BatchClock())
@@ -586,7 +587,7 @@ def test_prepared_ids_follow_fresh_topology_identity_and_tokenizer_observation(c
 @pytest.mark.parametrize("retain_cache", [True, False])
 def test_count_only_prepared_record_uses_verified_cached_ids_or_text(retain_cache):
     client = TokenClient(1)
-    adapter = adapter_for(client)
+    adapter = adapter_for(client, embedding_preparation_cache_enabled=retain_cache)
     try:
         record = adapter.prepare_query("legacy-count")
         fields = asdict(record)

@@ -421,7 +421,12 @@ def test_global_intake_budget_is_reserved_before_blocking_source_pulls():
     async def scenario():
         client = ContractClient(1)
         adapter = configured(
-            client, embedding_request_parallelism=1, embedding_queue_size=0, timeout=5
+            client,
+            embedding_request_parallelism=1,
+            embedding_queue_size=0,
+            embedding_capacity_limits=True,
+            embedding_max_pending_owners=1,
+            timeout=5,
         )
         sources = [WindowSource([[str(index)]], block_at=0) for index in range(5)]
         streams = [
@@ -659,6 +664,7 @@ def test_concurrent_streams_and_sync_caller_share_caps_and_cancel_locally():
             client,
             embedding_request_parallelism=2,
             embedding_queue_size=0,
+            embedding_capacity_limits=True,
             embedding_max_pending_owners=3,
             timeout=5,
         )
@@ -919,7 +925,12 @@ def test_global_intake_lease_survives_cancellation_until_source_pull_drains(
 
         client = ContractClient(1)
         adapter = configured(
-            client, embedding_request_parallelism=1, embedding_queue_size=0, timeout=5
+            client,
+            embedding_request_parallelism=1,
+            embedding_queue_size=0,
+            embedding_capacity_limits=True,
+            embedding_max_pending_owners=1,
+            timeout=5,
         )
         source_a = SlowCancelledPull([["never"]], block_at=0)
         source_b = WindowSource([["after-drain"]])
@@ -1046,7 +1057,12 @@ def test_window_timeout_starts_before_global_admission_without_cancelling_owner(
     async def scenario():
         client = ContractClient(1)
         adapter = configured(
-            client, embedding_request_parallelism=1, embedding_queue_size=0, timeout=5
+            client,
+            embedding_request_parallelism=1,
+            embedding_queue_size=0,
+            embedding_capacity_limits=True,
+            embedding_max_pending_owners=1,
+            timeout=5,
         )
         first_source = WindowSource([["owner"]], block_at=0)
         second_source = WindowSource([["waiting"]])
@@ -1329,6 +1345,7 @@ def test_paused_consumer_holds_result_budget_and_delivery_allows_progress():
             client,
             embedding_request_parallelism=1,
             embedding_queue_size=7,
+            embedding_capacity_limits=True,
             embedding_max_pending_bytes=1024,
             embedding_max_pending_tokens=100,
             embedding_batch_wait_sec=0,
@@ -1414,6 +1431,7 @@ def test_async_window_over_result_lower_bound_fails_before_tokenization():
             dimension=None,
             embedding_request_parallelism=1,
             embedding_queue_size=0,
+            embedding_capacity_limits=True,
             embedding_max_pending_bytes=512,
             embedding_batch_wait_sec=0,
         )

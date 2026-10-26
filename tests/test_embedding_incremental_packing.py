@@ -46,6 +46,7 @@ def engine_fixture(*, cap=128, request_bytes=1_000_000, native=True):
         embedding_batch_wait_sec=0,
         embedding_input_format="auto" if native else "text",
         embedding_max_request_bytes=request_bytes,
+        embedding_max_response_bytes=None,
         batch_size=cap,
         _scheduler=scheduler,
         _client=SimpleNamespace(supports_embedding_token_ids=native),
@@ -333,6 +334,7 @@ def late_owner_round(*, late_status="ready", forced=None):
         elif late_status == "blocked":
             later.blocked_at = (engine._progress, engine._metadata_availability)
         elif late_status == "uncredited":
+            engine.max_bytes = 65536
             later.retain_result = True
         elif late_status == "failed":
             later.call.failure = RuntimeError("cancelled late owner")

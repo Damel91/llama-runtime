@@ -54,7 +54,7 @@ def test_invalid_parallelism_rejected_before_http(value):
         profile(embedding_request_parallelism=value)
 
 
-@pytest.mark.parametrize("value", [None, -1, True, 1.5, "2"])
+@pytest.mark.parametrize("value", [-1, True, 1.5, "2"])
 def test_invalid_queue_capacity_rejected_before_http(value):
     with pytest.raises(ValueError):
         profile(embedding_queue_size=value)
@@ -91,15 +91,24 @@ def test_replica_objects_are_accepted():
     assert profile(embedding_replicas=(replica,)).embedding_replicas == (replica,)
 
 
-def test_persistent_queue_defaults_are_finite_without_a_required_timer():
+def test_persistent_queue_and_cache_have_no_implicit_capacity_defaults():
     parsed = profile()
     assert parsed.embedding_batch_wait_sec == 0.0
-    assert parsed.embedding_max_pending_bytes == 64 * 1024 * 1024
-    assert parsed.embedding_max_pending_tokens == 1024 * 1024
-    assert parsed.embedding_max_request_bytes == 8 * 1024 * 1024
-    assert parsed.embedding_max_response_bytes == 8 * 1024 * 1024
-    assert parsed.embedding_preparation_cache_entries == 1024
-    assert parsed.embedding_preparation_cache_bytes == 8 * 1024 * 1024
+    assert parsed.embedding_capacity_limits is False
+    assert parsed.embedding_preparation_cache_enabled is False
+    for name in (
+        "batch_size",
+        "embedding_queue_size",
+        "embedding_max_pending_owners",
+        "embedding_max_pending_bytes",
+        "embedding_max_pending_tokens",
+        "embedding_max_request_bytes",
+        "embedding_max_response_bytes",
+        "embedding_max_handoff_bytes",
+        "embedding_preparation_cache_entries",
+        "embedding_preparation_cache_bytes",
+    ):
+        assert getattr(parsed, name) is None
 
 
 @pytest.mark.parametrize(
@@ -111,7 +120,7 @@ def test_persistent_queue_defaults_are_finite_without_a_required_timer():
         "embedding_max_response_bytes",
     ],
 )
-@pytest.mark.parametrize("value", [None, 0, -1, True, 1.5, "1024"])
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "1024"])
 def test_queue_resource_limits_require_positive_integer_budgets(name, value):
     with pytest.raises(ValueError, match=name):
         profile(**{name: value})
@@ -134,6 +143,8 @@ def test_queue_budgets_are_configurable_without_changing_model_identity(monkeypa
 
     monkeypatch.setattr("requests.Session.request", forbidden)
     settings = {
+        "embedding_capacity_limits": True,
+        "embedding_preparation_cache_enabled": True,
         "embedding_max_pending_bytes": 2 * 1024 * 1024,
         "embedding_max_pending_tokens": 32768,
         "embedding_max_request_bytes": 256 * 1024,
@@ -154,10 +165,33 @@ def test_queue_budgets_are_configurable_without_changing_model_identity(monkeypa
 @pytest.mark.parametrize(
     "name", ["embedding_preparation_cache_entries", "embedding_preparation_cache_bytes"]
 )
-@pytest.mark.parametrize("value", [None, -1, True, 1.5, "1024", float("inf")])
+@pytest.mark.parametrize("value", [-1, True, 1.5, "1024", float("inf")])
 def test_preparation_cache_budgets_require_nonnegative_integers(name, value):
     with pytest.raises(ValueError, match=name):
         profile(**{name: value})
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "embedding_queue_size",
+        "embedding_max_pending_owners",
+        "embedding_max_pending_bytes",
+        "embedding_max_pending_tokens",
+        "embedding_max_request_bytes",
+        "embedding_max_response_bytes",
+        "embedding_max_handoff_bytes",
+        "embedding_preparation_cache_entries",
+        "embedding_preparation_cache_bytes",
+    ],
+)
+def test_explicit_none_capacity_remains_unrestricted_after_opt_in(name):
+    parsed = profile(
+        embedding_capacity_limits=True,
+        embedding_preparation_cache_enabled=True,
+        **{name: None},
+    )
+    assert getattr(parsed, name) is None
 
 
 def test_response_and_cache_configuration_inherits_defaults_with_role_overrides():

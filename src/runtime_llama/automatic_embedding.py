@@ -18,6 +18,7 @@ from pathlib import Path
 import sys
 from threading import Condition, Event, Lock, local
 import time
+import weakref
 
 from runtime_llama._proxy import normalize_proxy_url
 from runtime_llama.adapters.embedding import (
@@ -118,22 +119,25 @@ class AutomaticEmbeddingConfig:
     embedding_prefixes: EmbeddingPrefixes | Mapping[str, str] | None = None
     timeout: float = 120.0
     calibration_timeout: float = 600.0
-    calibration_workers: int = 2
-    batch_size: int = 256
+    calibration_workers: int | None = None
+    batch_size: int | None = None
     request_parallelism: int | None = None
     embedding_max_pending_owners: int | None = None
-    queue_size: int = 16
+    queue_size: int | None = None
     normalize: bool = True
     api_key: str | None = field(default=None, repr=False)
     api_key_env: str | None = field(default=None, repr=False)
     verify_ssl: bool = True
     proxy_url: str | None = field(default=None, repr=False)
     trust_env: bool = False
-    embedding_max_pending_bytes: int = 64 * 1024 * 1024
-    embedding_max_pending_tokens: int = 1024 * 1024
-    embedding_max_request_bytes: int = 8 * 1024 * 1024
-    embedding_max_response_bytes: int = 8 * 1024 * 1024
-    embedding_isolation_max_requests: int = 512
+    embedding_capacity_limits: bool = False
+    embedding_preparation_cache_enabled: bool = False
+    embedding_max_pending_bytes: int | None = None
+    embedding_max_pending_tokens: int | None = None
+    embedding_max_request_bytes: int | None = None
+    embedding_max_response_bytes: int | None = None
+    embedding_max_handoff_bytes: int | None = None
+    embedding_isolation_max_requests: int | None = None
     http_connection_policy: str = "close"
 
     def __post_init__(self):
@@ -160,27 +164,31 @@ class AutomaticEmbeddingConfig:
         for name in ("timeout", "calibration_timeout"):
             _finite(getattr(self, name), name, positive=True)
         for name in ("batch_size", "calibration_workers"):
-            if _positive_int(getattr(self, name), name) is None:
-                raise ValueError(f"{name} must be a positive integer")
+            _positive_int(getattr(self, name), name)
         _positive_int(self.request_parallelism, "request_parallelism")
         _positive_int(self.embedding_max_pending_owners, "embedding_max_pending_owners")
-        if self.calibration_workers > 32:
-            raise ValueError("calibration_workers must not exceed 32")
-        _nonnegative_int(self.queue_size, "queue_size")
+        if self.queue_size is not None:
+            _nonnegative_int(self.queue_size, "queue_size")
         for name in (
             "embedding_max_pending_bytes",
             "embedding_max_pending_tokens",
             "embedding_max_request_bytes",
             "embedding_max_response_bytes",
+            "embedding_max_handoff_bytes",
             "embedding_isolation_max_requests",
         ):
-            if _positive_int(getattr(self, name), name) is None:
-                raise ValueError(f"{name} must be a positive integer")
+            _positive_int(getattr(self, name), name)
         if not isinstance(
             self.http_connection_policy, str
         ) or self.http_connection_policy not in ("close", "reuse"):
             raise ValueError("http_connection_policy must be close or reuse")
-        for name in ("normalize", "verify_ssl", "trust_env"):
+        for name in (
+            "normalize",
+            "verify_ssl",
+            "trust_env",
+            "embedding_capacity_limits",
+            "embedding_preparation_cache_enabled",
+        ):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be a boolean")
         for name in ("api_key", "api_key_env"):
@@ -277,7 +285,7 @@ class AutomaticEmbeddingService:
         self._closing = Event()
         self._closed = False
         self._operations = set()
-        self._streams = set()
+        self._streams = weakref.WeakSet()
         self._callback_state = local()
 
     def _invoke_cancel(self, callback):
@@ -328,7 +336,11 @@ class AutomaticEmbeddingService:
     def _response_options(self, client):
         # Injected clients own decoding unless they explicitly support bounds.
         return (
-            {"max_response_bytes": self.config.embedding_max_response_bytes}
+            {
+                "max_response_bytes": self.config.embedding_max_response_bytes
+                if self.config.embedding_capacity_limits
+                else None
+            }
             if isinstance(client, _NATIVE_CLIENT_CLASS)
             or getattr(client, "supports_bounded_json", False) is True
             else {}
@@ -481,7 +493,10 @@ class AutomaticEmbeddingService:
                 "embedding_max_pending_tokens": self.config.embedding_max_pending_tokens,
                 "embedding_max_request_bytes": self.config.embedding_max_request_bytes,
                 "embedding_max_response_bytes": self.config.embedding_max_response_bytes,
+                "embedding_max_handoff_bytes": self.config.embedding_max_handoff_bytes,
                 "embedding_isolation_max_requests": self.config.embedding_isolation_max_requests,
+                "embedding_capacity_limits": self.config.embedding_capacity_limits,
+                "embedding_preparation_cache_enabled": self.config.embedding_preparation_cache_enabled,
             },
         )
         with self._condition:
@@ -498,7 +513,7 @@ class AutomaticEmbeddingService:
             )
             return adapter
 
-    def _binding(self, adapter, context, input_type):
+    def _binding(self, adapter, context, input_type, *, require_tokenizer=False):
         observations = context.observations
         if not observations or any(
             observation.identity_key != self._identity.key
@@ -507,9 +522,11 @@ class AutomaticEmbeddingService:
             raise LLMBackendError("llamacpp_automatic_embedding_identity_changed")
         builds = {observation.tokenizer_build for observation in observations.values()}
         vocabs = {observation.vocab_size for observation in observations.values()}
-        if len(builds) != 1 or None in builds or len(vocabs) != 1:
+        if require_tokenizer and (
+            len(builds) != 1 or len(vocabs) != 1 or None in builds
+        ):
             raise LLMBackendError("llamacpp_automatic_embedding_inconsistent_tokenizer")
-        if any(
+        if require_tokenizer and any(
             observation.context_token_limit is None
             for observation in observations.values()
         ):
@@ -517,20 +534,20 @@ class AutomaticEmbeddingService:
         binding = {
             "content_sha256": self._identity.content_sha256,
             "embedding_sha256": self._identity.embedding_sha256,
-            "tokenizer_build": next(iter(builds)),
-            "vocab_size": next(iter(vocabs)),
+            "tokenizer_build": next(iter(builds)) if len(builds) == 1 else None,
+            "vocab_size": next(iter(vocabs)) if len(vocabs) == 1 else None,
             "policy": adapter._policy(input_type),
             "input_type": input_type,
             "prefix": ""
             if input_type == "raw"
             else getattr(self._prefixes, input_type),
         }
-        budget = min(
-            adapter._minimum(
-                observation.context_token_limit, observation.native_microbatch_tokens
-            )
+        known_contexts = [
+            observation.context_token_limit
             for observation in observations.values()
-        )
+            if observation.context_token_limit is not None
+        ]
+        budget = min(known_contexts) if known_contexts else None
         return binding, budget
 
     @contextmanager
@@ -576,7 +593,9 @@ class AutomaticEmbeddingService:
                         )
             try:
                 call.check()
-                binding, budget = self._binding(adapter, context, input_type)
+                binding, budget = self._binding(
+                    adapter, context, input_type, require_tokenizer=calibration
+                )
                 # The pool reference, rather than this initialization mutex,
                 # protects the observed generation through calibration/use.
                 # Ordinary direct requests can progress during a budget probe.
@@ -765,7 +784,7 @@ class AutomaticEmbeddingService:
                         context.joined, observations, context.conservative
                     )
                     fresh_binding, fresh_budget = self._binding(
-                        adapter, fresh_context, input_type
+                        adapter, fresh_context, input_type, require_tokenizer=True
                     )
                     if fresh_binding != binding:
                         raise LLMBackendError(
@@ -819,7 +838,7 @@ class AutomaticEmbeddingService:
                             binding,
                             tokenize,
                             call.check,
-                            workers=self.config.calibration_workers,
+                            workers=self.config.calibration_workers or len(models),
                             validate=validate,
                         )
                         operation.check()
@@ -847,7 +866,9 @@ class AutomaticEmbeddingService:
         category = _category(self.config.category if category is None else category)
         bound = self.config.timeout if timeout is None else timeout
         with self._operation(bound, cancel) as operation:
-            with self._observed(operation, input_type=input_type) as observed:
+            with self._observed(
+                operation, input_type=input_type, calibration=True
+            ) as observed:
                 _, _, _, binding, context_budget, _ = observed
                 profile = self._cached_profile(binding, operation)
                 snapshot = self._budget_snapshot(
@@ -901,12 +922,33 @@ class AutomaticEmbeddingService:
             [text], input_type="query", timeout=timeout, cancel=cancel
         )[0]
 
+    def aiter_texts(
+        self,
+        texts,
+        *,
+        input_type="document",
+        timeout=None,
+        cancel=None,
+        close_source=False,
+    ):
+        """Stream indexed embeddings without consumer-managed HTTP windows."""
+        from runtime_llama.embedding_records import stream_text_records
+
+        return stream_text_records(
+            self,
+            texts,
+            input_type=input_type,
+            timeout=timeout,
+            cancel=cancel,
+            close_source=close_source,
+        )
+
     def astream_texts(
         self,
         windows,
         *,
         input_type="document",
-        max_pending_windows=2,
+        max_pending_windows=None,
         timeout=None,
         cancel=None,
         close_source=False,
@@ -997,8 +1039,8 @@ class _AutomaticEmbeddingStream:
     ):
         if not callable(getattr(windows, "__aiter__", None)):
             raise ValueError("windows must be an async iterable")
-        if _positive_int(max_pending_windows, "max_pending_windows") is None:
-            raise ValueError("max_pending_windows must be a positive integer")
+        if max_pending_windows is not None:
+            _positive_int(max_pending_windows, "max_pending_windows")
         if timeout is not None:
             _finite(timeout, "timeout", positive=True)
         if cancel is not None and not callable(cancel):
@@ -1015,6 +1057,13 @@ class _AutomaticEmbeddingStream:
         self._closed = self._next_active = False
         self._callback_failure = None
         self._admission_scope = _EmbeddingAdmissionScope()
+        reference = weakref.ref(self)
+
+        def cancelled():
+            owner = reference()
+            return owner is None or owner._cancelled()
+
+        self._cancel_probe = cancelled
 
     def __aiter__(self):
         return self
@@ -1048,7 +1097,7 @@ class _AutomaticEmbeddingStream:
 
     def _initialize(self):
         timeout = self.service.config.timeout if self.timeout is None else self.timeout
-        with self.service._operation(timeout, self._cancelled) as operation:
+        with self.service._operation(timeout, self._cancel_probe) as operation:
             return self.service._ready(
                 operation,
                 input_type=self.input_type,
@@ -1080,7 +1129,7 @@ class _AutomaticEmbeddingStream:
             timeout=self.service.config.timeout
             if self.timeout is None
             else self.timeout,
-            cancel=self._cancelled,
+            cancel=self._cancel_probe,
             close_source=self.close_source,
             admission_scope=self._admission_scope,
         )
@@ -1139,6 +1188,8 @@ class _AutomaticEmbeddingStream:
 
     async def aclose(self):
         self._check_loop()
+        if self._closed and self.service is None:
+            return
         self._closed = True
         self._stop.set()
 
@@ -1150,7 +1201,32 @@ class _AutomaticEmbeddingStream:
             if self._conversion is not None:
                 await asyncio.gather(self._conversion, return_exceptions=True)
             self._admission_scope.clear()
-            with self.service._condition:
-                self.service._streams.discard(self)
+            service = self.service
+            if service is not None:
+                with service._condition:
+                    service._streams.discard(self)
+            self._initialization = self._delegate = self._conversion = None
+            self.windows = self.cancel = self.service = None
+            self._status = None
 
         await _drain(cleanup())
+
+    def __del__(self):
+        if getattr(self, "_closed", True):
+            return
+        self._stop.set()
+        delegate = getattr(self, "_delegate", None)
+        if delegate is not None:
+            for window in tuple(delegate._pending):
+                window.call.stop.set()
+            adapter = getattr(delegate, "_adapter", None)
+            if adapter is not None:
+                adapter._engine.wake()
+        loop = getattr(self, "_loop", None)
+        if loop is not None and not loop.is_closed() and loop.is_running():
+            try:
+                loop.call_soon_threadsafe(
+                    lambda owner=self: loop.create_task(owner.aclose())
+                )
+            except RuntimeError:
+                pass

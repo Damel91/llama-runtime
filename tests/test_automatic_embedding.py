@@ -184,7 +184,7 @@ def test_task_prefixes_are_calibrated_separately_and_applied_once(
     assert len(service._adapter._replicas) == 2
 
 
-def test_loaded_context_and_microbatch_update_budget_without_recalibration(
+def test_loaded_context_updates_budget_but_microbatch_is_not_an_input_ceiling(
     make_service, calibration
 ):
     service, client = make_service()
@@ -196,7 +196,7 @@ def test_loaded_context_and_microbatch_update_budget_without_recalibration(
     for entry in client.catalog:
         entry["status"]["args"] += ["--ubatch-size", "256"]
     bounded = service.character_budget()
-    assert bounded.max_input_chars == math.floor(256 * 4 * 0.90)
+    assert bounded.max_input_chars == math.floor(4096 * 4 * 0.90)
     assert first.calibration_id == larger.calibration_id == bounded.calibration_id
     assert len(calibration) == 1
 
@@ -230,7 +230,9 @@ def test_build_change_recalibrates_and_inconsistent_builds_fail(
     assert len(calibration) == 2
     client.builds["embed_1"] = "another-build"
     status = service.status()
-    assert not status.available and "inconsistent_tokenizer" in status.reason
+    assert status.available
+    with pytest.raises(LLMBackendError, match="inconsistent_tokenizer"):
+        service.character_budget()
     assert len(calibration) == 2
 
 
@@ -411,7 +413,6 @@ def test_invalid_inputs_do_not_initialize_or_infer(make_service, calibration):
         {"timeout": 0},
         {"calibration_timeout": float("inf")},
         {"calibration_workers": True},
-        {"calibration_workers": 33},
         {"batch_size": 0},
         {"request_parallelism": 0},
         {"request_parallelism": True},
@@ -444,6 +445,7 @@ def test_config_auto_guard_and_owner_limit_survive_verified_discovery(
     service, client = make_service(
         request_parallelism=parallelism,
         embedding_max_pending_owners=owners,
+        embedding_capacity_limits=owners is not None,
     )
     assert service.config.request_parallelism == parallelism
     assert service.config.embedding_max_pending_owners == owners
@@ -490,7 +492,7 @@ def test_lazy_async_stream_is_direct_without_calibration_and_reuses_shared_engin
             ]
             assert not client.token_calls and not calibration
             assert not service._streams and not service._operations
-            assert stream._delegate._adapter is service._adapter
+            assert stream._delegate is None
         finally:
             await service.aclose()
         assert not client.closed
@@ -885,7 +887,7 @@ def test_waiting_budget_owner_refreshes_context_after_shared_calibration(
         "embedding_max_response_bytes",
     ],
 )
-@pytest.mark.parametrize("value", [0, -1, None, True, 1.5, "1024"])
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "1024"])
 def test_automatic_resource_budgets_reject_nonpositive_or_noninteger(name, value):
     with pytest.raises(ValueError, match=name):
         AutomaticEmbeddingConfig("http://runtime.example:8080", **{name: value})
@@ -893,17 +895,18 @@ def test_automatic_resource_budgets_reject_nonpositive_or_noninteger(name, value
 
 def test_automatic_resource_defaults_and_overrides_reach_existing_engine(make_service):
     defaults = AutomaticEmbeddingConfig("http://runtime.example:8080")
-    assert defaults.embedding_max_pending_bytes == 64 * 1024 * 1024
-    assert defaults.embedding_max_pending_tokens == 1024 * 1024
-    assert defaults.embedding_max_request_bytes == 8 * 1024 * 1024
-    assert defaults.embedding_max_response_bytes == 8 * 1024 * 1024
+    assert defaults.embedding_max_pending_bytes is None
+    assert defaults.embedding_max_pending_tokens is None
+    assert defaults.embedding_max_request_bytes is None
+    assert defaults.embedding_max_response_bytes is None
     configured = {
         "embedding_max_pending_bytes": 2 * 1024 * 1024,
         "embedding_max_pending_tokens": 8192,
         "embedding_max_request_bytes": 4096,
         "embedding_max_response_bytes": 16384,
     }
-    service, _ = make_service(**configured)
+    service, client = make_service(embedding_capacity_limits=True, **configured)
+    client.supports_bounded_json = True
     assert service.initialize().available
     for name, value in configured.items():
         assert getattr(service._adapter.profile, name) == value

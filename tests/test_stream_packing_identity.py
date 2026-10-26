@@ -85,6 +85,8 @@ def test_each_window_has_one_shared_group_but_its_own_call_and_future(
             stream = adapter.astream_texts(WindowSource(windows), input_type="raw")
         try:
             async with stream:
+                delegate = stream._delegate if kind == "direct" else stream
+                packing_group = delegate._packing_group
                 result = [window async for window in stream]
             assert result == [[vector(text) for text in window] for window in windows]
             calls = [call for call, _ in submissions]
@@ -93,8 +95,11 @@ def test_each_window_has_one_shared_group_but_its_own_call_and_future(
             assert len(set(calls)) == len({id(call.stop) for call in calls}) == 3
             assert len(set(futures)) == 3 and all(future.done() for future in futures)
             assert [call._window_index for call in calls] == [0, 1, 2]
-            delegate = stream._delegate if kind == "direct" else stream
-            assert all(call._packing_group is delegate._packing_group for call in calls)
+            assert all(call._packing_group is packing_group for call in calls)
+            assert delegate._packing_group is None
+            assert delegate._adapter is delegate._bridge is None
+            if kind == "direct":
+                assert stream._delegate is None
             if kind == "direct":
                 assert all(
                     call._packing_group is not call._admission_scope for call in calls
@@ -132,15 +137,19 @@ def test_mixed_streams_share_adapter_but_never_a_packing_identity(monkeypatch):
 
         async def consume(stream):
             async with stream:
-                return [window async for window in stream]
+                delegate = stream._delegate if stream is direct else stream
+                group = delegate._packing_group
+                return [window async for window in stream], group
 
         try:
-            assert await asyncio.gather(consume(exact), consume(direct)) == [
+            outputs = await asyncio.gather(consume(exact), consume(direct))
+            assert [result for result, _ in outputs] == [
                 [[vector("exact0")], [vector("exact1")]],
                 [[vector("direct0")], [vector("direct1")]],
             ]
             groups = {call._packing_group for call, _ in submissions}
-            assert groups == {exact._packing_group, direct._delegate._packing_group}
+            assert groups == {group for _, group in outputs}
+            assert exact._packing_group is None and direct._delegate is None
             assert len(groups) == 2
             assert len({call for call, _ in submissions}) == 4
             assert not adapter._calls and adapter._pool_users == 0

@@ -165,8 +165,10 @@ def assert_drained(service):
         "http_results_waiting",
     ):
         assert state[key] == 0, (key, state)
-    assert state["peak_pending_bytes"] <= adapter.embedding_max_pending_bytes
-    assert state["peak_pending_tokens"] <= adapter.embedding_max_pending_tokens
+    if adapter.embedding_max_pending_bytes is not None:
+        assert state["peak_pending_bytes"] <= adapter.embedding_max_pending_bytes
+    if adapter.embedding_max_pending_tokens is not None:
+        assert state["peak_pending_tokens"] <= adapter.embedding_max_pending_tokens
 
 
 def posts(seen):
@@ -174,7 +176,7 @@ def posts(seen):
 
 
 @pytest.mark.parametrize("compressed", [False, True])
-def test_public_default_response_cap_rejects_large_body_and_drains_without_replay(
+def test_public_explicit_response_cap_rejects_large_body_and_drains_without_replay(
     facade_endpoint, large_vectors, compressed
 ):
     expected, _ = large_vectors
@@ -182,7 +184,12 @@ def test_public_default_response_cap_rejects_large_body_and_drains_without_repla
     # Isolate the configured JSON cap from conservative decoded-vector and
     # handoff admission. This budget funds the same full 128-row wire payload
     # for both the rejecting 8 MiB and accepting 16 MiB configurations.
-    service = service_for(base_url, embedding_max_pending_bytes=512 * _MIB)
+    service = service_for(
+        base_url,
+        embedding_capacity_limits=True,
+        embedding_max_response_bytes=8 * _MIB,
+        embedding_max_pending_bytes=512 * _MIB,
+    )
     incoming = [f"item-{index:03}" for index in range(128)]
     try:
         warmup = service.embed_query("warmup")
@@ -208,6 +215,7 @@ def test_public_larger_response_cap_accepts_ordered_128_by_4096_vectors(
     base_url, seen, _ = facade_endpoint(large=True)
     service = service_for(
         base_url,
+        embedding_capacity_limits=True,
         embedding_max_response_bytes=16 * _MIB,
         embedding_max_pending_bytes=512 * _MIB,
     )
@@ -289,10 +297,8 @@ def test_public_injected_client_keeps_policy_and_ownership(facade_endpoint):
         client.close()
 
 
-@pytest.mark.parametrize(("limit", "cardinality"), [(None, 16), (65536 * 256, 256)])
-def test_public_pending_token_budget_controls_high_context_cardinality(
-    limit, cardinality
-):
+@pytest.mark.parametrize(("limit", "cardinality"), [(None, 256), (65536 * 256, 256)])
+def test_public_direct_inputs_do_not_reserve_a_whole_context_each(limit, cardinality):
     client = remote(replicas=1, context=65536)
     client.catalog[0]["status"]["args"] = [
         "llama-server",
@@ -328,15 +334,15 @@ def test_public_pending_token_budget_controls_high_context_cardinality(
         adapter = service._adapter
         state = adapter._engine_health_snapshot()
         assert state["pending_bytes"] == state["pending_tokens"] == 0
-        assert state["peak_pending_tokens"] <= (limit or 1024 * 1024)
-        assert state["peak_pending_bytes"] <= adapter.embedding_max_pending_bytes
+        assert state["peak_pending_tokens"] == 0
+        assert state["working_bytes_limit"] is None
         assert not adapter._calls
         assert adapter._scheduler.snapshot()["in_flight"] == 0
     finally:
         service.close()
 
 
-def test_high_context_owners_make_progress_with_bounded_reservations():
+def test_high_context_owners_share_explicit_batches_without_fake_token_charges():
     client = remote(replicas=1, context=65536)
     client.catalog[0]["status"]["args"] = [
         "llama-server",
@@ -350,6 +356,8 @@ def test_high_context_owners_make_progress_with_bounded_reservations():
         AutomaticEmbeddingConfig(
             base_url="http://runtime.invalid:8080",
             request_parallelism=1,
+            batch_size=4,
+            embedding_capacity_limits=True,
             embedding_max_pending_tokens=4 * 65536,
             embedding_max_pending_bytes=128 * 1024,
             normalize=False,
@@ -382,7 +390,7 @@ def test_high_context_owners_make_progress_with_bounded_reservations():
         )
         state = service._adapter._engine_health_snapshot()
         assert state["pending_bytes"] == state["pending_tokens"] == 0
-        assert state["peak_pending_tokens"] <= 4 * 65536
+        assert state["peak_pending_tokens"] == 0
         assert state["peak_pending_bytes"] <= 128 * 1024
         assert client.embed_active == 0 and not client.token_calls
     finally:

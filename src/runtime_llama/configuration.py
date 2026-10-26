@@ -281,19 +281,22 @@ class AdapterProfile:
     max_input_tokens: int | None = None
     embedding_request_parallelism: int | None = None
     embedding_max_pending_owners: int | None = None
-    embedding_queue_size: int = 16
+    embedding_queue_size: int | None = None
     embedding_replicas: tuple[EmbeddingReplicaConfig, ...] = ()
     embedding_prefixes: EmbeddingPrefixes = field(default_factory=EmbeddingPrefixes)
     embedding_replica_discovery: bool = False
     embedding_batch_wait_sec: float = 0.0
     embedding_input_format: str = "auto"
-    embedding_max_pending_bytes: int = 64 * 1024 * 1024
-    embedding_max_pending_tokens: int = 1024 * 1024
-    embedding_max_request_bytes: int = 8 * 1024 * 1024
-    embedding_max_response_bytes: int = 8 * 1024 * 1024
-    embedding_isolation_max_requests: int = 512
-    embedding_preparation_cache_entries: int = 1024
-    embedding_preparation_cache_bytes: int = 8 * 1024 * 1024
+    embedding_capacity_limits: bool = False
+    embedding_preparation_cache_enabled: bool = False
+    embedding_max_pending_bytes: int | None = None
+    embedding_max_pending_tokens: int | None = None
+    embedding_max_request_bytes: int | None = None
+    embedding_max_response_bytes: int | None = None
+    embedding_max_handoff_bytes: int | None = None
+    embedding_isolation_max_requests: int | None = None
+    embedding_preparation_cache_entries: int | None = None
+    embedding_preparation_cache_bytes: int | None = None
 
     def __post_init__(self) -> None:
         if self.adapter_type not in {"llm", "embedding"}:
@@ -318,15 +321,16 @@ class AdapterProfile:
             "embedding_max_pending_tokens",
             "embedding_max_request_bytes",
             "embedding_max_response_bytes",
+            "embedding_max_handoff_bytes",
             "embedding_isolation_max_requests",
         ):
-            if _positive_int(getattr(self, name), name) is None:
-                raise ValueError(f"{name} must be a positive integer")
+            _positive_int(getattr(self, name), name)
         for name in (
             "embedding_preparation_cache_entries",
             "embedding_preparation_cache_bytes",
         ):
-            _nonnegative_int(getattr(self, name), name)
+            if getattr(self, name) is not None:
+                _nonnegative_int(getattr(self, name), name)
         object.__setattr__(
             self,
             "embedding_batch_wait_sec",
@@ -339,6 +343,12 @@ class AdapterProfile:
             raise ValueError("embedding_input_format must be auto, text or tokens")
         if not isinstance(self.embedding_replica_discovery, bool):
             raise ValueError("embedding_replica_discovery must be boolean")
+        for name in (
+            "embedding_capacity_limits",
+            "embedding_preparation_cache_enabled",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be boolean")
         if self.adapter_type != "embedding" and self.embedding_replica_discovery:
             raise ValueError(
                 "embedding_replica_discovery requires an embedding profile"
@@ -347,12 +357,8 @@ class AdapterProfile:
             self.embedding_request_parallelism, "embedding_request_parallelism"
         )
         _positive_int(self.embedding_max_pending_owners, "embedding_max_pending_owners")
-        if (
-            isinstance(self.embedding_queue_size, bool)
-            or not isinstance(self.embedding_queue_size, int)
-            or self.embedding_queue_size < 0
-        ):
-            raise ValueError("embedding_queue_size must be a nonnegative integer")
+        if self.embedding_queue_size is not None:
+            _nonnegative_int(self.embedding_queue_size, "embedding_queue_size")
         if not isinstance(self.embedding_replicas, (tuple, list)):
             raise ValueError("embedding_replicas must be a sequence")
         replicas = tuple(
@@ -470,10 +476,13 @@ class AdapterProfile:
                 "embedding_replica_discovery",
                 "embedding_batch_wait_sec",
                 "embedding_input_format",
+                "embedding_capacity_limits",
+                "embedding_preparation_cache_enabled",
                 "embedding_max_pending_bytes",
                 "embedding_max_pending_tokens",
                 "embedding_max_request_bytes",
                 "embedding_max_response_bytes",
+                "embedding_max_handoff_bytes",
                 "embedding_isolation_max_requests",
                 "embedding_preparation_cache_entries",
                 "embedding_preparation_cache_bytes",

@@ -248,14 +248,36 @@ def test_invalid_state_is_not_silently_discarded_or_replaced(tmp_path, damage):
 
 
 @pytest.mark.parametrize("payload", [b"{", b"[]", b"x" * 16385, b'{"a":1,"a":2}'])
-def test_malformed_duplicate_or_oversized_state_does_not_reset_learning(
-    tmp_path, payload
-):
+def test_malformed_or_duplicate_state_does_not_reset_learning(tmp_path, payload):
     lower_learned_budget(tmp_path, binding(), 512, 100, check)
     state_path(tmp_path).write_bytes(payload)
     with pytest.raises(LLMBackendError, match="learned_budget_invalid"):
         lower_learned_budget(tmp_path, binding(), 512, 200, check)
     assert state_path(tmp_path).read_bytes() == payload
+
+
+def test_retained_invalid_state_error_does_not_retain_large_decoder_payload(tmp_path):
+    lower_learned_budget(tmp_path, binding(), 512, 100, check)
+    path = state_path(tmp_path)
+    payload = b'{"schema":"' + b"unclosed-state-value" * 2048
+    assert len(payload) > 16384
+    path.write_bytes(payload)
+    with pytest.raises(LLMBackendError, match="learned_budget_invalid") as caught:
+        load_learned_budget(tmp_path, binding(), 512, check)
+    error = caught.value
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    traceback = error.__traceback__
+    observed_reader = False
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if frame.f_code.co_name == "_read":
+            observed_reader = True
+            assert frame.f_locals["payload"] is None
+            assert frame.f_locals["value"] is None
+        traceback = traceback.tb_next
+    assert observed_reader
+    assert path.read_bytes() == payload
 
 
 def test_readable_state_load_does_not_need_write_permission(tmp_path, monkeypatch):
@@ -440,18 +462,36 @@ def test_waiting_on_another_process_lock_is_cancellable_and_does_not_modify_stat
     )
 
 
-@pytest.mark.parametrize("value", [0, -1, True, 1.5, None, "512", 2**31])
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, None, "512"])
 def test_invalid_context_is_rejected_without_creating_state(tmp_path, value):
     with pytest.raises(ValueError):
         lower_learned_budget(tmp_path, binding(), value, 100, check)
     assert not list(tmp_path.iterdir())
 
 
-@pytest.mark.parametrize("value", [0, -1, True, 1.5, None, "100", 2**53])
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, None, "100"])
 def test_invalid_character_ceiling_is_rejected_without_creating_state(tmp_path, value):
     with pytest.raises(ValueError):
         lower_learned_budget(tmp_path, binding(), 512, value, check)
     assert not list(tmp_path.iterdir())
+
+
+def test_budget_scalar_state_has_no_implicit_numeric_or_file_size_ceiling(tmp_path):
+    context, characters = 2**40, 2**60
+    identity = binding(vocab_size=2**40)
+    state = lower_learned_budget(tmp_path, identity, context, characters, check)
+    assert load_learned_budget(tmp_path, identity, context, check) == state
+    path = state_path(tmp_path, context, vocab_size=2**40)
+    value = json.loads(path.read_bytes())
+    value["budget_revision"] = 2**60
+    # Legal JSON whitespace is not a resource policy or a schema violation.
+    payload = json.dumps(value, indent=4096).encode()
+    assert len(payload) > 16384
+    path.write_bytes(payload)
+    loaded = load_learned_budget(tmp_path, identity, context, check)
+    assert loaded.budget_revision == 2**60
+    assert loaded.max_input_chars == characters
+    assert loaded.effective_context_tokens == context
 
 
 @pytest.mark.parametrize(

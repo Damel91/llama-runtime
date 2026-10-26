@@ -113,7 +113,7 @@ def test_failed_post_receipt_excludes_owner_pruned_before_native_post():
         assert not client.token_calls
 
 
-def test_receipt_contains_only_failed_http_subbatch_not_successful_or_unsent_rows():
+def test_rejection_isolates_failed_rows_without_replaying_successful_descendants():
     with direct_batch(context=10, batch_token_limit=20) as (
         adapter,
         client,
@@ -141,11 +141,11 @@ def test_receipt_contains_only_failed_http_subbatch_not_successful_or_unsent_row
         for index in (0, 1, 3, 4):
             assert result[index] == vector("doc: " + source[index])
         assert client.embedding_calls == [
+            ("embed_0", tuple("doc: " + text for text in source)),
             ("embed_0", ("doc: first", "doc: second")),
-            ("embed_0", ("doc: third", "doc: fourth")),
+            ("embed_0", ("doc: third", "doc: fourth", "doc: fifth")),
             ("embed_0", ("doc: third",)),
-            ("embed_0", ("doc: fourth",)),
-            ("embed_0", ("doc: fifth",)),
+            ("embed_0", ("doc: fourth", "doc: fifth")),
         ]
         assert not client.token_calls
 
