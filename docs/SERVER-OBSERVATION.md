@@ -8,7 +8,7 @@ been qualified by this document; see the separate
 [candidate verification record](verification/REPLICA-OWNERSHIP-CANDIDATE.md).
 
 The SDK lives in `runtime_llama.server_observation`. It supplies typed contracts
-and a bounded dispatch session for a consumer-supplied provider. It does not
+and a finite-deadline dispatch session for a consumer-supplied provider. It does not
 install a provider automatically in `LlamaCppEmbeddingAdapter` or add another
 embedding scheduler. A host using it must keep dispatch inside its existing
 shared replica lease, resource admission and result-ownership lifecycle.
@@ -50,8 +50,8 @@ credential scopes. This requires real producer enforcement, not only SDK types.
 | `ServerObservationProvider` | Provider protocol for negotiation, snapshot and embedding transport. |
 | `ServerObservationSession` | Finite-deadline dispatch, local revocation and drained provider-callback closure. |
 
-```python
-ServerObservationSession(scope, provider, *, max_response_bytes=8 * 1024 * 1024)
+```text
+ServerObservationSession(scope, provider, *, max_response_bytes=None)
 session.dispatch(inputs: tuple[str, ...], alias: str, *,
                  native, timeout: float, cancel=None)
 session.revoke()
@@ -61,13 +61,16 @@ session.close()
 The provider implements `snapshot(scope, *, timeout, cancel, cancel_wait,
 max_response_bytes)` and `embeddings(inputs, alias, *, expected, timeout,
 cancel, cancel_wait, max_response_bytes)`. The native callback accepts the same
-finite transport options. Provider transport must actually enforce response
-bounds and cancellation/drain; accepting a keyword alone does not prove that.
+finite timeout and optional response-byte policy. Provider transport must
+actually enforce any explicitly selected bounds and cancellation/drain;
+accepting a keyword alone does not prove that. Omitted response policy installs
+no substitute byte quota.
 All callbacks consume one original monotonic deadline, not a reset per phase.
 
-The SDK retains at most one immutable snapshot per session. Snapshot tuples
-are bounded; identifiers are bounded opaque values and do not contain raw
-credentials or private endpoint URLs. Scope mismatch, expiry or local revocation
+The SDK retains at most one immutable snapshot per session. Replica tuples
+and opaque identifiers have no arbitrary count or length ceiling; validation
+still rejects malformed values. They do not contain raw credentials or private
+endpoint URLs. Scope mismatch, expiry or local revocation
 invalidates reuse. A late response cannot revive a locally revoked generation.
 `revoke()` is a local safeguard, not evidence of a remote loading event.
 

@@ -20,8 +20,8 @@ the upstream package's bootstrap code. The Python distribution remains
 | History and tools | Structured messages, tool results with `tool_call_id`, tool schemas and tool-call deltas preserve names, identifiers and arguments. | The library returns tool calls; it does not execute them. |
 | Protections | Cooperative cancellation, including stream waits, timeouts, repetition detection and a visible-output limit derived from the budget. | The visible limit is a character estimate, not exact tokenization. Generation timeouts are not an overall deadline, and client closure does not prove remote inference has stopped. |
 | Usage and outcomes | Observed counters, unknown absent fields, terminal reasons and bounded diagnostics. Reading continues after `finish_reason` to collect final usage. | `[DONE]` ends transport only. A stream without `finish_reason` fails. Derived counters are marked, and tool tokens are not attributed to visible prose. |
-| Embedding | Exact pre-tokenization, text/token batch budgets, stable ordering, finite vectors, consistent dimensions and optional normalization. | `/tokenize`, `/props` and `/v1/embeddings` provide server capabilities. Configured/observed limits stay distinct. Inputs are never automatically truncated. |
-| Batch recovery | Adaptive splitting after structured HTTP 400 `exceed_context_size_error`, with gradual capacity recovery. | A generic 400, authentication failure or server error does not trigger splitting. An oversized single input remains an error. Transport has no hidden retries. |
+| Embedding | Optional exact preparation, automatic direct strings, optional text targets, ordered complete/progressive results, finite vectors, consistent dimensions and normalization. | Exact counts use `/tokenize`; ordinary automatic inputs do not. Context, native execution sizes and explicit HTTP policies stay distinct. Inputs are never silently truncated. |
+| Batch recovery | A recognized custom-client 400 splits only its failed POST; automatic 500 isolation retains successful vectors and returns lossless halves for rejected singleton inputs. | No persistent reduced target, ordinary per-input tokenization, saved-budget recalculation or ambiguous transport replay. A generic server error does not prove context overflow. |
 | MCP data | Data types and validation for integrations, calls, providers, events and results. | There is no MCP executor. Unsupported invocation methods are explicit; provider-specific legacy payloads are not declared llama.cpp APIs. |
 
 ## Operational boundaries
@@ -58,7 +58,9 @@ termination or improved token throughput. A complete model → authorized tool
 ## Additional contracts
 
 Embedding concurrency is independent of tokenization and shared across callers
-of an adapter, with a bounded queue and per-replica limits. Optional thinking
+of an adapter. Queue, owner and byte quotas are optional explicit policies,
+not inferred from host RAM. Default worker capacity follows verified replicas;
+one original POST lease per replica and explicit B/G policies remain. Optional thinking
 diagnostics are bounded and correlated per invocation without changing
 `reasoning_text`, budgets or protections. Concurrent JSON/SSE transport has
 explicit ownership. Model availability remains distinct from server
@@ -68,6 +70,7 @@ reachability. See [integration](INTEGRATION.md) and
 Automatic embedding discovery uses content and semantic identities published
 in Noxi's native catalog. The consumer selects one logical model without listing
 or counting instances. Each automatic replica permits one active request.
+Catalog/replica cardinality has no fixed application maximum.
 Context, GPU assignment and Flash Attention remain separate execution
 properties. Explicit replicas remain supported; see
 [replica discovery](AUTOMATIC-EMBEDDING-REPLICAS.md).
@@ -91,6 +94,15 @@ independent identity assertions and context provenance. The shared HTTP client
 adds optional decompressed JSON limits and explicit ambient-session policy.
 Existing generation and embedding APIs remain compatible; new deterministic
 checks do not establish live or consumer acceptance.
+
+Version 0.15.0 adds flat `aiter_texts()` delivery and removes implicit text,
+model and memory quotas. Legacy scalar values only apply behind
+`embedding_capacity_limits=True`; cache retention requires explicit enabling.
+Existing complete-list/window APIs remain. Finished inputs, results, Futures,
+tasks and topology generations release at ownership transfer or real drain,
+including abandoned iteration and retained public failures. This does not
+promise constant RSS for caller-held output or introduce automatic disk spill.
+See [current resource contracts](CONCURRENCY-AND-DIAGNOSTICS.md).
 
 ## Licensing and attribution
 

@@ -1,7 +1,7 @@
 # Consumer handoff: fixed budget and localized halving
 
-Applies to the `runtime-llama==0.13.0a1` prerelease. No consumer is modified
-or upgraded by this change. The installed package remains `runtime-llama`, with
+Describes the retained automatic recovery contract in `runtime-llama==0.15.0`,
+introduced in 0.13.0a1. No consumer is modified or upgraded by this guide. The installed package remains `runtime-llama`, with
 Python imports from `runtime_llama`.
 
 The [automatic API](AUTOMATIC-EMBEDDING.md) is the source of signatures and
@@ -11,8 +11,9 @@ this handoff concerns the automatic direct-text path only.
 ## Startup and normal ingestion
 
 1. Construct one shared `AutomaticEmbeddingService` using the endpoint and
-   bounded queue/HTTP settings. `batch_size=256` is a total text budget across
-   currently usable verified replicas, not 256 per replica.
+   any deliberately selected optional resource policies. `batch_size=256` is
+   an example total-text target across usable verified replicas, not an input
+   maximum or 256 per replica. Omission installs no replacement text target.
 2. Check availability and opaque `representation_id`. The consumer does not
    configure the number of copies, aliases or GPUs.
 3. If an initial character recommendation is required and the consumer has no
@@ -22,16 +23,17 @@ this handoff concerns the automatic direct-text path only.
    mixed 90%; a failed chunk never changes this value.
 4. Split source using that empirical character recommendation, preserving the
    consumer's AST/graph and lossless fragment identities. Send strings through
-   `embed_texts()` or `astream_texts()`, without per-chunk `prepare_*` calls.
+   `embed_texts()`, `astream_texts()` or flat `aiter_texts()`, without per-chunk
+   `prepare_*` calls.
 5. Persist vectors only with their actual source fragment identities and the
    matching representation. A changed loaded limit or representation requires
    the consumer to reassess its saved recommendation/index.
 
 ## Handling one failed window
 
-The following example handles one recovery round. Production consumers must
-bound the number of subsequent rounds, total work and deadline, and persist
-successful rounds safely. An isolated 500 does not establish that overflow was
+The following example handles one recovery round. Consumers own subsequent
+retry/splitting policy and persistence of successful rounds; library work
+retains its existing finite deadline and cancellation. An isolated 500 does not establish that overflow was
 the cause; splitting is a bounded recovery policy.
 
 ```python
@@ -92,7 +94,7 @@ the caller catches `EmbeddingChunkSplitRequiredError`; subsequent calls return
 subsequent original windows, without replay.
 
 ```python
-async with service.astream_texts(windows, max_pending_windows=2) as stream:
+async with service.astream_texts(windows) as stream:
     while True:
         try:
             vectors = await anext(stream)
@@ -113,6 +115,13 @@ finish local recovery before later windows, it can do so before the next
 an early break. Source windows remain delivery boundaries; compatible queued
 records may share scheduled HTTP requests across windows.
 
+The flat `aiter_texts()` API yields `EmbeddingRecordResult(index, embedding)`
+without caller windowing. A recoverable error keeps its type; `window_index`
+is the global flat record index, with nested source spans/indices relative to
+that occurrence. Explicit iteration can continue with later original records.
+Both forms use the same scheduler and default to no per-stream window quota;
+a positive `max_pending_windows` on the window API is a consumer choice.
+
 ## Integration constraints
 
 Keep AST splitting, byte/line offsets, parent/fragment IDs, graph writes and
@@ -124,5 +133,5 @@ consumer-side tokenizer loop or model-instance configuration is required.
 The older `EmbeddingInputOverflowError` exact-diagnostic type remains importable
 for compatibility but is no longer emitted by automatic native-500 recovery.
 A consumer must use the new partial-results contract before adopting this
-candidate. The existing numerical finding across physical replicas is separate
-from this functional handoff and remains open.
+contract. The earlier numerical finding across physical replicas remains a
+separate accepted profile limitation; it is not relabeled as a numerical pass.

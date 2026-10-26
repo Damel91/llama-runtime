@@ -1,6 +1,6 @@
 # Read-only model discovery
 
-Available in `runtime-llama` 0.5.0. The Python import remains `runtime_llama`.
+Introduced in 0.5.0; this guide describes `runtime-llama` 0.15.0. The Python import remains `runtime_llama`.
 This API observes an explicitly configured llama-server endpoint, including a
 remote host or VPN address. It neither starts the server nor selects, loads,
 downloads or runs a model.
@@ -35,8 +35,10 @@ def discover_models(
     timeout: float = 5.0,
     verify_ssl: bool = True,
     cancellation_probe: CancellationProbe | None = None,
-    max_response_bytes: int = 1_048_576,
-    max_models: int = 256,
+    max_response_bytes: int | None = None,
+    max_models: int | None = None,
+    proxy_url: str | None = None,
+    http_connection_policy: str = "close",
 ) -> ModelCatalog:
     ...
 ```
@@ -62,8 +64,8 @@ def discover_models(
 | `model.slots` | Slot count from matched direct-server root properties, if observed. |
 
 Each observed integer has `value` and `source`. Missing facts remain `None`.
-Positive integer observations are bounded to 2³¹−1. Names and aliases are bounded
-to 1,024 characters, aliases to 64 per entry and tags to 128 per entry. Malformed
+Positive integer observations retain their actual values. Names, aliases, tags
+and catalog cardinality have no arbitrary client count or length ceiling. Malformed
 supported fields, conflicting identity assertions and ambiguous aliases raise
 `LLMBackendError`; unsupported optional metadata/capability shapes produce fixed
 diagnostics. Raw model paths, arguments, presets and arbitrary properties are
@@ -117,9 +119,10 @@ are not applied. TLS verification is enabled by default; redirects and retries
 are disabled. Endpoints containing credentials, controls, whitespace, invalid
 ports, query strings or fragments are rejected without echoing their contents.
 
-`max_response_bytes` bounds each decompressed JSON response before buffer growth;
-its supported range is 1 byte to 16 MiB. `max_models` ranges from 1 to 4,096.
-Defaults are 1 MiB and 256 entries. There is no silent truncation. The lower-level
+`max_response_bytes` and `max_models` default to `None`. A caller can supply a
+positive integer to select an explicit per-response byte or catalog-count
+policy; omitted values install no replacement quotas or fixed maximum.
+There is no silent truncation. The lower-level
 `LlamaCppClient.request()`, `models()` and `props()` also accept an optional
 `max_response_bytes`; their default remains `None` for compatibility. The raw
 client's new keyword-only `trust_env` defaults to `True`, and borrowed sessions

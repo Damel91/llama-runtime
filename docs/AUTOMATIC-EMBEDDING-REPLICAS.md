@@ -59,7 +59,7 @@ Internal replica identifiers are monotonic operational identifiers; consumers
 should retain the stable content and semantic identities for indexes and
 caches instead.
 
-The current development contract admits **one original embedding POST per
+The 0.15.0 contract admits **one original embedding POST per
 verified canonical replica**. Missing/`None` `embedding_request_parallelism`
 uses all N replicas; a positive G limits original work to `min(N,G)`. Existing
 positive settings stay guards. Positive explicit `max_in_flight` values remain
@@ -81,9 +81,10 @@ when `G<N`. Source order and result identity remain unchanged.
 Calls share the adapter's scheduler. Pool/executor changes take effect only
 after the previous local topology generation's work and references drain,
 under the original finite cancellation/deadline. A shrink blocks new admission
-without revoking existing leases or results. The fixed global owner and memory
-pools do not grow with N; available resources can admit fewer than `min(N,G)`
-POSTs. Already started work is not replayed. Discovery failure does not
+without revoking existing leases or results. Explicit opt-in resource policies
+can admit fewer than `min(N,G)` POSTs; no fixed owner or memory pool is
+installed by default. Worker defaults follow the actual usable replica count.
+Already started work is not replayed. Discovery failure does not
 authorize new requests using stale catalog data. The client neither invokes
 administrative load/unload operations nor probes properties of unloaded
 aliases.
@@ -118,22 +119,26 @@ protocol tags. Local protocol tests do not certify that deployment.
 
 ## Distribution windows and preparation
 
-`batch_size` is the total text budget for a distribution window. Only the
-shared scheduler distributes that window across distinct aliases. A per-alias
-quota is separate from HTTP token packing and the context limit of an
-individual input.
+`batch_size` is an optional total-text target distributed across distinct
+aliases by the shared scheduler. It is independent of the number of texts
+submitted or the size of public source windows. Omission installs no
+replacement target. A per-alias quota is separate from explicit HTTP token
+packing and the context limit of an individual input.
 
 Public preparation returns exact counts even for oversized inputs. Counts are
 reused only when their identity, tokenizer build and task policy are verifiable,
 and admission checks fresh limits after waiting and before adaptive children.
-Globally bounded quota lookahead overlaps preparation with inference using
-reused executors. Ordinary embedding does not create public sealed records;
-public preparation and its tamper checks retain their contract.
+Preparation and inference overlap using reused executors. Ordinary automatic
+embedding sends strings without per-input tokenization or public sealed
+records; explicit preparation and its tamper checks retain their contract.
+Owner/queue and byte policies default to `None` and only supplied values behind
+`embedding_capacity_limits=True` activate. This does not change B/G policies
+or impose a new maximum catalog size.
 
 See [embedding contracts](EMBEDDING-CONTRACTS.md) for API details and
 [verification requirements](REQUIREMENTS.md) for the verification boundary.
-These 0.7.0 candidate changes do not constitute a release, new live
-qualification or consumer migration.
+Current [release evidence](verification/PUBLIC-RELEASE-0.15.0.md) is separate
+from earlier profile measurements and consumer migration.
 
 ## Local and remote generations
 
@@ -144,8 +149,9 @@ The optional [server-observation SDK](SERVER-OBSERVATION.md) describes the
 stronger, server-enforced contract needed to reuse authorization across POSTs.
 It is not inferred from native tags and has no implicit deployment dependency.
 
-Worker capacity, fixed owner H, snapshot/result/handoff pools and config
-migration details are specified in
-[concurrency and ownership](CONCURRENCY-AND-DIAGNOSTICS.md). Qualification of
-this candidate is recorded separately from historical profile evidence in the
-[pending candidate report](verification/REPLICA-OWNERSHIP-CANDIDATE.md).
+Worker capacity, optional resource policies, explicit cache retention and
+result/drain ownership are specified in
+[concurrency and ownership](CONCURRENCY-AND-DIAGNOSTICS.md). Existing complete
+window APIs and the flat progressive `aiter_texts()` interface use this same
+scheduler. Historical [candidate evidence](verification/REPLICA-OWNERSHIP-CANDIDATE.md)
+is retained under its original scope; it is not a new 0.15.0 live qualification.

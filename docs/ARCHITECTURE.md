@@ -1,100 +1,91 @@
 # Architettura della libreria
 
-La [proposta di ottimizzazione del 25 ottobre 2026](EMBEDDING-OPTIMIZATION-PLAN-20261025.md)
-è registrata in Flower come revisione 5, base 4, ora adottata per lo sviluppo
-autorizzato nel ciclo `BOOT-000029`. Definisce scheduler per replica e limiti
-operativi; l'adozione non implica completamento o qualifica dell'implementazione.
+La versione 0.15.0 segue l'architettura adottata revisione 6 di Flower MCP,
+requisiti `REQ-000061`–`REQ-000069`, milestone `MILE-000036`–`MILE-000040`
+e packet `PACKET-000039`–`PACKET-000043`. La precedente
+[proposta del 25 ottobre](EMBEDDING-OPTIMIZATION-PLAN-20261025.md) conserva
+il proprio contesto storico; le policy di risorse introdotte allora non sono
+limiti impliciti del contratto attuale. Registrazione, implementazione,
+verifica e acceptance restano stati distinti.
 
 Il package Python `runtime-llama` separa i contratti per i consumer dal
-trasporto HTTP e dall'inferenza eseguita da llama-server. La base funzionale è
-`lmstudio-agent-runtime`; la base del client è `LlamaCppClient` di
-llamatelemetry, isolato dal package initializer e dal bootstrap CUDA.
+trasporto HTTP e dall'inferenza su llama-server. Il client deriva da
+`LlamaCppClient` di llamatelemetry, isolato dall'initializer e dal bootstrap
+CUDA. Il gestore del server possiede modelli, build, processi e hardware.
+Il catalogo pubblico read-only e la discovery delle repliche condividono il
+trasporto ma conservano responsabilità diverse: osservazione e identità
+verificata non equivalgono a un permesso remoto di caricamento o inferenza.
 
-La libreria comprende scheduler embedding, prefissi per modello, diagnostica
-per invocazione e discovery delle repliche per identità del contenuto pubblicata
-dal runtime. La versione `0.5.0` aggiunge una proiezione pubblica read-only del
-catalogo e dei modelli provati caricati, sopra lo stesso client HTTP.
-Generazione, embedding e scheduler mantengono le API esistenti. I test non certificano
-compatibilità universale con ogni modello/template; l'integrazione dei consumer
-resta una fase distinta.
+## Motore embedding e risorse
 
-La versione `0.10.2` affida il coordinamento embedding a un motore persistente
-dell'adapter. Preparazione esatta e HTTP avanzano in
-pool di thread limitati; ogni replica verificata possiede una coda di record
-pronti. Un solo scheduler seleziona il batch quando dispone della capacità
-globale e locale, includendo il lavoro arrivato durante l'inferenza precedente.
-Le API sincrona e asincrona attendono i risultati dello stesso motore; le
-finestre restano confini di consegna ordinata. Record compatibili da finestre o
-chiamate diverse possono condividere un POST, mantenendo indici, risultati e
-cancellazione per proprietario. La cancellazione di uno non interrompe gli
-altri: il suo completamento attende il drain effettivo del trasporto condiviso,
-che ha una deadline finita fissata al massimo delle deadline iniziali. Il
-[progetto delle code persistenti](EMBEDDING-QUEUE-DESIGN.md) e il
-[contratto embedding](PROGRESSIVE-EMBEDDING.md) descrivono limiti e lifecycle.
+Un solo motore persistente coordina chiamate bloccanti, finestre asincrone e
+record progressivi. Ogni replica canonica verificata possiede una coda pronta.
+Record compatibili da chiamanti o finestre diverse possono condividere un
+POST, mantenendo indice, risultato e cancellazione per proprietario. I sommari
+di readiness sono incrementali e il packing usa iteratori; le attese non
+congelano un candidato né introducono un secondo scheduler.
 
-`batch_size` conserva il budget totale di testi e le quote bilanciate sulle
-repliche utilizzabili, senza ridurre il target HTTP alla dimensione delle
-finestre sorgente. `embedding_batch_wait_sec=0.0` riempie i batch tramite eventi
-di preparazione e capacità senza richiedere un timer; il primo record pronto
-non forza un POST parziale mentre altro lavoro compatibile può avanzare.
-Valori positivi mantengono coalescing opzionale nello stesso
-percorso. I budget configurabili di byte pendenti, token preparati e payload
-completano la backpressure. Il lavoro locale non cambia gli slot del server e
-la tokenizzazione remota dei testi nuovi resta necessaria.
+`batch_size=B` è un target opzionale totale di testi distribuito sulle N
+repliche utilizzabili. Non limita il numero di testi in ingresso. Il guard
+positivo G limita a `min(N,G)` le POST originali, lasciando le quote basate
+su N. Senza B o G non si installano target sostitutivi: G segue N. Ogni replica
+conserva una lease originale fino al drain, incluse le recovery seriali;
+gli slot nativi non moltiplicano le POST ammesse. I worker predefiniti seguono
+le repliche effettive, senza un massimo fisso di modelli.
 
-Il credito di lookahead della preparazione e' distinto dalla vita del piano:
-si libera quando non restano gruppi da preparare ne' worker di preparazione
-attivi. Record pronti o in volo, crediti byte/token, risultati e ownership HTTP
-restano trattenuti fino alla rispettiva consegna o al drain. Anche la lease
-della finestra async resta occupata fino alla consegna o pulizia; liberare
-lookahead non significa liberare la capacita' HTTP.
+`embedding_batch_wait_sec=0.0` coordina riempimento e code tramite eventi,
+senza timer obbligatorio. Il coalescing positivo resta una scelta esplicita.
+Contesto per input, passo nativo `n_batch`/`n_ubatch`, target di testi e policy
+aggregate HTTP restano separati. La recovery di un 400 riconosciuto dal
+contratto custom suddivide solo il POST fallito e non riduce i batch futuri.
 
-La versione `0.10.2` riusa osservazioni metadata coerenti durante l'ammissione,
-senza ripetere il catalogo gia' letto per l'appartenenza al pool. Prima dei POST
-restano verificati identita', build tokenizer e limiti correnti. Una cache LRU
-dell'adapter conserva solo tuple di ID esatti completati: identita' verificata,
-build, task, testo e policy di prefissi/token speciali fanno parte della chiave.
-Non autorizza l'inferenza e non evita la validazione dei record pubblici.
-Il pool aggiuntivo e' limitato a 1.024 entry e a
-`min(8 MiB, embedding_max_pending_bytes // 4)` byte, distinti da code e risultati.
-Non prevede TTL o singleflight; richieste fredde concorrenti possono ripetere
-la tokenizzazione. Evizione e chiusura liberano le entry. I contatori sono
-esposti nella diagnostica, senza dichiarare un tetto globale della RSS.
+I campi scalari per owner, code, byte/token pendenti, richieste, risposte,
+handoff, isolamento e cache hanno default `None`. Valori forniti si attivano
+solo con `embedding_capacity_limits=True`, evitando che numeri legacy salvati
+diventino nuove scelte implicite. B/G e il limite esplicito per stream restano
+policy indipendenti. Non esistono H derivato, pool obbligatorio da 64 MiB,
+partizione 75/25, risposta `pool/16`, riserva preventiva dell'intero output o
+dimezzamento dei candidati per memoria. Una policy handoff scelta è autonoma.
 
-Il candidato locale `0.13.1.dev1`, governato da Flower `REQ-000044` /
-`PACKET-000030`, separa l'ammissione iniziale dello stream automatico dal
-preflight dei POST. Uno scope privato conserva osservazioni iniziali e una
-generazione verificata, senza possedere riferimenti al pool durante le pause.
-Ogni finestra ammessa acquisisce il proprio riferimento reale. Cataloghi
-freschi che rilevano cambiamenti nell'intero gruppo di repliche revocano lo
-scope; la sostituzione del pool attende il drain e soltanto una nuova ammissione
-autorevole può riabilitare il riuso. Nessuno snapshot ripristina capacità
-obsolete. Catalogo e proprietà freschi prima dei POST, recovery, scheduler e
-quote restano quelli esistenti. Non viene anticipato il preflight mentre
-la capacità dell'alias è occupata.
+Le API complete mantengono naturalmente l'intero risultato promesso.
+`aiter_texts()` accetta invece una sequenza piatta o una sorgente asincrona e
+trasferisce `EmbeddingRecordResult(index, embedding)` in ordine sorgente,
+anche prima dell'esaurimento della sorgente. Duplicati restano occorrenze
+separate. Le API a finestre mantengono la compatibilità, con
+`max_pending_windows=None` predefinito. Il consumer resta responsabile della
+memoria dei risultati che decide di conservare.
 
-Il candidato successivo `0.13.1.dev2` (`REQ-000045` / `PACKET-000031`)
-introduce un'identità privata di consumer per lo stream, distinta dallo scope
-di ammissione e dall'ownership delle singole finestre. Il packing ruota fra
-consumer indipendenti e concatena le finestre pronte dello stesso consumer
-in ordine sorgente. Può riempire un POST attraverso più finestre; una coda
-temporaneamente vuota non blocca le successive già pronte. Questo evita che
-due finestre prefetched mantengano entrambe incompleta la propria parte sulla
-replica lenta, impedendo l'ingresso di altro lavoro sulla veloce. Il turno per
-alias avanza soltanto dopo dispatch effettivo. I sommari di readiness seguono
-lo stesso ordine, anche nel passaggio da ID nativi a testo. Scheduler, capacità,
-crediti e consegna ordinata rimangono quelli esistenti.
+La preparazione esatta è esplicita: `/tokenize` produce conteggi e ID con
+prefisso applicato una sola volta e policy speciali coerenti. L'embedding
+automatico ordinario invia stringhe senza tokenizzazione preventiva né
+calibrazione implicita. I token dei testi diretti restano sconosciuti, senza
+riserve fittizie pari al contesto. Il tetto in caratteri esplicitamente richiesto
+usa il contesto effettivo, non il microbatch, e mantiene corpus da 2.500 testi
+e margini categoria 80% / mixed 90%.
 
-L'architettura adottata revisione 4 e il packet complementare
-`PACKET-000019` (`REQ-000034`/`REQ-000035`, `MILE-000018`, `CHANGE-000018`)
-mantengono sommari incrementali delle code pronte. Il packing usa iteratori
-sul prefisso necessario alla richiesta corrente e rotazioni dei proprietari
-in tempo costante; non congela un candidato persistente durante le attese.
-Se un'eccezione esterna interrompe l'attesa sincrona della Future del motore,
-viene ritirato soltanto quel proprietario e si attende il drain reale prima di
-rilanciare l'eccezione originale, anche con interruzioni ripetute in cleanup.
-Gli altri proprietari di un POST condiviso e l'adapter/client restano aperti;
-valgono le deadline e i limiti di trasporto gia' descritti.
+La cache di preparazione è disabilitata per default. L'abilitazione esplicita
+sceglie retention nella sessione dell'adapter, eliminata alla chiusura;
+quote entry/byte si applicano solo con opt-in e non derivano da altre risorse.
+Identità dei pesi/semantica, build tokenizer, task, testo e policy prefissi/token
+speciali governano il riuso. Non sostituisce sigilli o verifiche fresche.
+Metadata coerenti si riusano nello stesso confine, acquisendo solo i fatti
+necessari alla modalità e ricontrollando identità/limiti prima di POST/recovery.
+
+Input, risultati, body HTTP, Future, task e generazioni ritirate vengono
+liberati al trasferimento o drain reale. Stop ritira il singolo owner senza
+interrompere i superstiti di un POST condiviso. La deadline del trasporto è
+fissata al dispatch e non si estende quando un owner esce. L'abbandono di
+un'attesa sincrona preserva l'eccezione primaria durante cleanup ripetuti.
+`async with`/`aclose()` assicurano chiusura deterministica; l'abbandono della
+facade progressiva segnala Stop e pianifica cleanup sul loop proprietario vivo.
+Non si promettono RSS costante, budget dedotti dalla RAM, spill su disco o
+arresto forzato di sorgenti/provider non cooperativi.
+
+I [contratti embedding](EMBEDDING-CONTRACTS.md), le
+[API asincrone](ASYNC-EMBEDDING-WINDOWS.md) e la
+[gestione delle risorse](CONCURRENCY-AND-DIAGNOSTICS.md) descrivono i dettagli.
+La [verifica 0.15.0](verification/PUBLIC-RELEASE-0.15.0.md) distingue risultati
+locali, qualifica live e acceptance applicativa.
 
 La versione `0.6.0` aggiunge il trasporto opzionale
 [Tailscale/Headscale](TAILNET.md). `TailnetConfig` mantiene la configurazione
@@ -148,14 +139,15 @@ flowchart TD
 | `contracts.py`, `usage.py`, `errors.py`, `runaway.py` | Accumulazione del testo, reasoning, budget visibile, interruzione, esiti e diagnostica della baseline adattati |
 | `client.py` | HTTP `requests`, parsing JSON/SSE rigoroso, limite JSON opzionale, policy ambientale esplicita, cleanup, cancellazione, errori classificati e API raw |
 | `_http_interrupt.py` | Hook per connessione owned della singola richiesta SSE senza idle; shutdown, detach prima del riuso e mapping locali a sessione/proxy |
-| `model_discovery.py` | Catalogo pubblico tipizzato e bounded, soli GET catalogo/root props, stati e capacità sconosciuti espliciti, identità e metadati con fonte |
+| `model_discovery.py` | Catalogo pubblico tipizzato con policy opzionali, soli GET catalogo/root props, stati e capacità sconosciuti espliciti, identità e metadati con fonte |
 | `tailnet.py`, `_proxy.py` | Configurazione consumer, protocollo stdin limitato, supervisor dell'helper e route loopback esplicita per tutte le sessioni possedute |
 | `helpers/tsnet` | Binario opzionale con stato dedicato, peer verificati, netstack userspace, proxy HTTP/CONNECT autenticato e teardown drenato |
 | `adapters/llama.py` | `/v1/chat/completions`, storia completa, sampling, reasoning/template, schema, tool delta e usage |
 | `adapters/embedding.py` | Preparazione query/document/raw, `/v1/embeddings`, `/tokenize`, `/props`, batching, limiti, ordine e integrità numerica |
 | `embedding_engine.py` | Motore persistente condiviso dalle API sync/async, code per replica, preparazione concorrente, selezione dei batch al dispatch e budget delle risorse |
+| `embedding_records.py`, `embedding_stream.py` | Consegna progressiva per occorrenza o per finestra, ownership della sorgente e chiusura drenata |
 | `embedding_packing.py` | Viste senza copia delle code esistenti: equità fra consumer, finestre pronte in ordine per stream e sommari coerenti dei prefissi di ID nativi |
-| `embedding_scheduler.py` | Ammissione condivisa, coda limitata, routing per alias e tetti globali/per replica |
+| `embedding_scheduler.py` | Ammissione condivisa, code con policy opzionali, routing per alias e guard globali/per replica |
 | `replica_discovery.py` | Selezione del modello logico e repliche loaded dai tag Noxi di identità contenuto e compatibilità semantica |
 | `diagnostics.py` | Cattura thinking opzionale e limitata, correlazione per chiamata e sink finale |
 | `factory.py`, `embedding_factory.py` | Costruzione senza richieste HTTP o avvio del server |
@@ -219,58 +211,34 @@ conserva solo conteggi. Prompt e header non vengono raccolti.
 
 ## Embedding
 
-`AdapterProfile.embedding_prefixes` contiene una coppia immutabile
-`EmbeddingPrefixes(query, document)`, vuota per default. Il profilo del modello
-possiede la preparazione dipendente dal training; il consumer indica query o
-documento attraverso i metodi esistenti o `input_type`. `raw` permette input
-già preparati. La libreria concatena stringhe letterali, senza dedurre il task
-dal nome dell'alias o interpretare template.
+`AdapterProfile.embedding_prefixes` mantiene una coppia immutabile
+`EmbeddingPrefixes(query, document)`, vuota per default. Il consumer indica
+query/documento; `raw` conserva testo già preparato. Prefissi letterali vengono
+applicati una sola volta e non si deducono dall'alias. Query concorrenti non
+modificano un task globale. Tutte le repliche compatibili conservano la stessa
+semantica; gli indici già costruiti richiedono la coerenza del consumer.
 
-Il testo completo viene preparato una sola volta nello stato locale della
-chiamata, prima di scheduler e tokenizzazione. Query e documenti concorrenti
-non modificano un task condiviso nell'adapter; tutte le repliche ereditano
-lo stesso formato e lo split adattivo non riapplica il prefisso. I prefissi
-rientrano nei limiti input e nel budget di packing. La configurazione non
-modifica l'identità fisica o il caricamento del server; il consumer deve
-conservare la coerenza semantica con gli indici già costruiti.
+Il percorso esatto combina conteggi reali con contesto caricato e tetti
+espliciti; gli oversize restano misurabili senza autorizzare inferenza. Il
+percorso automatico invia stringhe e lascia la tokenizzazione al server. In
+entrambi si validano ordine, cardinalità, indici e vettori finiti. L'isolamento
+automatico dei POST 500 conserva i successi, identifica i singleton rifiutati
+e restituisce consiglio di divisione al consumer senza ricalibrare il tetto.
 
-La tokenizzazione avviene sul server con aggiunta/parsing dei token speciali.
-I limiti effettivi combinano i tetti configurati e il contesto osservato, quando
-noti. Il batch conserva l'ordine, valida indici e vettori finiti e pubblica una
-nuova dimensione osservata soltanto dopo la validazione completa della chiamata.
-
-Il client HTTP nativo non ripete un POST embedding fallito o ambiguo.
-Per client iniettati con il contratto esplicito di recupero, soltanto l'errore
-HTTP 400 strutturato `exceed_context_size_error` consente lo split adattivo;
-gli altri errori propagano. Un singolo input fuori limite fallisce senza
-troncamento implicito. Il recupero della dimensione del batch è progressivo
-dopo successi; non modifica il modello o le istanze del server.
-
-Uno scheduler per adapter limita lavori attivi e accodati, anche fra chiamanti
-concorrenti. Ogni lavoro mantiene alias e posto fino alla pulizia HTTP;
-tokenizzazione, packing e split rispettano i limiti della replica scelta.
-`close()` drena i lavori e le risorse possedute. Il default resta sequenziale.
-Il [contratto di integrazione](INTEGRATION.md) descrive configurazioni, ownership,
-readiness e diagnostica; [CONCURRENCY-AND-DIAGNOSTICS.md](CONCURRENCY-AND-DIAGNOSTICS.md)
-conserva la motivazione architetturale dell'incremento.
-
-L'opt-in `embedding_replica_discovery` aggiunge uno snapshot delle istanze
-loaded, selezionate da nome logico, alias ancora o digest. L'identità dei byte
-e la compatibilità semantica sono dichiarate da Noxi nei tag nativi; la
-libreria non le deduce dal path. Il pool automatico limita le richieste attive
-per replica agli slot positivi osservati e al limite globale configurato;
-capacita' sconosciuta implica una sola richiesta. Gestisce ID operativi,
-refresh, pinning e cambi topologia
-senza trasferire questi dettagli al consumer. Il contratto completo è in
-[AUTOMATIC-EMBEDDING-REPLICAS.md](AUTOMATIC-EMBEDDING-REPLICAS.md).
+Discovery seleziona nome logico, alias o digest e raggruppa soltanto identità
+dei byte e semantica compatibili attestati nei tag. Il pool mantiene una POST
+originale per replica canonica e un eventuale G esplicito; gli slot sono
+osservazioni. Topologie cambiate vengono ritirate e drenate senza trasferire
+risultati o riusare snapshot come permessi. Nessun load/unload amministrativo
+è introdotto. Vedere [repliche](AUTOMATIC-EMBEDDING-REPLICAS.md).
 
 ## Verifica e limiti
 
 I [requisiti funzionali](REQUIREMENTS.md) collegano contratti e test locali.
 Una prova live deve identificare build, modello, template, configurazione di
 caricamento e consumer, includendo tool, reasoning, schema, embedding, timeout
-e arresto della generazione remota. La pubblicazione `0.5.0` non dichiara una
-nuova qualifica live o acceptance del consumer.
+e arresto della generazione remota. La verifica deterministica `0.15.0` non dichiara una nuova qualifica live o
+acceptance del consumer; le evidenze pubblicate ne precisano il perimetro.
 
 Riferimenti versionati del mapping:
 [server v0.6.0](https://github.com/ggml-org/llama.cpp/blob/v0.6.0/tools/server/README.md),

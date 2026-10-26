@@ -6,9 +6,9 @@ networks. The Python distribution is `runtime-llama` and the import namespace is
 `runtime_llama`. Python 3.11 or later is required. Runtime dependencies are
 `requests` and `urllib3`.
 
-The current stable release is **0.14.0**. See the
-[release assets](https://github.com/Damel91/llama-runtime/releases/tag/v0.14.0)
-and [verification record](docs/verification/PUBLIC-RELEASE-0.14.0.md), including
+The current stable release is **0.15.0**. See the
+[release assets](https://github.com/Damel91/llama-runtime/releases/tag/v0.15.0)
+and [verification record](docs/verification/PUBLIC-RELEASE-0.15.0.md), including
 the accepted numerical limitation of the measured server/model profile.
 
 ## Why this library exists
@@ -40,10 +40,11 @@ The project's engineering lifecycle is managed with
 | Usage and outcomes | Token counters, terminal reasons, bounded transport metadata and optional typed native server timings; unavailable counters remain unknown. |
 | Embeddings | Query, document and raw input modes; optional normalization; validates result order, cardinality, vector dimensions and finite values. |
 | Task-aware preparation | Configurable model-specific query/document prefixes and exact server tokenization, including special tokens; measures oversized inputs and safely reuses verified counts. |
-| Batching | Configurable total text windows, balanced quotas across usable replicas and HTTP packing within known input/context and explicitly configured aggregate token budgets; native computation batch sizes remain separate. Inputs are never silently truncated. |
+| Batching | Optional total text targets balanced across usable replicas, independently of submitted text count. Server constraints and explicit HTTP policies stay distinct; no silent truncation. |
 | Replica discovery | Explicit aliases or automatic discovery using content and semantic identity tags from a compatible server manager; identity pinning and bounded topology refresh. |
-| Shared concurrency | One original HTTP lease per verified canonical replica; automatic N-wide capacity or a positive global guard. Shared sync/async owner, memory and payload bounds; separate finite tokenizer/control workers and ordered results. Native slots remain diagnostics. |
-| Async embedding windows | Async text or prepared-input sources, ordered complete windows, bounded intake and buffered results, with the same scheduler and limits used by synchronous callers. |
+| Shared concurrency | One original HTTP lease per verified canonical replica; automatic N-wide capacity or an explicit positive guard. Ownership and cleanup shared by sync/async callers, without implicit memory/owner quotas. Native slots remain diagnostics. |
+| Progressive embedding records | Flat text sequences or async text sources yield indexed vectors in source order through the existing scheduler; no consumer-side POST grouping. |
+| Async embedding windows | Text or prepared-input windows retain complete-window results, with optional explicit pending-window controls and shared cancellation/drain. |
 | Persistent embedding queues | Prepared records accumulate in adapter-owned queues for each verified replica; batches are formed when execution capacity is available, with the same engine for synchronous and async callers. |
 | Native token inputs | Reuses exact retained token IDs with verified weights, tokenizer build and prefix/special policy, avoiding a second string tokenization in the native embedding handler. |
 | Optional automatic embeddings | Verified loaded-model discovery and direct text inputs using the existing scheduler; an explicit character-budget helper calibrates 2,500 selected hard texts by category when requested. Native 500s isolate rejected inputs through bounded subbatches and preserve successful indexed vectors. |
@@ -51,7 +52,7 @@ The project's engineering lifecycle is managed with
 | Optional stream idle | Explicit `stream_idle_timeout_sec=None` waits through quiet prefill; connection/JSON budgets remain finite, with per-request socket interruption for Stop and drained close. |
 | Diagnostics | Bounded HTTP kind/phase counts and wall unions, requested/effective capacity, resource use/wait reasons; optional thinking capture and final sinks, including interrupted calls. |
 | HTTP access | Works with native unpatched llama-server using independent connections by default; explicit keep-alive opt-in, authentication, TLS verification and raw endpoint helpers. |
-| Read-only model catalog | Typed observations of catalog entries and proven loaded models, explicit capability unknowns, identity tags and context provenance; bounded GET-only discovery without model loading. |
+| Read-only model catalog | Typed catalog/loaded-model observations, unknown capabilities, identity tags and context provenance; GET-only discovery without a fixed model-count ceiling or model loading. |
 | Optional server-observation SDK | Typed snapshot and conditional-admission contracts for a separately negotiated provider; native fresh checks remain the default. No real-server extension is installed or implied. |
 | Optional embedded VPN client | A separately built Go tsnet helper for Tailscale or Headscale, with consumer-owned configuration, authenticated loopback proxy, verified peer routing, TLS and bounded teardown; no system VPN installation. |
 | MCP data contracts | Validated integration, call, event and result types for consumer-managed MCP execution. |
@@ -63,7 +64,41 @@ against the forwarded JSON Schema. Splitting source documents and tracking their
 fragments belong to the consuming application. The server's own auto-loading
 policy is supported.
 
-## Release 0.14.0: replica admission and bounded ownership
+## Release 0.15.0: progressive input and explicit capacity policies
+
+`aiter_texts()` accepts a flat text sequence or async text source and yields
+`EmbeddingRecordResult(index, embedding)` in source order. Consumers can submit
+10,000 texts without dividing them into HTTP-sized groups; that is a test size,
+not a new maximum. Existing blocking/list and complete-window APIs remain.
+All use the same model engine and replica scheduler.
+
+There are no implicit text/model-count, owner, pending-byte/token or
+whole-result memory quotas. `embedding_capacity_limits=False` leaves legacy
+scalar capacity fields inactive. A consumer deliberately choosing those
+policies enables the flag and supplies independent values; missing fields stay
+unset. Optional batch targets and global HTTP guards retain their own meanings.
+No new budget is inferred from RAM.
+
+The former 75/25 handoff partition, response `pool/16` cap and memory-driven
+batch halving are removed. Preparation caching is disabled unless explicitly
+enabled and clears at close. Worker defaults follow the usable replica pool.
+Ordinary direct embedding neither tokenizes each input nor reserves the entire
+model context as token consumption. Character recommendations use effective
+context rather than substituting native microbatch.
+
+Resource correctness is verified through ownership transfer and release on
+success, errors, cancellation, abandonment and close. A complete list or
+consumer-retained results still require their natural memory; constant RSS,
+implicit disk spilling and consumer migration are not promised.
+See the [release verification](docs/verification/PUBLIC-RELEASE-0.15.0.md),
+[resource contract](docs/CONCURRENCY-AND-DIAGNOSTICS.md) and
+[async interfaces](docs/ASYNC-EMBEDDING-WINDOWS.md).
+
+## Earlier release 0.14.0: replica admission and bounded ownership
+
+The sections through 0.7.0 below are historical release notes. Their defaults
+and capacity policies describe those versions; current use follows the 0.15.0
+contract above and the linked current guides.
 
 Version 0.14.0 uses one original embedding POST per verified canonical replica.
 An absent/`None` `embedding_request_parallelism` (`request_parallelism` on the
@@ -304,10 +339,10 @@ results and deployment boundaries.
 With Python 3.11 or later, install the tagged source:
 
 ```bash
-python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.14.0'
+python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.15.0'
 ```
 
-Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.14.0),
+Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.15.0),
 or run the following from a checkout:
 
 ```bash
@@ -373,9 +408,10 @@ for model in catalog.loaded_models:
 
 `catalog.models` contains the observed catalog; `loaded_models` contains only
 entries proved loaded. Capabilities remain `None` when the server does not
-declare them. The API uses a bounded `GET /v1/models` and optional root
+declare them. The API uses `GET /v1/models` and optional root
 `GET /props`, with one deadline and cooperative cancellation. It neither
-selects nor loads a model. Authentication is optional and explicit; TLS is
+selects nor loads a model or installs a fixed catalog-count ceiling. Optional
+response/model policies are caller choices. Authentication is optional and explicit; TLS is
 verified and ambient authentication/proxy settings are ignored. See the
 [model discovery API](docs/MODEL-DISCOVERY.md) for signatures, identity tags,
 context provenance, limits and failure handling.
@@ -388,7 +424,7 @@ directory, hostname, enrollment credentials when needed, coordination server
 and inference endpoint. The Python wheel remains portable and contains no
 native binary. Importing or constructing the library never launches a VPN.
 
-The [release](https://github.com/Damel91/llama-runtime/releases/tag/v0.14.0)
+The [release](https://github.com/Damel91/llama-runtime/releases/tag/v0.15.0)
 provides separate helper archives for macOS ARM64, Linux AMD64 and Windows
 AMD64. Go is needed to build the helper from source, not to run a supplied
 binary. Both Tailscale's coordinator and an explicit HTTPS Headscale
@@ -423,9 +459,7 @@ from runtime_llama import build_embedding_adapter
 embedding = build_embedding_adapter({
     "model": "embedding-model",
     "base_url": "http://localhost:8081",
-    "max_input_tokens": 2048,
     "batch_size": 256,
-    "token_count_parallelism": 2,
     "normalize": True,
     "embedding_prefixes": {
         "query": "task: search result | query: ",
@@ -441,9 +475,10 @@ finally:
     embedding.close()
 ```
 
-`batch_size` is the total number of texts per distribution window. With two
-usable replicas, a window of 256 texts receives balanced quotas of 128 texts
-per replica; token packing may require several HTTP requests per quota.
+`batch_size` is an optional total text target for replica distribution, not a
+maximum submission size. An explicit target of 256 gives quotas up to 128 with
+two usable replicas or 64 with four; server or explicit HTTP policies can require
+more requests. Missing `batch_size` installs no replacement text target.
 `prepare_texts()` and `prepare_query()` measure oversized inputs too.
 `embed_prepared()` reuses verified counts and rejects inputs exceeding known
 limits. Prefixes and special tokens are counted once. Splitting documents and
@@ -457,7 +492,8 @@ Unknown limits remain unknown. Query and
 document prefixes default to empty strings; `input_type="raw"` accepts texts
 already prepared by the consumer.
 
-An adapter can share bounded concurrency and queue limits across callers.
+An adapter shares ownership and scheduling across callers. Capacity policies
+are opt-in; legacy scalar fields alone do not activate them.
 Optional `embedding_replica_discovery=True` selects loaded replicas using
 content and semantic identity tags published by a compatible server manager.
 Each verified canonical replica has one original lease; native slots remain
@@ -467,43 +503,39 @@ one. Quota width follows N even when a positive guard allows fewer active POSTs.
 [integration guide](docs/INTEGRATION.md) and
 [replica discovery contract](docs/AUTOMATIC-EMBEDDING-REPLICAS.md).
 
-### Asynchronous window sources
+### Progressive text and complete-window sources
 
-Introduced in 0.8.0, `astream_texts()` and `astream_prepared()` remain available.
-The synchronous API remains available. A consumer can supply successive
-windows while earlier windows are preparing or running:
+Use `aiter_texts()` to pass flat input without constructing source windows:
 
 ```python
-async def incoming_windows():
-    yield ["first document", "second document"]
-    yield ["third document"]
-
-async def ingest(embedding):
+async def ingest(embedding, texts, store_vector):
     try:
-        async with embedding.astream_texts(
-            incoming_windows(), max_pending_windows=2, timeout=120.0,
-        ) as stream:
-            async for vectors in stream:
-                await store_next_window(vectors)  # Application-owned storage.
+        async with embedding.aiter_texts(texts, timeout=120.0) as stream:
+            async for result in stream:
+                await store_vector(result.index, result.embedding)
     finally:
         await embedding.aclose()
 ```
 
-Each yielded vector list corresponds to one source window, in order.
-`max_pending_windows` includes source pulls, preparation, inference and results
-waiting for the consumer. Fixed global owner H covers both synchronous calls
-and async streams before retention or source pulls; separate input/result/
-handoff credits complement that count. Both APIs share the same scheduler. `batch_size` still controls total-text distribution windows internally.
-The finite timeout applies separately to each source window, including waiting
-for capacity and the source itself.
+A finite sequence or async text source is accepted. Each original occurrence
+has an index, including duplicates, and its vector transfers to the consumer.
+The stream can yield before an async source is exhausted. Use `async with` or
+`aclose()` for deterministic early exit; dropping the flat facade also signals
+Stop and schedules cleanup on its live owning loop until actual drain.
 
-Use `async with` or `await stream.aclose()` when stopping early. Closing a stream
-drains its work and leaves the shared adapter available; `await embedding.aclose()`
-closes the adapter and its active streams. Source iterators are borrowed unless
-`close_source=True` is requested. See the [async window API](docs/ASYNC-EMBEDDING-WINDOWS.md)
-for ownership, deadlines, error propagation and event-loop constraints.
-The [0.8.0 candidate qualification](docs/verification/ASYNC-WINDOWS-0.8.0.md)
-records deterministic and bounded live results, including both embedding replicas.
+Existing `astream_texts()`/`astream_prepared()` keep complete-window delivery.
+Their default `max_pending_windows=None` installs no count quota; a positive
+argument is an explicit stream policy. Complete list/window outputs naturally
+need their full memory. The library does not require them to fit the former
+whole-result pool and does not promise constant RSS for accumulated work.
+
+All paths share the same scheduler and preserve source order, owner cancellation,
+finite deadlines and drained close. Source iterators are borrowed unless
+`close_source=True` is requested. The consumer retains splitting, UTF-8 spans,
+fragment identities, graph and persistence. See
+[async interfaces](docs/ASYNC-EMBEDDING-WINDOWS.md),
+[capacity and ownership](docs/CONCURRENCY-AND-DIAGNOSTICS.md) and
+[embedding contracts](docs/EMBEDDING-CONTRACTS.md).
 
 ## Verification
 

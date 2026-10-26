@@ -1,225 +1,146 @@
 # Progressive preparation and native token inputs
 
-Contract for development version 0.10.3. Flower MCP governs requirements,
-implementation and verification in project `llama-runtime`. `PACKET-000018`
-covers metadata and exact-ID reuse; complementary `PACKET-000019` covers
-interrupted blocking waits and incremental ready-queue accounting under adopted
-architecture revision 4 (`REQ-000034`/`REQ-000035`, `MILE-000018`,
-`CHANGE-000018`). Qualification, publication and consumer acceptance remain distinct.
-
-The [persistent queue engine design](EMBEDDING-QUEUE-DESIGN.md) records the
-architecture and verification requirements for replacing per-window
-coordination and early batch selection.
+Version 0.15.0 uses one persistent engine for blocking calls, complete-window
+async results and flat progressive records. Flower's adopted architecture
+revision 6, requirements `REQ-000061`–`REQ-000069` and milestones 36–40 govern
+the resource-lifecycle changes. Earlier queue and metadata designs remain
+historical context; the current [embedding contract](EMBEDDING-CONTRACTS.md)
+and [capacity and ownership guide](CONCURRENCY-AND-DIAGNOSTICS.md) define use.
 
 ## Progressive queues
 
-The synchronous and asynchronous embedding APIs register work with the same
-persistent execution engine and shared HTTP scheduler. Each verified replica
-has a queue of prepared records. Compatible records from different calls or
-source windows can share an HTTP batch while retaining their individual
-cancellation and result ownership. Preparation publishes each record with its
-original input index. Public windows are result boundaries; they do not create their
-own blocking coordinator threads or determine the lifetime of the queues.
+Each verified canonical replica has a ready queue. Compatible occurrences from
+different callers or source windows can share a POST while preserving their
+input index, result owner and independent cancellation. Windows are delivery
+boundaries; they do not create independent schedulers or force POST boundaries.
 
-`batch_size` remains the total-text budget for dynamic replica distribution.
-Each quota remains affine to its discovered alias. Preparation and ready
-records accumulate within the adapter's admission and resource budgets while
-earlier inference is running. A batch is selected only when global and
-per-replica capacity are available; waiting work does not retain an already
-frozen list of batch indices. Records from different ready owners can combine;
-complete public windows and vectors retain input order.
+`batch_size=B` is an optional total-text target distributed across N verified
+usable replicas. A positive global G controls `min(N,G)` original POSTs while
+quotas still use N. Each replica holds one original lease through actual drain,
+including serial recovery descendants. Native slots do not multiply that
+lease. Omitting B imposes no replacement text target; input cardinality is not
+limited to B, 128 or a source-window size.
 
-Ready queues maintain summaries as records enter and leave. Readiness checks
-can use those summaries instead of rescanning the growing backlog. Packing
-uses lazy iterators over the records needed for the current bounded request;
-owner rotation does not copy or remove the front of a Python list. This avoids
-repeated whole-queue candidate materialization without retaining a persistent
-candidate prefix across waits. Identity, capacity and byte/token checks still
-apply to the batch actually dispatched.
+The engine composes a request when capacity is available, including work that
+arrived during preceding inference. Incremental summaries avoid repeatedly
+materializing the whole ready backlog. Packing uses iterators and constant-time
+owner rotation; waiting does not freeze a candidate. Text targets, explicit
+aggregate HTTP token policies, per-input context and native execution sizes
+remain separate. A recognized custom-client 400 recovery subdivides its failed
+POST; it does not establish a reduced cap for subsequent work.
 
-`embedding_batch_wait_sec` is finite and nonnegative, default `0.0`. Zero uses
-event-driven filling, without a required coalescing timer. A free replica does
-not have to dispatch the first ready record while compatible admitted work is
-still being prepared. Preparation, ready records, capacity and resource limits
-drive batching; tails flush when further filling cannot progress. Records
-accumulated during an earlier POST can join the next one. Sparse sources or
-resource limits can still produce partial batches.
+`embedding_batch_wait_sec=0.0` fills using preparation/capacity events without a
+required timer. Compatible pending preparation may fill a free replica's batch;
+tails flush when further filling cannot progress. A positive finite wait is an
+explicit coalescing choice in the same engine. Its clock starts at the first
+unsent ready record and is not renewed by arrivals. Neither form extends the
+owner's finite work deadline.
 
-An explicit positive value remains an optional coalescing policy in the same
-engine. Its budget starts at the first unsent ready record and is not reset by
-new arrivals. A filled text/token cap, exhausted eligible preparation or expired wait can
-flush the batch. The call/window deadline includes this waiting. This setting
-does not change finite HTTP and overall deadlines.
+## Input, result and cache ownership
 
-Text targets derive from the configured total-text budget, usable replicas and
-adaptive limits, never from a hardcoded 8/64/128 or the size of a source window.
-Accumulating multiple windows neither shrinks nor multiplies these request caps.
-Native computation `n_batch`/`n_ubatch` remain separate from aggregate HTTP
-request token limits. Request-size and timing measurements accompany
-qualification.
+There is no default owner, queue-count, pending-byte/token, HTTP-body or handoff
+quota. These scalar profile fields default to `None` and require
+`embedding_capacity_limits=True` before supplied values activate. Legacy saved
+numbers do not silently opt into policies. Explicit fields are independent;
+there is no derived H, 64 MiB pool, 75/25 split, response `pool/16`, compulsory
+whole-result reservation or memory-driven request halving. B and G retain their
+separate batching and dispatch roles.
 
-The finite resource budgets are configurable:
+The complete-list and complete-window APIs naturally retain their complete
+output until delivery. `aiter_texts()` instead transfers
+`EmbeddingRecordResult(index, embedding)` occurrences progressively from a flat
+sequence or async source. Its default window intake has no compulsory count
+cap. A caller can select `max_pending_windows` on the window APIs explicitly.
+See [async interfaces](ASYNC-EMBEDDING-WINDOWS.md) for delivery, failure and
+source-ownership semantics.
 
-| Setting | Default | Purpose |
-| --- | --- | --- |
-| `embedding_max_pending_bytes` | 67,108,864 bytes | Separate ceilings for input snapshots, raw/counted queues and complete sync/async outputs; HTTP handoff derives its own finite envelope |
-| `embedding_max_pending_tokens` | 1,048,576 tokens | Bound prepared tokens queued or active for inference |
-| `embedding_max_request_bytes` | 8,388,608 bytes | Bound individual request payloads |
-| `embedding_max_response_bytes` | 8,388,608 bytes | Pre-decode bound for all embedding-path JSON, including controls; handoff can impose a lower per-candidate cap |
-| `embedding_preparation_cache_entries` | 1,024 entries | Bound completed exact-token retention; zero disables |
-| `embedding_preparation_cache_bytes` | 8,388,608 bytes | Cache ceiling, also capped by pending bytes / 4; zero disables |
+Inputs, response objects, Futures, completed tasks and retired generations are
+released when their owner transfers or drains them. Source order and duplicate
+occurrences remain distinct. Explicit close is deterministic; dropping a flat
+facade also signals Stop and schedules cleanup on its live owning loop. No
+constant-RSS, automatic RAM-budget selection, disk spill or forced termination
+of uncooperative source/provider code is promised.
 
-The first four budgets require positive integers. The two cache limits accept
-nonnegative integers; zero disables retention. Oversized embedding inputs remain
-measurable with `prepare_*` within the configured resource ceilings, but are
-not admitted for inference. The caller's original input remains external. The library reserves complete
-sync and async results before accumulating them; oversized whole outputs fail
-explicitly instead of escaping the result ledger. Exact bulk preparation has
-one unknown-size result accumulator, with parallel tokenizer workers inside it.
-Response handoff uses a separate global normal/progress pool, not credits from
-the working pool required to make those requests progress. Its floor is 64 KiB;
-cold JSON decoding reserves a 64-times-body materialization envelope.
-Async intake also bounds source pulls and
-completed windows waiting for the consumer. Resource accounting does not
-claim a fixed process RSS.
+Exact preparation caching is disabled by default. Explicit
+`embedding_preparation_cache_enabled=True` enables adapter-session retention;
+close clears it. Optional cache entry/byte quotas require the capacity opt-in,
+and omitted quotas impose no replacement ceiling. Reuse still requires verified
+content/semantic identity, tokenizer build, task, exact text and prefix/special
+policy. It does not authorize inference or bypass public-record seals and
+fresh dispatch checks. There is no TTL or singleflight; concurrent cold misses
+can each tokenize, and failed tokenization cannot publish an entry.
 
-Preparation lookahead and retained work have separate lifetimes.
-`embedding_queue_size` contributes to a preparation target
-`min(H,max(1,effective_HTTP_capacity+queue_size))`. Fixed global H is controlled
-by `embedding_max_pending_owners`; it is acquired before sync registration or
-async source pulls and does not grow with discovery. HTTP text quotas still
-use N independently of a positive global guard; each replica owns one original
-lease regardless of native slots. A plan releases that phase lease when all its groups have been prepared
-and its preparation workers finish; ready or in-flight records can still be
-retained. Their byte/token credits, result reservations and shared HTTP leases
-are not released early. This lets several small source windows fill a replica's
-request target without requiring every earlier window's HTTP to finish first.
-Async source-window intake and delivery leases retain their existing bounds.
+## Preparation, controls and interruption
 
-Tokenizer concurrency is bounded across the adapter; HTTP control work has a
-separate bound, and total HTTP capacity is derived from the embedding,
-tokenizer and control limits. Retained records and IDs have no unbounded
-cross-call registry. Limits and identity are rechecked before inference.
+The automatic direct-text path performs no per-input `/tokenize` requests or
+implicit calibration. It does not pretend that every input consumes its whole
+context. Token usage is unknown for direct strings; an explicit pending-token
+policy applies to exact counted/prepared work. The consumer may explicitly ask
+for the character recommendation derived from the 2,500-text calibration;
+category 80% and mixed 90% factors are unchanged.
 
-The 0.10.2 candidate reuses coherent admission metadata instead of fetching
-the same catalog again within a start boundary. This does not turn metadata
-into an inference permit: actual HTTP dispatch still observes loaded identity,
-tokenizer build and current limits after waiting. Metadata counts depend on
-admission and topology events; there is no fixed request count for every run.
+Exact preparation remains available when a consumer requests real counts or
+retained token IDs. Worker defaults follow the actual usable replica count;
+explicit positive worker choices remain explicit. Metadata is acquired only
+when required by the chosen mode. Coherent admission observations can be
+reused within that boundary, while current identity and relevant limits are
+rechecked before POST/recovery. A local observation is not a remote load lease.
 
-A completed exact-token cache can reuse IDs for repeated prepared or raw
-inputs on this adapter. Its key includes verified content/semantic identity,
-tokenizer build, task and the exact prefix/special policy and text. It has no
-alias/path-only authorization. Unknown identity or build bypasses reuse.
-Public prepared records still require a valid same-adapter seal; cached IDs
-do not authorize oversized inputs or bypass fresh dispatch checks.
+Stopping one owner removes its pending work and discards its response portion
+without aborting surviving owners of a shared POST. Transport has one finite
+deadline fixed at dispatch; cancellation does not extend it. The retiring
+owner completes only after actual transport drain, which can outlast its own
+work deadline. All-member Stop or adapter close cancels and drains transport.
+Successful inputs are not replayed.
 
-The cache is a separate retained pool with configurable entry and byte limits
-(defaults 1,024 entries and 8 MiB). Effective bytes are
-`min(embedding_preparation_cache_bytes, embedding_max_pending_bytes // 4)`;
-zero entries or bytes disables retention. LRU eviction and close
-release entries. There is no TTL or singleflight: concurrent cold misses may
-each tokenize, and a failed tokenization does not publish a reusable entry.
-These bytes are additional to raw/ready and async-result budgets, not a total
-process memory ceiling. Diagnostics expose counters without dumping inputs.
-
-An invalid input discovered after valid inputs were dispatched stops/drains the
-window and returns an error. It is never sent for inference, and successful
-earlier work is not replayed. No partial public window is returned. Preparation
-still measures oversized inputs; known limits/identity are rechecked at
-admission. Cancellation, finite deadlines, async backpressure and drained close
-retain the existing contracts.
-
-Cancelling or expiring an owner removes its pending work and discards its
-portion of any shared response without aborting surviving owners. A shared
-transport has one finite deadline fixed from the latest deadline among its
-initial members; later cancellation does not extend it. The cancelled owner's
-completion waits for that transport's actual drain and can therefore outlast
-its own work deadline. When every member is stopped, or the adapter closes,
-the request is cancelled and drained. No successful inputs are replayed.
-
-If an external exception such as `KeyboardInterrupt` or `SystemExit` abandons
-a synchronous call while it waits for the engine Future, that owner is stopped
-and the coordinator is woken. The call waits for its genuine completion/drain
-boundary before reraising the original exception, retaining it through repeated
-interruptions during cleanup. Shared HTTP survivors keep their transport, and
-the adapter and borrowed client remain open. A Future already completed with a
-normal typed worker error simply propagates that error. Drain retains the
-existing finite transport/deadline limits and may outlast the abandoned owner's
-work deadline when another shared owner survives.
+An external exception abandoning a synchronous Future wait retires that owner,
+wakes the engine and waits for real completion/drain before reraising the
+original exception, including through repeated cleanup interruptions. Shared
+survivors and the borrowed client remain open. Async source ownership, explicit
+close and recoverable flat-record errors follow the same engine lifecycle.
 
 ## Native token input
 
-The native `/v1/embeddings` route accepts either texts or token sequences. For
-several prepared inputs the client sends `input: [[id, ...], [id, ...]]`; each
-inner array is one input, including a single-input request. This keeps output
-cardinality explicit. Prefixed text is tokenized once with `add_special=True`
-and `parse_special=True`, and the returned token IDs are retained immutably.
-The native integer-array path copies the IDs without tokenizing strings or
-inserting another BOS/EOS. No prefix or synthetic special token is appended
-when constructing that payload.
+The native `/v1/embeddings` route accepts texts or token sequences. Several
+prepared inputs use `input: [[id, ...], [id, ...]]`; each inner array represents
+one input. Exact prefixed text is tokenized with `add_special=True` and
+`parse_special=True`. Retained immutable IDs already contain that policy;
+payload construction adds neither another prefix nor synthetic BOS/EOS.
 
-This behavior is supported by the pinned build's
-[integer-input implementation](https://github.com/ggml-org/llama.cpp/blob/797de63b2fa7396dcc8caca76834c699ac84e1c3/tools/server/server-common.cpp#L1029-L1061)
-and [official embedding tests](https://github.com/ggml-org/llama.cpp/blob/797de63b2fa7396dcc8caca76834c699ac84e1c3/tools/server/tests/unit/test_embedding.py).
-Source inspection is complemented by explicit text/ID equivalence checks on
-the loaded deployment; a server version string alone is not a binary audit.
+The inspected [integer-input implementation](https://github.com/ggml-org/llama.cpp/blob/797de63b2fa7396dcc8caca76834c699ac84e1c3/tools/server/server-common.cpp#L1029-L1061)
+and [upstream embedding tests](https://github.com/ggml-org/llama.cpp/blob/797de63b2fa7396dcc8caca76834c699ac84e1c3/tools/server/tests/unit/test_embedding.py)
+are versioned source references. Loaded-deployment equivalence requires its own
+qualification; a server version string is not a binary audit.
 
-`embedding_input_format` controls pre-dispatch selection:
-
-| Setting | Behavior |
+| `embedding_input_format` | Behavior |
 | --- | --- |
-| `auto` (default) | Use IDs only with an explicitly declared native client contract and verified record identity, tokenizer build and policy; otherwise choose text before sending. |
-| `text` | Send prepared strings; retain exact counts and admission checks. |
-| `tokens` | Require safe native token input; fail with a typed error before the POST when its conditions are unavailable. |
+| `auto` | Use IDs only with declared native client support and verified identity/build/policy; otherwise select text before sending. |
+| `text` | Send strings while preserving the exact preparation/admission contract when requested. |
+| `tokens` | Require reusable IDs or raise a typed error before embedding dispatch. |
 
-The standard `LlamaCppClient` declares its native input contract. Custom clients
-with unknown support remain on text in `auto`; the adapter does not infer
-support from arbitrary truthy values or send hidden capability inference
-probes. A nonstandard server can be configured explicitly for text input.
-There is no automatic retry as text after an ambiguous token-input failure:
-some sibling inputs may already have been evaluated.
-
-Prepared records retain the existing public text/count/limit fields. Retained
-IDs are covered by the same-adapter seal and can only be reused under the same
-verified weights, tokenizer build and special/prefix policy. Stale/unverified
-records are recounted under the existing policy. Empty tokenizer output remains
-measurable as count zero; `auto` uses text for it and explicit `tokens` rejects
-it before embedding HTTP. The client never manufactures a BOS token.
-
-This removes the second internal tokenization when the native ID path is used.
-Previously unseen texts still require exact `/tokenize` requests. JSON ID arrays may be larger
-than their original strings; bandwidth or latency improvements are measured,
-not assumed. Source splitting, UTF-8 intervals and fragment identity remain
-the consumer's responsibility.
-
-## Configuration example
+Unknown custom clients use text in auto mode. Empty tokenizer output remains
+measurable as zero; auto uses text and explicit tokens rejects it. No
+capability inference POST, ambiguous replay or automatic retry as text is
+introduced. JSON ID arrays may exceed string payload size; reduced latency or
+bandwidth must be measured. Source splitting and fragment identity remain
+consumer responsibilities.
 
 ```python
 from runtime_llama import build_embedding_adapter
 
 adapter = build_embedding_adapter({
     "model": "embedding-model.gguf",
-    "base_url": "http://localhost:8080",
+    "base_url": "http://inference.example.invalid:8080",
     "embedding_replica_discovery": True,
     "batch_size": 256,
-    "embedding_request_parallelism": 2,
-    "token_count_parallelism": 2,
-    "embedding_batch_wait_sec": 0.0,
-    "embedding_max_pending_bytes": 64 * 1024 * 1024,
-    "embedding_max_pending_tokens": 1024 * 1024,
-    "embedding_max_request_bytes": 8 * 1024 * 1024,
+    "embedding_request_parallelism": None,
     "embedding_input_format": "auto",
 })
+try:
+    vectors = adapter.embed_texts(["first document", "second document"])
+finally:
+    adapter.close()
 ```
 
-The existing `embed_texts`/`embed_prepared` and
-[`astream_texts`/`astream_prepared`](ASYNC-EMBEDDING-WINDOWS.md) interfaces share
-these settings. Configure model-specific prefixes and limits as described in
-the [embedding contract](EMBEDDING-CONTRACTS.md).
-
-The [0.9.0 coalescing comparison](verification/COALESCING-TUNING-0.9.0.md)
-records earlier Nomic measurements. Its timer recommendation applies to that
-engine and workload, not automatically to 0.10.2. Compare zero waiting and any
-explicit coalescing value using the same model, build, profiles, corpus and
-numerical thresholds; distinguish preparation, queue, HTTP and total times.
+[Release verification](verification/PUBLIC-RELEASE-0.15.0.md) records executed
+checks separately from live model qualification and consumer acceptance.

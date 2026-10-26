@@ -1,45 +1,46 @@
 # Automatic embeddings and fixed character recommendations
 
-The automatic service discovers one unambiguous verified loaded embedding
-identity group. It owns aliases, replica scheduling, task prefixes and dispatch
-through the same persistent engine as the declared-model adapter. The operator
-owns model loading and server configuration.
+`AutomaticEmbeddingService` selects the requested remote model or one
+unambiguous loaded embedding identity group. It owns task prefixes, replica
+discovery and dispatch through the same engine as the declared-model adapter.
+Different identities remain separate; loading/build/hardware remain operator
+owned. Version 0.15.0 removes implicit text/model/memory quotas without moving
+source splitting, fragment identity or graph/storage into the library.
 
-The 0.13.0a1 contract is governed by Flower `REQ-000042`,
-`GOAL-000024`, `MILE-000025`, `CHANGE-000027`, `PACKET-000028`. It replaces the
-0.12.0a1 minimum-ratio and exact post-failure diagnostics contract. Historical
-qualification reports describe their historical versions. Publication of the
-exact tested artifact is governed separately by `REQ-000043` / `PACKET-000029`;
-see the [prerelease record](verification/PUBLIC-RELEASE-0.13.0a1.md).
+Flower MCP governs this change through requirements `REQ-000061`–`REQ-000069`,
+milestones 36–40 and packets 39–43. See the
+[release verification](verification/PUBLIC-RELEASE-0.15.0.md).
 
 ## Ordinary use
 
 ```python
-from runtime_llama import AutomaticEmbeddingConfig, AutomaticEmbeddingService
+from runtime_llama import AutomaticEmbeddingService
 
-with AutomaticEmbeddingService(AutomaticEmbeddingConfig(
-    base_url="http://inference.example:8080",
-    batch_size=256,
-)) as embeddings:
+with AutomaticEmbeddingService({
+    "base_url": "http://inference.example.invalid:8080",
+    "model": "logical-embedding-name",
+    "batch_size": 256,  # Optional consumer-selected target.
+}) as embeddings:
     status = embeddings.status()
     if status.available:
         vectors = embeddings.embed_texts(["A document to index."])
         query_vector = embeddings.embed_query("What does it describe?")
-
-    # Optional explicit provisioning. Save the snapshot in consumer storage.
+    # Optional explicit provisioning; the consumer can save the snapshot.
     budget = embeddings.character_budget(category="code")
 ```
 
-Construction, availability, ordinary embedding and asynchronous intake never
-start calibration, consult a calibration cache or require a saved character
-limit. Strings go directly to the server. The server tokenizes and enforces its
-context; the library preserves source order and validates cardinality, dimensions
-and finite values. Inputs are never silently truncated or split.
+Construction, availability, ordinary embedding and async intake never start
+calibration or require a saved character limit. Strings go directly to the
+server, which tokenizes and enforces its context. Prefixes are applied once;
+cardinality, dimensions, finite values and source order are validated. Ordinary
+direct inputs do not reserve the entire model context as invented token use.
 
-Only `character_budget()` can start a cold calibration. A consumer may request
-its character recommendation once, save it and send later strings without
-supplying the recommendation back to the library. The consumer owns source
-splitting, fragment IDs, UTF-8 intervals, graph relationships and index storage.
+Only `character_budget()` can start cold calibration. Its recommendation can
+be saved by the consumer and need not be sent back with later strings.
+Recommendations use effective context, without substituting native microbatch
+as a context ceiling. Direct requests do not require metadata needed solely
+for unused tokenizer/cache/calibration paths; pooling equivalent replicas still
+requires the corresponding identity proof. Missing capabilities stay explicit.
 
 ## Public methods
 
@@ -50,44 +51,33 @@ character_budget(*, category=None, input_type="document", timeout=None, cancel=N
 refresh_character_budget(*, category=None, input_type="document", timeout=None, cancel=None)
 embed_texts(texts, *, input_type="document", timeout=None, cancel=None)
 embed_query(text, *, timeout=None, cancel=None)
-astream_texts(windows, *, input_type="document", max_pending_windows=2,
+aiter_texts(texts, *, input_type="document", timeout=None, cancel=None,
+             close_source=False)
+astream_texts(windows, *, input_type="document", max_pending_windows=None,
               timeout=None, cancel=None, close_source=False)
 close()
 await aclose()
 ```
 
-The local `0.13.1.dev1` candidate reuses verified admission within an active
-automatic stream. Readiness observes the pool once; subsequent direct windows
-fork independent call references while the same pool generation remains valid.
-An idle stream holds no pool reference or scheduler permit. Each original
-embedding POST still requires fresh catalog and selected-replica properties;
-recovery keeps its own fresh observations. A full matching-pool topology change
-revokes local reuse, and pool replacement waits for existing calls to drain.
-There is no TTL cache or inference authorization attached to saved observations.
-The public signatures, synchronous/exact paths, batch quotas, deadlines,
-cancellation and bounded intake remain unchanged. This candidate is for isolated
-verification and does not update consumer installations. See the
-[control-overhead verification](verification/STREAM-CONTROL-0.13.1.dev1.md).
+`aiter_texts()` takes a finite text sequence or async text source and yields
+`EmbeddingRecordResult(index, embedding)` in source order. The consumer need
+not divide 10,000 texts into HTTP-sized windows. Individual result ownership
+transfers as records are delivered. Existing `embed_texts()` and
+`astream_texts()` keep their complete-list/window result forms and naturally
+occupy the memory those outputs require. See
+[async interfaces](ASYNC-EMBEDDING-WINDOWS.md).
 
-The follow-up isolated `0.13.1.dev2` candidate gives all windows of one stream
-one private packing identity. Model-wide packing rotates between independent
-consumers and takes the oldest ready windows within each stream first, while
-allowing a POST to span windows. Each window keeps its own cancellation, result
-and ordered delivery. This avoids a demonstrated source-prefetch blockage
-without increasing `max_pending_windows`, changing batch budgets or introducing
-another scheduler. See the
-[window-packing verification](verification/STREAM-WINDOW-0.13.1.dev2.md).
+Observation methods return `AutomaticEmbeddingStatus`. Ordinary availability
+has `max_input_chars`, `category`, `calibration_id` and `budget` set to `None`.
+`refresh_character_budget()` reuses completed matching calibration after fresh
+observation and never calibrates. Without a complete matching profile its
+reason is `character_budget_not_calibrated`, with no budget/cache creation.
 
-Observation methods return `AutomaticEmbeddingStatus`. Ordinary availability has
-`max_input_chars`, `category`, `calibration_id` and `budget` set to `None`.
-`refresh_character_budget()` uses completed matching calibration after fresh
-observation; it never calibrates. Without a complete profile it returns reason
-`character_budget_not_calibrated`, with no budget and no cache creation.
-
-`input_type` is `document`, `query` or `raw`. Query and document prefixes are
-applied once by the selected model policy. Prefix/task policies have separate
-calibrations. A changed opaque `representation_id` requires consumer review
-before reusing an existing vector index.
+`input_type` is `document`, `query` or `raw`. Query/document prefixes are chosen
+from the model contract or explicit `embedding_prefixes`; raw adds no prefix.
+A changed opaque `representation_id` requires consumer review before reusing
+an existing vector index. Identity verification prevents pooling unrelated
+models, not a fixed maximum number of loaded models.
 
 ## The 2,500 hard calibration texts
 
@@ -183,68 +173,69 @@ adapter owners in a shared POST preserve their original error; only automatic
 direct owners take this isolation path. If isolation cannot complete safely,
 it does not claim a complete partial-result partition.
 
-## Ordered asynchronous windows
+## Ordered asynchronous delivery
 
-The asynchronous API shares the same engine, owner cancellation and HTTP
-limits as synchronous calls. Results and recoverable errors are delivered in
-source-window order. A later prefetched rejection cannot discard an earlier
-successful window. Catching `EmbeddingChunkSplitRequiredError` leaves the
-iterator usable; the next `anext()` delivers the next original window. Nothing
-is replayed automatically. If recovery should occur before later delivery,
-handle it before calling `anext()` again.
+All async methods share the same engine and HTTP scheduler as synchronous
+calls. Complete windows and recoverable errors are delivered in source order;
+flat records use their global occurrence index. For a flat
+`EmbeddingChunkSplitRequiredError`, `window_index` identifies that global
+record while nested indices/spans remain relative to the singleton occurrence.
+The error remains its original type and iteration can continue. Nothing is
+silently replayed. An exception escaping `async with` closes the stream.
 
-Use an explicit `anext()` loop to continue after recoverable errors. An exception
-escaping an `async with` body closes and drains the stream normally. Other
-errors remain fail-stop. `timeout` bounds readiness and each individual window,
-not the whole stream. Source iterators are borrowed unless `close_source=True`.
-Paused successful or partial results remain covered by result credits until
-ordered delivery; closing drains all owned requests.
+`timeout` bounds readiness and each source window/record's work, not the whole
+stream. Sources are borrowed unless `close_source=True`. Use `async with` or
+`aclose()` for deterministic early Stop; dropping the flat facade signals Stop
+and schedules actual inner drain on its live loop. Already closed event loops
+and uncooperative user code cannot be made to perform asynchronous cleanup.
 
-## Batching, concurrency and bounds
+## Batching, concurrency and capacity choices
 
-`batch_size` is the total text distribution budget. With budget 256, two usable
-replicas can each receive up to 128 texts; four can receive up to 64. These are
-text quotas, separate from per-input context, aggregate HTTP token limits and
-native computation batch/microbatch sizes. Quotas can require multiple HTTP
-requests. Missing/`None` `request_parallelism` admits up to N verified replicas;
-a positive G caps original HTTP work to `min(N,G)` without reducing N-wide
-quotas. Each canonical replica has one original lease; native slots and batch
-settings remain observations. Fixed global owner/memory credits can limit
-actual admission further. No compulsory accumulation timer or second scheduler
-is introduced.
+`batch_size=None` imposes no fixed text target. An explicit B is a total text
+distribution target across N verified replicas: B=256/N=2 gives up to 128 texts
+per quota, and N=4 up to 64. Neither value is a maximum total input count.
+`request_parallelism=None` uses N; a positive G caps original HTTP work to
+`min(N,G)` independently of quota width. Each canonical replica owns one
+original lease through its serial isolation descendants and actual drain.
+Native slots/batch/microbatch do not multiply HTTP permits.
 
-Compatible admitted records accumulate across callers/windows. Source windows
-are delivery boundaries, not forced HTTP fragmentation boundaries. Isolation
-holds the original alias lease and serializes its own descendant calls; workers
-on other aliases remain able to run. Each verified replica permits one original embedding HTTP call at a time,
-independent of its native parallel setting. Adding a synonym does not increase
-capacity; another loaded canonical destination requires content/semantic
-identity verification.
+Compatible records accumulate across source windows. No mandatory timer or
+second scheduler is added. Worker defaults follow the actual pool; there is
+no fixed preparation/control cap of one, two or four models.
 
 | Setting | Default | Meaning |
-| --- | ---: | --- |
-| `embedding_max_request_bytes` | 8 MiB | Serialized embedding request bound. |
-| `embedding_max_response_bytes` | 8 MiB | Decoded HTTP response bound, including decompressed gzip. |
-| `request_parallelism` | `None` | Automatic N; positive values are global guards, independent of text quota width. |
-| `embedding_max_pending_owners` | Derived once from guard-or-2 plus queue | Shared sync/async H before retention/pulls; never multiplied by N. |
-| `embedding_max_pending_bytes` | 64 MiB | Separate snapshot, working and complete-result pools; handoff has a separate finite envelope. |
-| `embedding_max_pending_tokens` | 1,048,576 | Queue reservation units for direct inputs; not measured tokens. |
-| `embedding_isolation_max_requests` | 512 | Maximum descendant POSTs per originally failed POST, excluding that root request. |
-| `http_connection_policy` | `"close"` | Independent connections for an owned client; `"reuse"` explicitly enables keep-alive. |
+| --- | --- | --- |
+| `batch_size` | `None` | Optional total text target, independent of input size. |
+| `request_parallelism` | `None` | Automatic N; positive values are explicit HTTP guards. |
+| `calibration_workers` | `None` | Follows the active pool unless explicitly selected; no former 32-worker validation maximum. |
+| `embedding_capacity_limits` | `False` | Explicit opt-in required before scalar capacity fields take effect. |
+| `embedding_max_pending_owners`, `queue_size` | `None` | Optional owner/lookahead policies; no derived H preset. |
+| `embedding_max_pending_bytes`, `embedding_max_pending_tokens` | `None` | Optional pending/output policies; no implicit 64 MiB or 1,048,576 allowance. |
+| `embedding_max_request_bytes`, `embedding_max_response_bytes` | `None` | Independently requested payload/response controls. |
+| `embedding_max_handoff_bytes` | `None` | Independent optional handoff control; no 75/25 partition or response/16 transformation. |
+| `embedding_isolation_max_requests` | `None` | Optional descendant-request policy. |
+| `embedding_preparation_cache_enabled` | `False` | Explicitly enables session-owned exact preparation reuse. |
+| `http_connection_policy` | `"close"` | Independent owned connections; `"reuse"` enables keep-alive. |
+| `timeout`, `calibration_timeout` | `120`, `600` seconds | Finite work budgets, preserving cancellation and cleanup. |
 
-Explicit integer limits must be positive; `request_parallelism` and
-`embedding_max_pending_owners` also allow their documented automatic `None`. There is also an overall finite original
-call/window deadline. Isolation checks cancellation and fresh model/limit
-observations before descendant calls. With N rows the full binary isolation
-tree has at most `2*N-1` POSTs including the root, before the configured cap.
-A descendant cancellation retires its participating owner; healthy sibling
-owners are not cancelled. Close waits for actual transport drain.
+`embedding_capacity_limits=True` enables only the supplied capacity values;
+missing fields remain unset. Legacy scalar values alone do not reactivate old
+policies. Explicit `max_pending_windows` on a window stream remains a separate
+consumer choice. Batch targets and HTTP guards are also independent of this
+capacity switch. No automatic RAM sizing, compulsory whole-result reservation,
+memory-driven candidate halving, implicit spill to disk or constant-RSS promise
+is installed.
 
-Direct queue token accounting conservatively reserves the observed allowance
-per input without invoking the tokenizer. This is not an input token count or
-an admission guarantee. Large allowances may require a larger explicitly
-configured pending-token budget. Byte, text, result and HTTP limits remain
-independent; they are not a claim about total operating-system RSS.
+The session preparation cache is distinct from persisted calibration profiles.
+An explicitly enabled preparation cache clears at close. Its entry/byte controls
+are available on the adapter profile through the capacity opt-in; absent quotas
+allow deliberate session retention to grow. Ordinary direct embeddings do not
+consult this exact-token cache.
+
+Without an explicit isolation-request cap, a finite N-input binary subdivision
+has at most `2*N-1` POSTs including its root. The existing deadline and Stop are
+still checked. Healthy sibling owners survive another owner's withdrawal;
+close waits for real transport drain.
 
 ## Persistence and failure handling
 
@@ -265,13 +256,12 @@ missing status is not assumed to mean loaded.
 ## Qualification boundaries
 
 Deterministic tests, installed-wheel checks, live server qualification and
-consumer acceptance are separate. The current live server has one loaded Nomic;
-two-alias HTTP barrier fixtures prove scheduler overlap separately. Reported
-client wall times include networking, preparation and validation, not pure GPU
-time. The existing cross-replica numerical finding remains open; this contract
-does not relax its tolerances or modify consumers or loaded models.
+consumer acceptance remain separate. The release record distinguishes actual
+new checks from historical measurements. No fresh 0.15 live result or consumer
+migration is implied by these contracts. Client wall times include networking,
+preparation, controls and decoding; they are not pure GPU time.
 
-See [concurrency and ownership](CONCURRENCY-AND-DIAGNOSTICS.md) for the separate
-result/handoff lifetimes, finite control JSON, progress reserve and bounded
-HTTP diagnostics. Category 80% and mixed 90% factors, the 2,500-text calibration
-trigger and persisted recommendation are unchanged by this scheduler candidate.
+The earlier strict numerical repeatability failures remain retained as the
+operator-accepted model-profile limitation; no numerical or retrieval-quality
+pass is invented. See [resource ownership](CONCURRENCY-AND-DIAGNOSTICS.md) and
+[0.15.0 verification](verification/PUBLIC-RELEASE-0.15.0.md).
