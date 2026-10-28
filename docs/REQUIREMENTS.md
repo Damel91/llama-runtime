@@ -1,6 +1,12 @@
 # Functional requirements
 
-The current 0.15.0 lifecycle follows Flower's adopted architecture revision 6,
+Version 0.16.0 adds Flower requirements `REQ-000070`–`REQ-000072`, milestone
+`MILE-000041` and packet `PACKET-000044`: Strata LLM compatibility, automatic
+runtime/model discovery with request-local routing, and a verified portable
+release. See [automatic runtimes](AUTOMATIC-RUNTIMES.md). Earlier acceptance
+and numerical-profile findings are preserved separately.
+
+The 0.15.0 baseline follows Flower's adopted architecture revision 6,
 requirements `REQ-000061`–`REQ-000069`, milestones `MILE-000036`–`MILE-000040`
 and packets `PACKET-000039`–`PACKET-000043`. The
 [earlier optimization plan](EMBEDDING-OPTIMIZATION-PLAN-20261025.md) remains

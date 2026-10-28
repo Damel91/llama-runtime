@@ -1,7 +1,7 @@
 # Functional contract coverage
 
 `llama-runtime` provides a Python HTTP client, contracts, profiles and adapters
-for generation and embedding with llama.cpp servers. The functional comparison
+for LLM generation with llama.cpp or Strata, and embeddings with llama.cpp. The functional comparison
 below concerns behavior, not identical server protocols or implementations.
 It does not certify live compatibility or consumer acceptance.
 
@@ -14,7 +14,7 @@ the upstream package's bootstrap code. The Python distribution remains
 
 | Area | Library contract | Adaptation or limit |
 | --- | --- | --- |
-| Contracts and roles | Generation/embedding interfaces, results, events, errors, profiles and Python adapter factories. | The backend is llama.cpp HTTP; there is no alternative-provider registry. |
+| Contracts and roles | Generation/embedding interfaces, results, events, errors, profiles and Python adapter factories. | LLM backends are llama.cpp and Strata; deployment endpoints can be probed and selected automatically from the requested model. Embeddings remain llama.cpp-only. |
 | Identity and context | Endpoint, model, declared runtime identity and external context are separate from role/request parameters. Logical limits are compared with known context. | The library does not inspect remote binaries or reallocate context/KV. Missing metadata stays unknown. |
 | Generation | Blocking and streaming calls, visible text, separate reasoning, removal of inline thinking and structured output. | Chat uses `/v1/chat/completions`. Templates, schemas and reasoning options need qualification with the intended build and model. |
 | History and tools | Structured messages, tool results with `tool_call_id`, tool schemas and tool-call deltas preserve names, identifiers and arguments. | The library returns tool calls; it does not execute them. |
@@ -27,8 +27,10 @@ the upstream package's bootstrap code. The Python distribution remains
 ## Operational boundaries
 
 The configured server can be local or remote. Its operator owns builds,
-binaries, processes and loading resources. The library neither launches a
-local runtime nor selects a fallback when an endpoint is unavailable.
+binaries, processes and loading resources. Automatic mode selects a currently
+loaded matching model among configured endpoints before submitting a request.
+It never launches a runtime, substitutes another model or replays a submitted
+POST on a fallback. See [automatic runtime routing](AUTOMATIC-RUNTIMES.md).
 
 The selected server's auto-load policy is allowed. The client does not force
 `autoload=false` or independently run a load/unload protocol. Adapter `load()`

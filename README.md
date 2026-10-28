@@ -1,25 +1,25 @@
 # llama-runtime
 
-A Python library for **llama.cpp / llama-server HTTP servers**, providing
-generation and embedding adapters for local servers, remote hosts and private
-networks. The Python distribution is `runtime-llama` and the import namespace is
+A Python inference client for **llama.cpp / llama-server and Strata**, with
+automatic runtime detection and model-based LLM routing, plus llama.cpp
+embedding adapters for local servers, remote hosts and private networks. The Python distribution is `runtime-llama` and the import namespace is
 `runtime_llama`. Python 3.11 or later is required. Runtime dependencies are
-`requests` and `urllib3`.
+`requests`, `urllib3` and `jsonschema`.
 
-The current stable release is **0.15.0**. See the
-[release assets](https://github.com/Damel91/llama-runtime/releases/tag/v0.15.0)
-and [verification record](docs/verification/PUBLIC-RELEASE-0.15.0.md), including
+The current stable release is **0.16.0**. See the
+[release assets](https://github.com/Damel91/llama-runtime/releases/tag/v0.16.0)
+and [verification record](docs/verification/PUBLIC-RELEASE-0.16.0.md), including
 the accepted numerical limitation of the measured server/model profile.
 
 ## Why this library exists
 
 `llama-runtime` was created to give agents, coding tools, retrieval pipelines
-and other Python applications reusable building blocks for llama.cpp inference.
+and other Python applications reusable building blocks for remote inference.
 It brings conversation handling, streaming, tool-call data, exact embedding
 preparation and replica scheduling into a common client API.
 
 Applications configure inference requests and consume typed results. The server
-operator controls the llama.cpp build, model loading, context allocation,
+operator controls the runtime build, model loading, context allocation,
 processes and hardware. This separation lets applications use a manually
 started server, a managed service or a remote endpoint through the same adapters.
 Sampling settings can be adjusted per request while a model stays loaded.
@@ -31,10 +31,11 @@ The project's engineering lifecycle is managed with
 
 | Capability | What the library provides |
 | --- | --- |
+| Automatic runtime routing | Probe configured endpoints, list loaded models per runtime and select llama.cpp or Strata from the requested model; keep each concurrent request on its selected route. |
 | Text generation | Blocking calls, text streaming and streams containing text, reasoning, tool fragments and final metadata. |
 | Conversations | Structured message histories, including system, developer, user, assistant and tool messages; preserves tool identifiers and additional message fields. |
 | Inference controls | Output budgets, temperature, top-p, top-k, min-p, repetition penalties, template options and per-call server extensions. |
-| Structured output | JSON output mode and JSON schema forwarding, subject to the server build and model's support. |
+| Structured output | Native llama.cpp JSON/schema forwarding; Strata JSON Schema projection and local validation before a successful complete response. |
 | Reasoning | Separate reasoning output, configurable reasoning policies and removal of inline thinking from visible text. |
 | Tool calls | Tool definitions and choice controls, streamed argument assembly, complete structured calls and correlation with tool results. |
 | Usage and outcomes | Token counters, terminal reasons, bounded transport metadata and optional typed native server timings; unavailable counters remain unknown. |
@@ -59,10 +60,50 @@ The project's engineering lifecycle is managed with
 
 The consumer executes tools and MCP calls and supplies subsequent conversation
 messages. Reasoning and structured-output behavior depend on the selected
-server build, model and chat template. Responses are not locally validated
-against the forwarded JSON Schema. Splitting source documents and tracking their
+server build, model and chat template. Strata structured responses are validated
+locally before successful completion; llama.cpp retains native schema forwarding. Splitting source documents and tracking their
 fragments belong to the consuming application. The server's own auto-loading
 policy is supported.
+
+## Release 0.16.0: Strata and automatic runtime selection
+
+The deployment supplies the network endpoints; the inference consumer requests
+its model. The library identifies the supported runtimes, lists their loaded
+models and chooses the adapter automatically. Servers on the same IP use
+different listening ports. No model or runtime process is started by the client.
+
+```python
+from runtime_llama import build_adapter
+
+llm = build_adapter({
+    "model": "chat-model",
+    "runtime_endpoints": [
+        {"name": "inference-a", "base_url": "http://localhost:8080"},
+        {"name": "inference-b", "base_url": "http://localhost:8082"},
+    ],
+    "temperature": 0.2,
+})
+try:
+    catalog = llm.discover_models()
+    for runtime in catalog.runtimes:
+        print(runtime.endpoint.name, runtime.backend,
+              [model.id for model in runtime.loaded_models])
+    result = llm.generate_with_metadata("Explain this change.")
+    print(result.text, result.runtime_selection.backend)
+finally:
+    llm.close()
+```
+
+Every generation refreshes the configured runtime catalog and pins its selected
+backend and canonical model for that call. Stream events and blocking results
+carry their own `runtime_selection`. Unsupported or unreachable endpoints stay
+visible as diagnostics; model identity conflicts and ambiguous aliases fail
+explicitly. There is no silent model substitution or retry of a submitted POST.
+
+Existing direct llama.cpp adapters and embedding contracts remain available.
+Strata support is LLM-only; this release does not add Ollama, OpenAI or LM Studio
+providers. See [automatic runtime discovery and Strata](docs/AUTOMATIC-RUNTIMES.md)
+for signatures, routing policy, endpoint credentials and structured output.
 
 ## Release 0.15.0: progressive input and explicit capacity policies
 
@@ -90,7 +131,7 @@ Resource correctness is verified through ownership transfer and release on
 success, errors, cancellation, abandonment and close. A complete list or
 consumer-retained results still require their natural memory; constant RSS,
 implicit disk spilling and consumer migration are not promised.
-See the [release verification](docs/verification/PUBLIC-RELEASE-0.15.0.md),
+See the [release verification](docs/verification/PUBLIC-RELEASE-0.16.0.md),
 [resource contract](docs/CONCURRENCY-AND-DIAGNOSTICS.md) and
 [async interfaces](docs/ASYNC-EMBEDDING-WINDOWS.md).
 
@@ -339,10 +380,10 @@ results and deployment boundaries.
 With Python 3.11 or later, install the tagged source:
 
 ```bash
-python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.15.0'
+python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.16.0'
 ```
 
-Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.15.0),
+Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.16.0),
 or run the following from a checkout:
 
 ```bash
@@ -392,8 +433,8 @@ for the bridge-owned client pattern, authentication policy and cleanup limits.
 sampling overrides and server extensions while protecting managed request
 fields. `num_ctx` is a logical consumer limit; it does not reallocate server
 context. Reasoning, templates and JSON schema support depend on the server
-build and model. The library forwards JSON schemas without locally validating
-the response against JSON Schema.
+build and model. The llama.cpp adapter forwards JSON schemas to the server; the Strata adapter
+also validates completed structured responses locally.
 
 ## Discover available and loaded models
 
@@ -424,7 +465,7 @@ directory, hostname, enrollment credentials when needed, coordination server
 and inference endpoint. The Python wheel remains portable and contains no
 native binary. Importing or constructing the library never launches a VPN.
 
-The [release](https://github.com/Damel91/llama-runtime/releases/tag/v0.15.0)
+The [release](https://github.com/Damel91/llama-runtime/releases/tag/v0.16.0)
 provides separate helper archives for macOS ARM64, Linux AMD64 and Windows
 AMD64. Go is needed to build the helper from source, not to run a supplied
 binary. Both Tailscale's coordinator and an explicit HTTPS Headscale
@@ -590,6 +631,7 @@ requires its separately distributed native helper.
 - [Architecture and mapping](docs/ARCHITECTURE.md)
 - [Functional parity and limits](docs/FUNCTIONAL-PARITY.md)
 - [Read-only model discovery](docs/MODEL-DISCOVERY.md)
+- [Automatic runtime routing and Strata](docs/AUTOMATIC-RUNTIMES.md)
 - [Embedding preparation and batching](docs/EMBEDDING-CONTRACTS.md)
 - [Progressive preparation and native token inputs](docs/PROGRESSIVE-EMBEDDING.md)
 - [Asynchronous embedding windows](docs/ASYNC-EMBEDDING-WINDOWS.md)

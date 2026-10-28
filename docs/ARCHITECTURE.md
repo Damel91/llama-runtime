@@ -1,6 +1,14 @@
 # Architettura della libreria
 
-La versione 0.15.0 segue l'architettura adottata revisione 6 di Flower MCP,
+La 0.16.0 aggiunge il backend LLM Strata e il catalogo automatico dei runtime,
+gestiti con Flower in `MILE-000041`, `REQ-000070`–`REQ-000072` e
+`PACKET-000044`. Gli endpoint appartengono alla configurazione del deployment;
+il modello richiesto determina il backend. Ogni chiamata conserva client e
+selezione propri fino alla chiusura, senza modificare la rotta delle chiamate
+concorrenti. Il probe usa solo GET e non carica modelli. Il motore embedding
+precedente rimane invariato. Dettagli e API: [runtime automatici](AUTOMATIC-RUNTIMES.md).
+
+La base 0.15.0 segue l'architettura adottata revisione 6 di Flower MCP,
 requisiti `REQ-000061`–`REQ-000069`, milestone `MILE-000036`–`MILE-000040`
 e packet `PACKET-000039`–`PACKET-000043`. La precedente
 [proposta del 25 ottobre](EMBEDDING-OPTIMIZATION-PLAN-20261025.md) conserva
