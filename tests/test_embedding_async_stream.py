@@ -1276,7 +1276,10 @@ def test_empty_window_does_not_compare_a_stale_dimension_snapshot(monkeypatch):
     """An empty result has no dimension even when a sibling learns one first."""
 
     async def scenario():
-        client = ContractClient(1)
+        # The fixture deliberately blocks one result conversion until its
+        # sibling commits a dimension. Give those conversions separate control
+        # workers; blocking the only worker would create a test-only cycle.
+        client = ContractClient(2)
         adapter = configured(
             client,
             dimension=None,
@@ -1310,6 +1313,7 @@ def test_empty_window_does_not_compare_a_stale_dimension_snapshot(monkeypatch):
                 client._wait(
                     dimension_known, cancel=call.probe, timeout=call.remaining()
                 )
+                assert adapter._engine.control_workers == 2
                 assert call.dimension is None and adapter.embedding_dim == 2
             value = finish(call, operation, outputs)
             if outputs:

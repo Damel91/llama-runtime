@@ -1,4 +1,4 @@
-"""Functional contracts for an externally managed llama.cpp HTTP server."""
+"""Functional contracts for externally managed inference runtimes."""
 
 from runtime_llama.contracts import (
     BaseLLMAdapter,
@@ -55,6 +55,7 @@ from runtime_llama.usage import (
     LLMTransportAttempt,
     LLMUsageStats,
     LLMServerTimings,
+    RuntimeSelection,
 )
 from runtime_llama.mcp import (
     MCPCallResult,
@@ -79,15 +80,34 @@ from runtime_llama.model_discovery import (
     discover_models,
 )
 from runtime_llama.adapters.llama import LlamaCppAdapter
+from runtime_llama.adapters.strata import StrataAdapter
+from runtime_llama.adapters.automatic import AutoRuntimeAdapter
+from runtime_llama.runtime_discovery import (
+    RuntimeBackend,
+    RuntimeEndpoint,
+    RuntimeObservation,
+    RuntimeCatalog,
+    RuntimeModelSelection,
+    discover_runtimes,
+)
 from runtime_llama.adapters.embedding import LlamaCppEmbeddingAdapter
 from runtime_llama.factory import build_adapter, build_embedding_adapter
 from runtime_llama.tailnet import TailnetConfig, TailnetError, TailnetHelper
 
 from runtime_llama.embedding_records import EmbeddingRecordResult, EmbeddingRecordStream
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 
 __all__ = [
+    "StrataAdapter",
+    "AutoRuntimeAdapter",
+    "RuntimeBackend",
+    "RuntimeSelection",
+    "RuntimeEndpoint",
+    "RuntimeObservation",
+    "RuntimeCatalog",
+    "RuntimeModelSelection",
+    "discover_runtimes",
     "EmbeddingRecordResult",
     "EmbeddingRecordStream",
     "EmbeddingSourceSpan",

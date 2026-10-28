@@ -13,7 +13,7 @@ from dataclasses import dataclass, field, replace
 import os
 import math
 import time
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence
 
 from runtime_llama.client import LlamaCppClient
 from runtime_llama._proxy import assert_client_proxy, normalize_proxy_url, proxy_secrets
@@ -111,6 +111,8 @@ class LlamaCppAdapter(LLMAdapter):
     metadata. It does not resize context or load a model. Sampling and tools are
     request-local; the selected server owns any model auto-load policy.
     """
+
+    _client_trust_env = True
 
     def __init__(
         self,
@@ -217,6 +219,7 @@ class LlamaCppAdapter(LLMAdapter):
                 else self._generation_config.stream_idle_timeout_sec
             ),
             verify_ssl=self._model_config.verify_ssl,
+            trust_env=self._client_trust_env,
             proxy_url=self._model_config.proxy_url,
             connection_policy=getattr(
                 self._model_config, "http_connection_policy", "close"
@@ -400,11 +403,25 @@ class LlamaCppAdapter(LLMAdapter):
         if output_mode == "json":
             if "response_format" in body:
                 raise ValueError("llama_response_format_overrides_managed_fields")
-            body["response_format"] = {"type": "json_object"}
-            if config.json_schema is not None:
-                body["response_format"]["schema"] = deepcopy(config.json_schema)
+            body["response_format"] = self._json_response_format(config.json_schema)
         body["messages"] = self._chat_messages(messages)
         return body
+
+    def _json_response_format(self, schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        response: Dict[str, Any] = {"type": "json_object"}
+        if schema is not None:
+            response["schema"] = deepcopy(schema)
+        return response
+
+    def _response_validator(
+        self, body: Mapping[str, Any]
+    ) -> Optional[Callable[[str], None]]:
+        """Optional provider validation before a completed success terminal.
+
+        Ordinary text streams retain no extra response copy. A provider may
+        require complete structured output to check its declared contract.
+        """
+        return None
 
     @staticmethod
     def _positive_integer(value: Any, name: str) -> int:
@@ -552,6 +569,8 @@ class LlamaCppAdapter(LLMAdapter):
             output_format=output_format,
             request_options=request_options,
         )
+        validator = self._response_validator(body)
+        response_parts: Optional[List[str]] = [] if validator is not None else None
         request_messages = body.pop("messages")
         started = time.monotonic()
         event_count = 0
@@ -638,6 +657,8 @@ class LlamaCppAdapter(LLMAdapter):
                     if value is not None and not isinstance(value, str):
                         raise LLMBackendError("llama_malformed_chat_text")
                     if value:
+                        if kind == "content" and response_parts is not None:
+                            response_parts.append(value)
                         yield LLMStreamEvent(kind=kind, text=value)
                 if "tool_calls" in delta:
                     self._merge_tool_deltas(tool_calls, delta["tool_calls"])
@@ -666,6 +687,8 @@ class LlamaCppAdapter(LLMAdapter):
             calls = self._completed_tools(tool_calls)
             if finish_reason == "tool_calls" and not calls:
                 raise LLMBackendError("llama_tool_finish_without_calls")
+            if validator is not None and finish_reason == "stop" and not calls:
+                validator("".join(response_parts or ()))
             terminal = {
                 "stop": "completed",
                 "length": "length_cap",
@@ -803,6 +826,7 @@ class LlamaCppAdapter(LLMAdapter):
                 },
                 thinking_diagnostic=result.thinking_diagnostic,
                 server_timings=result.server_timings,
+                runtime_selection=result.runtime_selection,
             )
         except (
             LLMBackendError,

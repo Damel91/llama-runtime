@@ -5,14 +5,14 @@ backend-path = ["."]
 
 [project]
 name = "runtime-llama"
-version = "0.15.0"
-description = "Python adapters for llama.cpp HTTP servers: streaming, tool calls, embeddings and replica discovery"
+version = "0.16.0"
+description = "Python inference client for llama.cpp and Strata: automatic runtime routing, streaming, tools and embeddings"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE", "src/runtime_llama/_vendor/llamatelemetry.LICENSE"]
 authors = [{name = "Davide Mele"}]
-dependencies = ["requests>=2.31,<3", "urllib3>=1.26.20,<3"]
+dependencies = ["requests>=2.31,<3", "urllib3>=1.26.20,<3", "jsonschema>=4.23,<5"]
 
 [project.urls]
 Repository = "https://github.com/Damel91/llama-runtime"

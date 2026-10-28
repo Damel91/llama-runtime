@@ -2,10 +2,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Protocol
 from collections.abc import Mapping
 
 from runtime_llama.diagnostics import ThinkingDiagnostic
+
+
+class RuntimeSelection(Protocol):
+    """Request-local routing metadata, without importing HTTP dependencies.
+
+    Automatic adapters return the immutable ``RuntimeModelSelection`` catalog
+    object. This structural contract keeps ordinary result annotations usable
+    independently of discovery, including ``typing.get_type_hints``.
+    """
+
+    runtime: Any
+    model: Any
+
+    @property
+    def backend(self) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -144,6 +159,7 @@ class LLMStreamEvent:
     data: Optional[Dict[str, Any]] = None
     thinking_diagnostic: Optional[ThinkingDiagnostic] = None
     server_timings: Optional[LLMServerTimings] = None
+    runtime_selection: RuntimeSelection | None = None
 
 
 @dataclass(frozen=True)
@@ -158,3 +174,4 @@ class LLMCallResult:
     tool_calls: tuple[Dict[str, Any], ...] = ()
     thinking_diagnostic: Optional[ThinkingDiagnostic] = None
     server_timings: Optional[LLMServerTimings] = None
+    runtime_selection: RuntimeSelection | None = None

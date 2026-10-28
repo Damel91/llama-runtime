@@ -175,9 +175,12 @@ class _StreamAccumulator:
         self._server_timings: Optional[LLMServerTimings] = None
         self._terminal_reason = "completed"
         self._tool_calls: tuple[Dict[str, Any], ...] = ()
+        self._runtime_selection = None
 
     def consume(self, event: LLMStreamEvent) -> Iterator[str]:
         kind = str(event.kind or "")
+        if event.runtime_selection is not None:
+            self._runtime_selection = event.runtime_selection
         if event.usage is not None:
             self._usage = event.usage
         if event.transport is not None:
@@ -288,6 +291,7 @@ class _StreamAccumulator:
             tool_calls=self._tool_calls,
             thinking_diagnostic=self.finish_diagnostic(terminal_reason),
             server_timings=self._server_timings,
+            runtime_selection=self._runtime_selection,
         )
 
 
@@ -452,6 +456,7 @@ class BaseLLMAdapter(ABC):
                 tool_calls=result.tool_calls,
                 thinking_diagnostic=result.thinking_diagnostic,
                 server_timings=result.server_timings,
+                runtime_selection=result.runtime_selection,
             )
         except (
             LLMBackendError,

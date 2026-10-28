@@ -297,10 +297,47 @@ class AdapterProfile:
     embedding_isolation_max_requests: int | None = None
     embedding_preparation_cache_entries: int | None = None
     embedding_preparation_cache_bytes: int | None = None
+    backend_id: str = "llamacpp"
+    runtime_endpoints: tuple[Any, ...] = ()
+    runtime_discovery_timeout: float = 5.0
 
     def __post_init__(self) -> None:
         if self.adapter_type not in {"llm", "embedding"}:
             raise ValueError("adapter_type must be llm or embedding")
+        if not isinstance(self.backend_id, str) or self.backend_id not in {
+            "llamacpp",
+            "strata",
+            "auto",
+        }:
+            raise ValueError("unsupported runtime backend")
+        if self.adapter_type == "embedding" and (
+            self.backend_id != "llamacpp" or self.runtime_endpoints
+        ):
+            raise ValueError("automatic runtime routing is currently LLM-only")
+        if not isinstance(self.runtime_endpoints, (tuple, list)):
+            raise ValueError("runtime_endpoints must be a sequence")
+        if self.runtime_endpoints:
+            from runtime_llama.runtime_discovery import RuntimeEndpoint
+
+            object.__setattr__(
+                self,
+                "runtime_endpoints",
+                tuple(
+                    RuntimeEndpoint.from_value(value)
+                    for value in self.runtime_endpoints
+                ),
+            )
+            if self.backend_id != "auto":
+                raise ValueError("runtime_endpoints require automatic routing")
+        object.__setattr__(
+            self,
+            "runtime_discovery_timeout",
+            _finite(
+                self.runtime_discovery_timeout,
+                "runtime_discovery_timeout",
+                positive=True,
+            ),
+        )
         if (
             self.adapter_type == "embedding"
             and self.generation.stream_idle_timeout_sec is None
@@ -386,12 +423,16 @@ class AdapterProfile:
         defaults: dict[str, Any] | None = None,
     ) -> AdapterProfile:
         merged = {**(defaults or {}), **(role_cfg or {})}
-        if merged.get("backend", "llamacpp") not in {
-            "llamacpp",
-            "llama.cpp",
-            "llama_cpp",
-        }:
-            raise ValueError("runtime-llama supports only llama.cpp HTTP")
+        backend = merged.get(
+            "backend", "auto" if merged.get("runtime_endpoints") else "llamacpp"
+        )
+        if not isinstance(backend, str):
+            raise ValueError("unsupported runtime backend")
+        backend = {"llama.cpp": "llamacpp", "llama_cpp": "llamacpp"}.get(
+            backend, backend
+        )
+        if backend not in {"llamacpp", "strata", "auto"}:
+            raise ValueError("unsupported runtime backend")
         # Historical LM Studio lifecycle knobs are never silently accepted.
         forbidden = {
             "lmstudio_load_config",
@@ -489,7 +530,16 @@ class AdapterProfile:
             )
             if name in merged
         }
-        return cls(merged.get("adapter_type", "llm"), model, role, generation, **emb)
+        return cls(
+            merged.get("adapter_type", "llm"),
+            model,
+            role,
+            generation,
+            backend_id=backend,
+            runtime_endpoints=merged.get("runtime_endpoints", ()),
+            runtime_discovery_timeout=merged.get("runtime_discovery_timeout", 5.0),
+            **emb,
+        )
 
     @property
     def role_id(self) -> str:
@@ -505,7 +555,7 @@ class AdapterProfile:
 
     @property
     def backend(self) -> str:
-        return "llamacpp"
+        return self.backend_id
 
     raw_backend = backend
 
