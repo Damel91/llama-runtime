@@ -52,9 +52,12 @@ class _ThinkingStreamStripper:
         self,
         adapter: "BaseLLMAdapter",
         on_thinking: Optional[Callable[[str], None]] = None,
+        *,
+        log_thinking: bool = True,
     ):
         self._adapter = adapter
         self._on_thinking = on_thinking
+        self._log_thinking = log_thinking
         self._buffer = ""
         self._thinking_chars = 0
         self._in_think = False
@@ -65,7 +68,8 @@ class _ThinkingStreamStripper:
             self._on_thinking(text)
 
     def _finish_thinking(self) -> None:
-        self._adapter._log_thinking_chars(self._thinking_chars)
+        if self._log_thinking:
+            self._adapter._log_thinking_chars(self._thinking_chars)
         self._thinking_chars = 0
 
     @staticmethod
@@ -140,14 +144,20 @@ class _StreamAccumulator:
         thinking_diagnostics: Optional[ThinkingDiagnosticsConfig] = None,
         thinking_sink: Optional[ThinkingDiagnosticSink] = None,
         collect_reasoning: bool = True,
+        inspection_only: bool = False,
     ) -> None:
         self._adapter = adapter
+        self._inspection_only = inspection_only
+        self._diagnostic_override: Optional[ThinkingDiagnostic] = None
         configured = getattr(
             getattr(adapter, "_generation_config", None), "thinking_diagnostics", None
         )
         capture_config = ThinkingDiagnosticsConfig.from_value(
             configured if thinking_diagnostics is None else thinking_diagnostics
         )
+        if inspection_only:
+            capture_config = ThinkingDiagnosticsConfig(enabled=False)
+            thinking_sink = None
         self._capture_enabled = capture_config.enabled
         self._capture = _ThinkingCapture(
             capture_config,
@@ -156,11 +166,14 @@ class _StreamAccumulator:
             sink=thinking_sink,
             secrets=getattr(adapter, "_diagnostic_secrets", ()),
         )
-        self._stripper = adapter._new_thinking_stream_stripper(
-            (lambda text: self._capture.observe("inline", text))
-            if self._capture_enabled
-            else None
-        )
+        if inspection_only:
+            self._stripper = _ThinkingStreamStripper(adapter, log_thinking=False)
+        else:
+            self._stripper = adapter._new_thinking_stream_stripper(
+                (lambda text: self._capture.observe("inline", text))
+                if self._capture_enabled
+                else None
+            )
         self._detector = adapter._new_runaway_detector()
         self._visible_char_limit = adapter._visible_output_char_limit(
             visible_output_token_limit
@@ -176,11 +189,14 @@ class _StreamAccumulator:
         self._terminal_reason = "completed"
         self._tool_calls: tuple[Dict[str, Any], ...] = ()
         self._runtime_selection = None
+        self._tool_recovery = None
 
     def consume(self, event: LLMStreamEvent) -> Iterator[str]:
         kind = str(event.kind or "")
         if event.runtime_selection is not None:
             self._runtime_selection = event.runtime_selection
+        if event.tool_recovery is not None:
+            self._tool_recovery = event.tool_recovery
         if event.usage is not None:
             self._usage = event.usage
         if event.transport is not None:
@@ -224,12 +240,14 @@ class _StreamAccumulator:
     def finish(self) -> Iterator[str]:
         if not self._visible_limit_reached:
             yield from self._apply_visible_limit(self._stripper.flush())
-        if self._reasoning_chars:
+        if self._reasoning_chars and not self._inspection_only:
             self._adapter._log_thinking_chars(self._reasoning_chars)
 
     def finish_diagnostic(
         self, reason: str = "interrupted"
     ) -> Optional[ThinkingDiagnostic]:
+        if self._diagnostic_override is not None:
+            return self._diagnostic_override
         # Flush dangling inline thinking even when a consumer closes the stream
         # or an exception prevents normal visible-output finalization.
         for _ in self._stripper.flush():
@@ -237,6 +255,13 @@ class _StreamAccumulator:
         return self._capture.finish(reason)
 
     def fail_diagnostic(self, exc: BaseException) -> None:
+        # A staged attempt has already finalized its actual opt-in capture.
+        # Do not replace that evidence with an empty outer capture or invoke
+        # the consumer's sink a second time while unwinding the same failure.
+        prior = getattr(exc, "thinking_diagnostic", None)
+        if getattr(exc, "tool_recovery", None) is not None and prior is not None:
+            self._diagnostic_override = prior
+            return
         reason = str(getattr(exc, "terminal_reason", "invocation_error"))
         transport = getattr(exc, "diagnostics", None)
         if getattr(transport, "terminal_reason", "") == "early_eof":
@@ -271,15 +296,17 @@ class _StreamAccumulator:
         return self._visible_limit_reached
 
     def result(self) -> LLMCallResult:
-        if self._usage is not None:
-            self._adapter._set_last_usage(self._usage)
-        self._adapter._set_last_server_timings(self._server_timings)
+        if not self._inspection_only:
+            if self._usage is not None:
+                self._adapter._set_last_usage(self._usage)
+            self._adapter._set_last_server_timings(self._server_timings)
         terminal_reason = (
             "visible_output_cap"
             if self._visible_limit_reached
             else self._terminal_reason
         )
-        self._adapter._set_last_terminal_reason(terminal_reason)
+        if not self._inspection_only:
+            self._adapter._set_last_terminal_reason(terminal_reason)
         return LLMCallResult(
             text="",  # populated by BaseLLMAdapter.invoke_with_ctx
             usage=self._usage,
@@ -292,6 +319,7 @@ class _StreamAccumulator:
             thinking_diagnostic=self.finish_diagnostic(terminal_reason),
             server_timings=self._server_timings,
             runtime_selection=self._runtime_selection,
+            tool_recovery=self._tool_recovery,
         )
 
 
@@ -335,15 +363,18 @@ class BaseLLMAdapter(ABC):
             collect_reasoning=False,
         )
         events = None
+        recovery_active = False
         try:
             self._raise_if_cancelled(cancellation_probe, timeout=timeout)
-            events = self._iter_stream_events_with_ctx(
+            events = self._iter_invocation_events(
                 messages,
                 num_ctx=num_ctx,
                 num_predict=num_predict,
                 output_format=output_format,
                 timeout=timeout,
                 cancellation_probe=cancellation_probe,
+                thinking_diagnostics=thinking_diagnostics,
+                thinking_sink=thinking_sink,
                 **(
                     {"request_options": request_options}
                     if request_options is not None
@@ -351,22 +382,37 @@ class BaseLLMAdapter(ABC):
                 ),
             )
             for event in events:
-                self._raise_if_cancelled(cancellation_probe, timeout=timeout)
+                recovery_active = recovery_active or event.tool_recovery is not None
+                self._raise_if_projection_cancelled(
+                    cancellation_probe, timeout=timeout, recovery_active=recovery_active
+                )
                 for chunk in accumulator.consume(event):
-                    self._raise_if_cancelled(cancellation_probe, timeout=timeout)
+                    self._raise_if_projection_cancelled(
+                        cancellation_probe,
+                        timeout=timeout,
+                        recovery_active=recovery_active,
+                    )
                     yield chunk
                 if accumulator.visible_limit_reached:
                     break
-            self._raise_if_cancelled(cancellation_probe, timeout=timeout)
+            self._raise_if_projection_cancelled(
+                cancellation_probe, timeout=timeout, recovery_active=recovery_active
+            )
             for chunk in accumulator.finish():
-                self._raise_if_cancelled(cancellation_probe, timeout=timeout)
+                self._raise_if_projection_cancelled(
+                    cancellation_probe, timeout=timeout, recovery_active=recovery_active
+                )
                 yield chunk
-            self._raise_if_cancelled(cancellation_probe, timeout=timeout)
+            self._raise_if_projection_cancelled(
+                cancellation_probe, timeout=timeout, recovery_active=recovery_active
+            )
             close = getattr(events, "close", None)
             events = None
             if callable(close):
                 close()
             accumulator.result()
+            if recovery_active:
+                self._raise_if_recovery_retired()
         except (
             LLMBackendError,
             LLMCancelledError,
@@ -415,15 +461,18 @@ class BaseLLMAdapter(ABC):
         )
         visible_parts: List[str] = []
         events = None
+        recovery_active = False
         try:
             self._raise_if_cancelled(cancellation_probe, timeout=timeout)
-            events = self._iter_stream_events_with_ctx(
+            events = self._iter_invocation_events(
                 messages,
                 num_ctx=num_ctx,
                 num_predict=num_predict,
                 output_format=output_format,
                 timeout=timeout,
                 cancellation_probe=cancellation_probe,
+                thinking_diagnostics=thinking_diagnostics,
+                thinking_sink=thinking_sink,
                 **(
                     {"request_options": request_options}
                     if request_options is not None
@@ -431,20 +480,29 @@ class BaseLLMAdapter(ABC):
                 ),
             )
             for event in events:
-                self._raise_if_cancelled(cancellation_probe, timeout=timeout)
+                recovery_active = recovery_active or event.tool_recovery is not None
+                self._raise_if_projection_cancelled(
+                    cancellation_probe, timeout=timeout, recovery_active=recovery_active
+                )
                 visible_parts.extend(accumulator.consume(event))
                 if accumulator.visible_limit_reached:
                     break
             # The blocking contract still strips inline thinking from visible
             # text, exactly as the old per-adapter implementations did.
-            self._raise_if_cancelled(cancellation_probe, timeout=timeout)
+            self._raise_if_projection_cancelled(
+                cancellation_probe, timeout=timeout, recovery_active=recovery_active
+            )
             visible_parts.extend(accumulator.finish())
-            self._raise_if_cancelled(cancellation_probe, timeout=timeout)
+            self._raise_if_projection_cancelled(
+                cancellation_probe, timeout=timeout, recovery_active=recovery_active
+            )
             close = getattr(events, "close", None)
             events = None
             if callable(close):
                 close()
             result = accumulator.result()
+            if recovery_active:
+                self._raise_if_recovery_retired()
             return LLMCallResult(
                 text="".join(visible_parts),
                 usage=result.usage,
@@ -457,6 +515,7 @@ class BaseLLMAdapter(ABC):
                 thinking_diagnostic=result.thinking_diagnostic,
                 server_timings=result.server_timings,
                 runtime_selection=result.runtime_selection,
+                tool_recovery=result.tool_recovery,
             )
         except (
             LLMBackendError,
@@ -577,6 +636,24 @@ class BaseLLMAdapter(ABC):
         )
         raise LLMCancelledError(diagnostics=evidence)
 
+    def _raise_if_recovery_retired(self) -> None:
+        """Reject replay after retirement; legacy adapters have no staged state."""
+
+    def _raise_if_projection_cancelled(
+        self,
+        cancellation_probe: Optional[CancellationProbe],
+        *,
+        timeout: Optional[float] = None,
+        recovery_active: bool = False,
+    ) -> None:
+        # A caller probe may close the adapter and still return False. A staged
+        # proposal must not escape after that callback retires its owner.
+        if recovery_active:
+            self._raise_if_recovery_retired()
+        self._raise_if_cancelled(cancellation_probe, timeout=timeout)
+        if recovery_active:
+            self._raise_if_recovery_retired()
+
     def _new_runaway_detector(self) -> RunawayDetector:
         profile = self.role_profile
         return RunawayDetector(
@@ -607,6 +684,35 @@ class BaseLLMAdapter(ABC):
         if ratio <= 0:
             ratio = 0.33
         return max(1, int(math.ceil(parsed / ratio)))
+
+    def _iter_invocation_events(
+        self,
+        messages: List,
+        *,
+        num_ctx: Optional[int] = None,
+        num_predict: Optional[int] = None,
+        output_format: Optional[str] = None,
+        timeout: Optional[float] = None,
+        cancellation_probe: Optional[CancellationProbe] = None,
+        request_options: Optional[Dict[str, Any]] = None,
+        thinking_diagnostics: Optional[ThinkingDiagnosticsConfig] = None,
+        thinking_sink: Optional[ThinkingDiagnosticSink] = None,
+    ) -> Iterator[LLMStreamEvent]:
+        """Invocation projection seam; legacy adapters retain raw forwarding."""
+        del thinking_diagnostics, thinking_sink
+        yield from self._iter_stream_events_with_ctx(
+            messages,
+            num_ctx=num_ctx,
+            num_predict=num_predict,
+            output_format=output_format,
+            timeout=timeout,
+            cancellation_probe=cancellation_probe,
+            **(
+                {"request_options": request_options}
+                if request_options is not None
+                else {}
+            ),
+        )
 
     def _iter_stream_events_with_ctx(
         self,

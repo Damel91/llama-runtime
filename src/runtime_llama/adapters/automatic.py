@@ -13,6 +13,7 @@ from runtime_llama.adapters.strata import StrataAdapter
 from runtime_llama.client import CancellationProbe, LlamaCppClient, _cancelled
 from runtime_llama.configuration import AdapterProfile
 from runtime_llama.errors import LLMBackendError, LLMCancelledError
+from runtime_llama.diagnostics import ThinkingDiagnosticsConfig, ThinkingDiagnosticSink
 from runtime_llama.runtime_discovery import (
     RuntimeCatalog,
     RuntimeEndpoint,
@@ -121,7 +122,19 @@ class AutoRuntimeAdapter(LlamaCppAdapter):
     def _cancel(
         operation: _Operation, cancel: CancellationProbe | None
     ) -> CancellationProbe:
-        return lambda: operation.stop.is_set() or bool(cancel and cancel())
+        def cancelled() -> bool:
+            if operation.stop.is_set():
+                return True
+            requested = bool(cancel and cancel())
+            return requested or operation.stop.is_set()
+
+        return cancelled
+
+    def _raise_if_recovery_retired(self) -> None:
+        with self._runtime_lock:
+            closed = self._runtime_closed
+        if closed:
+            raise LLMCancelledError()
 
     def _finish(self, operation: _Operation) -> None:
         operation.discovery_done.set()
@@ -188,11 +201,62 @@ class AutoRuntimeAdapter(LlamaCppAdapter):
         cancellation_probe: Optional[CancellationProbe] = None,
         request_options: Optional[Mapping[str, Any]] = None,
     ) -> Iterator[LLMStreamEvent]:
+        yield from self._iter_selected_events(
+            messages,
+            num_ctx=num_ctx,
+            num_predict=num_predict,
+            output_format=output_format,
+            timeout=timeout,
+            cancellation_probe=cancellation_probe,
+            request_options=request_options,
+        )
+
+    def _iter_invocation_events(
+        self,
+        messages: Any,
+        *,
+        num_ctx: Optional[int] = None,
+        num_predict: Optional[int] = None,
+        output_format: Optional[str] = None,
+        timeout: Optional[float] = None,
+        cancellation_probe: Optional[CancellationProbe] = None,
+        request_options: Optional[Mapping[str, Any]] = None,
+        thinking_diagnostics: Optional[ThinkingDiagnosticsConfig] = None,
+        thinking_sink: Optional[ThinkingDiagnosticSink] = None,
+    ) -> Iterator[LLMStreamEvent]:
+        yield from self._iter_selected_events(
+            messages,
+            num_ctx=num_ctx,
+            num_predict=num_predict,
+            output_format=output_format,
+            timeout=timeout,
+            cancellation_probe=cancellation_probe,
+            request_options=request_options,
+            invocation_projection=True,
+            thinking_diagnostics=thinking_diagnostics,
+            thinking_sink=thinking_sink,
+        )
+
+    def _iter_selected_events(
+        self,
+        messages: Any,
+        *,
+        num_ctx: Optional[int] = None,
+        num_predict: Optional[int] = None,
+        output_format: Optional[str] = None,
+        timeout: Optional[float] = None,
+        cancellation_probe: Optional[CancellationProbe] = None,
+        request_options: Optional[Mapping[str, Any]] = None,
+        invocation_projection: bool = False,
+        thinking_diagnostics: Optional[ThinkingDiagnosticsConfig] = None,
+        thinking_sink: Optional[ThinkingDiagnosticSink] = None,
+    ) -> Iterator[LLMStreamEvent]:
         idle = self._stream_idle(timeout)
         self._raise_if_cancelled(cancellation_probe, timeout=idle)
         operation = self._begin(cancellation_probe)
         cancel = self._cancel(operation, cancellation_probe)
         events = None
+        selection = None
         try:
             catalog = self._discover(operation, cancellation_probe)
             selection = catalog.select(self.model_name)
@@ -244,7 +308,12 @@ class AutoRuntimeAdapter(LlamaCppAdapter):
             child._observed_context_length = (
                 observed.value if observed is not None else None
             )
-            events = child._iter_stream_events_with_ctx(
+            generate_events = (
+                child._iter_invocation_events
+                if invocation_projection
+                else child._iter_stream_events_with_ctx
+            )
+            events = generate_events(
                 messages,
                 num_ctx=num_ctx,
                 num_predict=num_predict,
@@ -252,10 +321,22 @@ class AutoRuntimeAdapter(LlamaCppAdapter):
                 timeout=timeout,
                 cancellation_probe=cancel,
                 request_options=request_options,
+                **(
+                    {
+                        "thinking_diagnostics": thinking_diagnostics,
+                        "thinking_sink": thinking_sink,
+                    }
+                    if invocation_projection
+                    else {}
+                ),
             )
             for event in events:
                 _cancelled(cancel)
                 yield replace(event, runtime_selection=selection)
+        except BaseException as error:
+            if selection is not None and not isinstance(error, GeneratorExit):
+                error.runtime_selection = selection
+            raise
         finally:
             try:
                 close = getattr(events, "close", None)

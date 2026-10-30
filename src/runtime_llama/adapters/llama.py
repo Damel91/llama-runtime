@@ -23,13 +23,23 @@ from runtime_llama.configuration import (
     LlamaRoleConfig,
     LlamaServerConfig,
 )
-from runtime_llama.contracts import CancellationProbe, LLMAdapter, _StreamAccumulator
-from runtime_llama.diagnostics import ThinkingDiagnosticsConfig, ThinkingDiagnosticSink
+from runtime_llama.contracts import (
+    CancellationProbe,
+    LLMAdapter,
+    _StreamAccumulator,
+    _ThinkingStreamStripper,
+)
+from runtime_llama.diagnostics import (
+    ThinkingDiagnosticsConfig,
+    ThinkingDiagnosticSink,
+    _ThinkingCapture,
+)
 from runtime_llama.errors import (
     LLMBackendError,
     LLMCancelledError,
     LLMRunawayError,
     LLMTimeoutError,
+    LLMToolRecoveryError,
     sanitize_diagnostic,
 )
 from runtime_llama.usage import (
@@ -38,7 +48,10 @@ from runtime_llama.usage import (
     LLMServerTimings,
     LLMTransportAttempt,
     LLMUsageStats,
+    LLMToolRecoveryAttempt,
+    LLMToolRecoveryReport,
 )
+from runtime_llama.tool_recovery import ToolRecoveryPolicy
 
 
 _RESERVED_REQUEST_FIELDS = {
@@ -198,6 +211,7 @@ class LlamaCppAdapter(LLMAdapter):
         self._requested_context_ceiling: Optional[int] = None
         self._observed_context_length: Optional[int] = None
         self._last_usage: Optional[LLMUsageStats] = None
+        self._adapter_closed = False
         token = self._generation_config.api_key or (
             os.environ.get(self._generation_config.api_key_env)
             if self._generation_config.api_key_env
@@ -293,6 +307,10 @@ class LlamaCppAdapter(LLMAdapter):
             if diagnostics is None and idle is None and exc.diagnostics is not None:
                 exc.diagnostics = replace(exc.diagnostics, idle_timeout_sec=None)
             raise
+
+    def _raise_if_recovery_retired(self) -> None:
+        if self._adapter_closed:
+            raise LLMBackendError("llama_adapter_closed")
 
     def _chat_messages(self, messages: Any) -> List[Dict[str, Any]]:
         if isinstance(messages, str):
@@ -569,6 +587,20 @@ class LlamaCppAdapter(LLMAdapter):
             output_format=output_format,
             request_options=request_options,
         )
+        yield from self._iter_chat_attempt(
+            body, idle=idle, cancellation_probe=cancellation_probe
+        )
+
+    def _iter_chat_attempt(
+        self,
+        body: Mapping[str, Any],
+        *,
+        idle: float | None,
+        cancellation_probe: Optional[CancellationProbe],
+        tool_policy_enabled: bool = False,
+    ) -> Iterator[LLMStreamEvent]:
+        """Perform exactly one native POST against a frozen effective body."""
+        body = deepcopy(dict(body))
         validator = self._response_validator(body)
         response_parts: Optional[List[str]] = [] if validator is not None else None
         request_messages = body.pop("messages")
@@ -579,6 +611,7 @@ class LlamaCppAdapter(LLMAdapter):
         usage: Optional[LLMUsageStats] = None
         server_timings: Optional[LLMServerTimings] = None
         tool_calls: Dict[int, _ToolCallBuilder] = {}
+        native_tool_diagnostics: Dict[str, Any] = {}
         stream = None
 
         def evidence(reason: str) -> LLMTransportAttempt:
@@ -614,7 +647,17 @@ class LlamaCppAdapter(LLMAdapter):
                     raise LLMBackendError("llama_malformed_chat_chunk")
                 if payload.get("error") is not None:
                     raise LLMBackendError("llama_server_error")
-                choices = payload.get("choices")
+                observed_diagnostics = {
+                    key: deepcopy(payload[key])
+                    for key in ("strata_rejected_tool_calls", "strata_mcp")
+                    if key in payload
+                }
+                if observed_diagnostics:
+                    native_tool_diagnostics.update(observed_diagnostics)
+                    yield LLMStreamEvent(
+                        kind="tool_diagnostic", data=observed_diagnostics
+                    )
+                choices = payload.get("choices", [] if observed_diagnostics else None)
                 if not isinstance(choices, list) or len(choices) > 1:
                     raise LLMBackendError("llama_malformed_chat_choices")
                 choice = choices[0] if choices else None
@@ -642,7 +685,11 @@ class LlamaCppAdapter(LLMAdapter):
                     server_timings = observed_timings
                     yield LLMStreamEvent(kind="timings", server_timings=server_timings)
                 if not choices:
-                    if "usage" not in payload and "timings" not in payload:
+                    if (
+                        "usage" not in payload
+                        and "timings" not in payload
+                        and not observed_diagnostics
+                    ):
                         raise LLMBackendError("llama_empty_chat_chunk")
                     continue
                 if finish_reason is not None and delta:
@@ -685,9 +732,17 @@ class LlamaCppAdapter(LLMAdapter):
                 error.diagnostics = evidence("early_eof")
                 raise error
             calls = self._completed_tools(tool_calls)
-            if finish_reason == "tool_calls" and not calls:
+            if finish_reason == "tool_calls" and not calls and not tool_policy_enabled:
                 raise LLMBackendError("llama_tool_finish_without_calls")
-            if validator is not None and finish_reason == "stop" and not calls:
+            if (
+                validator is not None
+                and finish_reason == "stop"
+                and not calls
+                and not (
+                    tool_policy_enabled
+                    and native_tool_diagnostics.get("strata_rejected_tool_calls")
+                )
+            ):
                 validator("".join(response_parts or ()))
             terminal = {
                 "stop": "completed",
@@ -702,7 +757,11 @@ class LlamaCppAdapter(LLMAdapter):
                 usage=usage,
                 terminal_reason=terminal,
                 transport=evidence(terminal),
-                data={"tool_calls": calls, "finish_reason": finish_reason},
+                data={
+                    "tool_calls": calls,
+                    "finish_reason": finish_reason,
+                    **deepcopy(native_tool_diagnostics),
+                },
                 server_timings=server_timings,
             )
         except (LLMBackendError, LLMCancelledError, LLMTimeoutError) as exc:
@@ -713,6 +772,358 @@ class LlamaCppAdapter(LLMAdapter):
             close = getattr(stream, "close", None)
             if callable(close):
                 close()
+
+    def _capture_rejected_thinking(
+        self,
+        events: Sequence[LLMStreamEvent],
+        reason: str,
+        thinking_diagnostics: Optional[ThinkingDiagnosticsConfig],
+        thinking_sink: Optional[ThinkingDiagnosticSink],
+    ):
+        configured = getattr(self._generation_config, "thinking_diagnostics", None)
+        config = ThinkingDiagnosticsConfig.from_value(
+            configured if thinking_diagnostics is None else thinking_diagnostics
+        )
+        if not config.enabled:
+            return None
+        capture = _ThinkingCapture(
+            config,
+            role_id=self.role_id,
+            model=self.model_name,
+            sink=thinking_sink,
+            secrets=self._diagnostic_secrets,
+        )
+        stripper = _ThinkingStreamStripper(
+            self,
+            lambda text: capture.observe("inline", text),
+            log_thinking=False,
+        )
+        for event in events:
+            if event.kind == "reasoning":
+                capture.observe("separated", event.text)
+            elif event.kind == "content":
+                for _ in stripper.feed(event.text):
+                    pass
+        for _ in stripper.flush():
+            pass
+        return capture.finish(reason)
+
+    @staticmethod
+    def _recovery_proposal(events: Sequence[LLMStreamEvent]) -> Dict[str, Any]:
+        terminal = next(
+            (event for event in reversed(events) if event.kind == "terminal"), None
+        )
+        return {
+            "content": "".join(
+                event.text for event in events if event.kind == "content"
+            ),
+            "tool_calls": deepcopy(
+                (terminal.data or {}).get("tool_calls", []) if terminal else []
+            ),
+        }
+
+    def _iter_invocation_events(
+        self,
+        messages: Any,
+        *,
+        num_ctx: Optional[int] = None,
+        num_predict: Optional[int] = None,
+        output_format: Optional[str] = None,
+        timeout: Optional[float] = None,
+        cancellation_probe: Optional[CancellationProbe] = None,
+        request_options: Optional[Mapping[str, Any]] = None,
+        thinking_diagnostics: Optional[ThinkingDiagnosticsConfig] = None,
+        thinking_sink: Optional[ThinkingDiagnosticSink] = None,
+    ) -> Iterator[LLMStreamEvent]:
+        idle = self._stream_idle(timeout)
+        self._raise_if_cancelled(cancellation_probe, timeout=idle)
+        body = self._body(
+            messages,
+            num_ctx=num_ctx,
+            num_predict=num_predict,
+            output_format=output_format,
+            request_options=request_options,
+        )
+        policy = ToolRecoveryPolicy.from_request(body)
+        if not policy.enabled:
+            # Keep the legacy native seam observable to third-party adapters
+            # and test transports when no tool recovery is applicable.
+            events = self._iter_stream_events_with_ctx(
+                messages,
+                num_ctx=num_ctx,
+                num_predict=num_predict,
+                output_format=output_format,
+                timeout=timeout,
+                cancellation_probe=cancellation_probe,
+                request_options=request_options,
+            )
+            started = time.perf_counter()
+            usage = None
+            server_timings = None
+            try:
+                for event in events:
+                    usage = event.usage if event.usage is not None else usage
+                    server_timings = (
+                        event.server_timings
+                        if event.server_timings is not None
+                        else server_timings
+                    )
+                    if event.data and "strata_rejected_tool_calls" in event.data:
+                        decision = policy.classify(
+                            [event],
+                            event if event.kind == "terminal" else None,
+                            secrets=self._diagnostic_secrets,
+                        )
+                        if not decision.accepted:
+                            close = getattr(events, "close", None)
+                            if callable(close):
+                                close()
+                            attempt = LLMToolRecoveryAttempt(
+                                index=0,
+                                outcome="unsafe",
+                                reasons=decision.reasons,
+                                native_rejected_tool_calls=decision.native_rejected_tool_calls,
+                                native_rejections=decision.native_rejections,
+                                provenance=decision.provenance,
+                                usage=usage,
+                                transport=event.transport,
+                                server_timings=server_timings,
+                            )
+                            raise LLMToolRecoveryError(
+                                "tool_recovery_unsafe",
+                                tool_recovery=LLMToolRecoveryReport(
+                                    (attempt,),
+                                    elapsed_ms=(time.perf_counter() - started) * 1000,
+                                ),
+                                last_proposal={"content_already_streamed": True},
+                                diagnostics=event.transport,
+                            )
+                    yield event
+            finally:
+                close = getattr(events, "close", None)
+                if callable(close):
+                    close()
+            return
+
+        # Everything below belongs to this external invocation, never the
+        # adapter/session. New calls therefore start with a fresh budget.
+        started = time.monotonic()
+        history = deepcopy(body["messages"])
+        attempts: List[LLMToolRecoveryAttempt] = []
+        staged: List[LLMStreamEvent] = []
+
+        def native_cancelled() -> bool:
+            # The native request owns its interruption even with a borrowed
+            # client. Retiring this adapter must not close sibling requests.
+            if self._adapter_closed:
+                return True
+            cancelled = bool(cancellation_probe and cancellation_probe())
+            return cancelled or self._adapter_closed
+
+        def check_cancelled() -> None:
+            # Closing a borrowed adapter must not close its caller-owned
+            # transport. It still retires private staged proposals and cannot
+            # allow another correction or late executable event to escape.
+            self._raise_if_projection_cancelled(
+                cancellation_probe, timeout=idle, recovery_active=True
+            )
+
+        def report(*, exhausted: bool = False) -> LLMToolRecoveryReport:
+            return LLMToolRecoveryReport(
+                tuple(attempts), exhausted, (time.monotonic() - started) * 1000
+            )
+
+        def snapshot(index, outcome, decision=None, diagnostic=None, error=None):
+            def latest(attribute):
+                return next(
+                    (
+                        getattr(event, attribute)
+                        for event in reversed(staged)
+                        if getattr(event, attribute) is not None
+                    ),
+                    None,
+                )
+
+            transport = latest("transport")
+            if transport is None and isinstance(
+                getattr(error, "diagnostics", None), LLMTransportAttempt
+            ):
+                transport = error.diagnostics
+            return LLMToolRecoveryAttempt(
+                index=index,
+                outcome=outcome,
+                reasons=(decision.reasons if decision else (outcome,)),
+                native_rejected_tool_calls=(
+                    decision.native_rejected_tool_calls if decision else None
+                ),
+                native_rejections=(decision.native_rejections if decision else ()),
+                provenance=decision.provenance if decision else (),
+                usage=latest("usage"),
+                transport=transport,
+                server_timings=latest("server_timings"),
+                thinking_diagnostic=diagnostic,
+            )
+
+        try:
+            for index in range(4):
+                check_cancelled()
+                staged.clear()
+                terminal = None
+                local_cap = False
+                guard = _StreamAccumulator(
+                    self,
+                    visible_output_token_limit=num_predict,
+                    collect_reasoning=False,
+                    inspection_only=True,
+                )
+                attempt_body = deepcopy(body)
+                attempt_body["messages"] = deepcopy(history)
+                stream = self._iter_chat_attempt(
+                    attempt_body,
+                    idle=idle,
+                    cancellation_probe=native_cancelled,
+                    tool_policy_enabled=True,
+                )
+                try:
+                    try:
+                        for event in stream:
+                            check_cancelled()
+                            staged.append(event)
+                            if event.kind == "terminal":
+                                terminal = event
+                            for _ in guard.consume(event):
+                                pass
+                            if guard.visible_limit_reached:
+                                local_cap = True
+                                break
+                        for _ in guard.finish():
+                            pass
+                        local_cap = local_cap or guard.visible_limit_reached
+                    finally:
+                        stream.close()
+                except BaseException as error:
+                    if isinstance(error, GeneratorExit):
+                        raise
+                    reason = str(getattr(error, "terminal_reason", "invocation_error"))
+                    diagnostic = self._capture_rejected_thinking(
+                        staged, reason, thinking_diagnostics, thinking_sink
+                    )
+                    attempts.append(
+                        snapshot(index, reason, diagnostic=diagnostic, error=error)
+                    )
+                    error.tool_recovery = report()
+                    if diagnostic is not None:
+                        error.thinking_diagnostic = diagnostic
+                    raise
+
+                check_cancelled()
+                decision = policy.classify(
+                    staged, terminal, secrets=self._diagnostic_secrets
+                )
+                incomplete = terminal is not None and terminal.terminal_reason in {
+                    "length_cap",
+                    "visible_output_cap",
+                    "content_filter",
+                }
+                if local_cap or incomplete:
+                    reason = (
+                        "visible_output_cap" if local_cap else terminal.terminal_reason
+                    )
+                    attempts.append(snapshot(index, reason, decision))
+                    current_report = report()
+                    # Existing partial-text behavior remains, but no candidate
+                    # tool fragment can escape an incomplete generation.
+                    yield LLMStreamEvent(
+                        kind="tool_recovery", tool_recovery=current_report
+                    )
+                    for event in staged:
+                        if event.kind not in {
+                            "tool_call_delta",
+                            "tool_diagnostic",
+                            "terminal",
+                        }:
+                            check_cancelled()
+                            yield replace(event, tool_recovery=current_report)
+                    yield LLMStreamEvent(
+                        kind="terminal",
+                        terminal_reason=reason,
+                        usage=attempts[-1].usage,
+                        transport=attempts[-1].transport,
+                        server_timings=attempts[-1].server_timings,
+                        data={
+                            "tool_calls": [],
+                            **(
+                                {"finish_reason": terminal.data.get("finish_reason")}
+                                if terminal is not None and terminal.data
+                                else {}
+                            ),
+                        },
+                        tool_recovery=current_report,
+                    )
+                    return
+
+                if decision.accepted:
+                    attempts.append(snapshot(index, "accepted", decision))
+                    current_report = report()
+                    for event in staged:
+                        check_cancelled()
+                        yield replace(event, tool_recovery=current_report)
+                    return
+
+                diagnostic = self._capture_rejected_thinking(
+                    staged,
+                    "tool_protocol_rejected",
+                    thinking_diagnostics,
+                    thinking_sink,
+                )
+                attempts.append(
+                    snapshot(
+                        index,
+                        "rejected" if decision.recoverable else "unsafe",
+                        decision,
+                        diagnostic,
+                    )
+                )
+                exhausted = decision.recoverable and index == 3
+                current_report = report(exhausted=exhausted)
+                if not decision.recoverable or exhausted:
+                    error = LLMToolRecoveryError(
+                        "tool_recovery_exhausted"
+                        if exhausted
+                        else "tool_recovery_unsafe",
+                        tool_recovery=current_report,
+                        last_proposal=self._recovery_proposal(staged),
+                        diagnostics=attempts[-1].transport,
+                    )
+                    if diagnostic is not None:
+                        error.thinking_diagnostic = diagnostic
+                    raise error
+                check_cancelled()
+                history.extend(policy.correction_messages(staged, decision))
+                staged.clear()
+                yield LLMStreamEvent(
+                    kind="tool_recovery",
+                    data={"next_attempt": index + 1},
+                    tool_recovery=current_report,
+                )
+        except BaseException as error:
+            if (
+                not isinstance(error, GeneratorExit)
+                and attempts
+                and not hasattr(error, "tool_recovery")
+            ):
+                error.tool_recovery = report()
+            if (
+                not isinstance(error, GeneratorExit)
+                and attempts
+                and attempts[-1].thinking_diagnostic is not None
+                and not hasattr(error, "thinking_diagnostic")
+            ):
+                error.thinking_diagnostic = attempts[-1].thinking_diagnostic
+            raise
+        finally:
+            staged.clear()
+            history.clear()
 
     @staticmethod
     def _tool_options(
@@ -764,7 +1175,7 @@ class LlamaCppAdapter(LLMAdapter):
         self._set_last_usage(None)
         self._set_last_server_timings(None)
         self._set_last_terminal_reason("")
-        events = self._iter_stream_events_with_ctx(
+        events = self._iter_invocation_events(
             messages,
             num_ctx=num_ctx,
             num_predict=num_predict,
@@ -772,6 +1183,8 @@ class LlamaCppAdapter(LLMAdapter):
             timeout=timeout,
             cancellation_probe=cancellation_probe,
             request_options=self._tool_options(request_options, tools, tool_choice),
+            thinking_diagnostics=thinking_diagnostics,
+            thinking_sink=thinking_sink,
         )
         accumulator = _StreamAccumulator(
             self,
@@ -781,9 +1194,13 @@ class LlamaCppAdapter(LLMAdapter):
             collect_reasoning=False,
         )
         terminal: Optional[LLMStreamEvent] = None
+        recovery_active = False
         try:
             for event in events:
-                self._raise_if_cancelled(cancellation_probe, timeout=timeout)
+                recovery_active = recovery_active or event.tool_recovery is not None
+                self._raise_if_projection_cancelled(
+                    cancellation_probe, timeout=timeout, recovery_active=recovery_active
+                )
                 if event.kind == "content":
                     for chunk in accumulator.consume(event):
                         yield (
@@ -798,11 +1215,17 @@ class LlamaCppAdapter(LLMAdapter):
                         yield event
                 if accumulator.visible_limit_reached:
                     break
-            self._raise_if_cancelled(cancellation_probe, timeout=timeout)
+            self._raise_if_projection_cancelled(
+                cancellation_probe, timeout=timeout, recovery_active=recovery_active
+            )
             for chunk in accumulator.finish():
-                self._raise_if_cancelled(cancellation_probe, timeout=timeout)
+                self._raise_if_projection_cancelled(
+                    cancellation_probe, timeout=timeout, recovery_active=recovery_active
+                )
                 yield LLMStreamEvent(kind="content", text=chunk)
-            self._raise_if_cancelled(cancellation_probe, timeout=timeout)
+            self._raise_if_projection_cancelled(
+                cancellation_probe, timeout=timeout, recovery_active=recovery_active
+            )
             # A terminal event tells a harness that this request has ended. In
             # particular, a visible cap must close the active transport before
             # the consumer stops reading on that event.
@@ -811,12 +1234,19 @@ class LlamaCppAdapter(LLMAdapter):
             if callable(close):
                 close()
             result = accumulator.result()
+            if recovery_active:
+                self._raise_if_recovery_retired()
             yield LLMStreamEvent(
                 kind="terminal",
                 usage=result.usage,
                 terminal_reason=result.terminal_reason,
                 transport=result.transport,
                 data={
+                    **(
+                        deepcopy(terminal.data)
+                        if terminal is not None and terminal.data
+                        else {}
+                    ),
                     "tool_calls": list(result.tool_calls),
                     **(
                         {"finish_reason": terminal.data["finish_reason"]}
@@ -827,6 +1257,7 @@ class LlamaCppAdapter(LLMAdapter):
                 thinking_diagnostic=result.thinking_diagnostic,
                 server_timings=result.server_timings,
                 runtime_selection=result.runtime_selection,
+                tool_recovery=result.tool_recovery,
             )
         except (
             LLMBackendError,
@@ -1018,6 +1449,7 @@ class LlamaCppAdapter(LLMAdapter):
         }
 
     def close(self) -> None:
+        self._adapter_closed = True
         if self._owns_client:
             self._client.close()
 
