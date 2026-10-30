@@ -48,6 +48,7 @@ from runtime_llama.errors import (
     LLMCancelledError,
     LLMRunawayError,
     LLMTimeoutError,
+    LLMToolRecoveryError,
 )
 from runtime_llama.usage import (
     LLMCallResult,
@@ -56,6 +57,9 @@ from runtime_llama.usage import (
     LLMUsageStats,
     LLMServerTimings,
     RuntimeSelection,
+    LLMToolRecoveryAttempt,
+    LLMToolRecoveryReport,
+    LLMToolRecoveryRejection,
 )
 from runtime_llama.mcp import (
     MCPCallResult,
@@ -147,6 +151,10 @@ __all__ = [
     "LLMCancelledError",
     "LLMRunawayError",
     "LLMTimeoutError",
+    "LLMToolRecoveryError",
+    "LLMToolRecoveryAttempt",
+    "LLMToolRecoveryReport",
+    "LLMToolRecoveryRejection",
     "LLMCallResult",
     "LLMStreamEvent",
     "LLMTransportAttempt",
