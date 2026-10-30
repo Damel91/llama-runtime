@@ -173,6 +173,7 @@ def native_server():
                 self.send_response(302 if redirect else 200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(wire)))
+                self.send_header("Connection", "close")
                 self.send_header("Location", "/models/load")
                 self.end_headers()
                 self.wfile.write(wire)
@@ -202,6 +203,7 @@ def native_server():
                 self.send_header("Content-Type", "text/event-stream")
                 if not keepalive and not quiet:
                     self.send_header("Content-Length", str(len(wire)))
+                    self.send_header("Connection", "close")
                 self.end_headers()
                 if not quiet:
                     self.wfile.write(wire)
