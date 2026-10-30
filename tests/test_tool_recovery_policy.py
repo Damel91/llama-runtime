@@ -255,6 +255,51 @@ def test_absent_tools_preserve_legacy_path_even_if_text_has_tags():
     ).accepted
 
 
+@pytest.mark.parametrize("with_terminal", [False, True])
+def test_no_client_tools_native_rejection_is_unsafe_without_regeneration_authority(
+    with_terminal,
+):
+    policy = ToolRecoveryPolicy.from_request({})
+    event = LLMStreamEvent(
+        "native_diagnostic", data={"strata_rejected_tool_calls": native()}
+    )
+    result = policy.classify([event], terminal() if with_terminal else None)
+    assert result.status == "unsafe" and not result.recoverable
+    assert result.reason == "no_declared_tool_authority"
+    assert result.native_rejected_tool_calls == 1
+    assert result.native_rejections[0].name == "write"
+    assert result.native_rejections[0].source == "strata_rejected_tool_calls"
+    with pytest.raises(ValueError, match="safe_recoverable"):
+        policy.correction_messages([event], result)
+
+
+@pytest.mark.parametrize(
+    "marker", [None, 1, {}, [{"name": "write", "reason": "unsupported"}]]
+)
+def test_no_client_tools_malformed_native_marker_is_unsafe_before_terminal(marker):
+    event = LLMStreamEvent(
+        "native_diagnostic", data={"strata_rejected_tool_calls": marker}
+    )
+    result = ToolRecoveryPolicy.from_request({}).classify([event], None)
+    assert result.status == "unsafe" and not result.recoverable
+    assert result.reason == "no_declared_tool_authority"
+    assert "malformed_native_tool_rejection" in result.reasons
+    assert result.native_rejected_tool_calls is None
+
+
+@pytest.mark.parametrize("marker", ["absent", []])
+def test_no_client_tools_no_rejection_requires_no_terminal_or_other_new_validation(
+    marker,
+):
+    data = {} if marker == "absent" else {"strata_rejected_tool_calls": marker}
+    event = LLMStreamEvent("native_diagnostic", data=data)
+    text = LLMStreamEvent(
+        "content", text="Example: <tool_call><function=write>...</tool_call>"
+    )
+    result = ToolRecoveryPolicy.from_request({}).classify([text, event], None)
+    assert result.accepted and not result.recoverable
+
+
 def test_effective_tools_are_snapshotted_and_feedback_does_not_echo_bad_arguments():
     body = request(choice="required")
     original = deepcopy(body)

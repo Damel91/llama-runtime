@@ -212,8 +212,6 @@ class ToolRecoveryPolicy:
         *,
         secrets: Sequence[str] = (),
     ) -> ToolRecoveryDecision:
-        if not self.enabled:
-            return ToolRecoveryDecision("accepted")
         reasons: list[str] = []
         fatal: list[str] = []
         provenance: list[str] = []
@@ -265,6 +263,29 @@ class ToolRecoveryPolicy:
         if rejected:
             reasons.append("native_rejected_tool_call")
             provenance.append(_NATIVE_MARKER)
+        if not self.enabled:
+            # No-tools streams retain their legacy behavior unless an explicit
+            # native marker reports or fails to describe a rejected proposal.
+            # No terminal is needed to establish absent client-tool authority.
+            malformed = "malformed_native_tool_rejection" in fatal
+            if rejected or malformed:
+                return ToolRecoveryDecision(
+                    "unsafe",
+                    (
+                        "no_declared_tool_authority",
+                        *(("malformed_native_tool_rejection",) if malformed else ()),
+                        *reasons,
+                    ),
+                    len(rejected) if marker_seen else None,
+                    server_activity,
+                    tuple(rejected),
+                    tuple(dict.fromkeys(provenance)),
+                )
+            return ToolRecoveryDecision(
+                "accepted",
+                native_rejected_tool_calls=0 if marker_seen else None,
+                server_activity=server_activity,
+            )
         if terminal is None or terminal.kind != "terminal":
             fatal.append("incomplete_tool_response")
         elif terminal.terminal_reason not in {"completed", "tool_calls"}:
