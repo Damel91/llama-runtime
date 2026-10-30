@@ -22,7 +22,7 @@ import json
 import math
 import os
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Condition, Lock, Thread
 import time
 from urllib.parse import urlsplit
 
@@ -142,9 +142,12 @@ class Upstream:
             )
         self.deadline = time.monotonic() + args.timeout * 4
         self.lock = Lock()
+        self.drained = Condition(self.lock)
         self.counts = Counter()
         self.active = 0
         self.closed = False
+        self.closing = False
+        self.responses = set()
         self.canonical_model = None
 
     def remaining(self):
@@ -160,6 +163,7 @@ class Upstream:
             "probe_endpoint_not_permitted",
         )
         with self.lock:
+            require(not self.closing, "probe_upstream_closed")
             limit = MAX_NATIVE_POSTS if method == "POST" else 18
             require(
                 self.counts[method] < limit, "probe_native_request_budget_exhausted"
@@ -176,13 +180,17 @@ class Upstream:
                 allow_redirects=False,
                 stream=True,
             )
+            with self.lock:
+                self.responses.add(response)
             require(response.status_code == 200, "native_http_status_not_200")
             yield response
         finally:
             if response is not None:
                 response.close()
-            with self.lock:
+            with self.drained:
+                self.responses.discard(response)
                 self.active -= 1
+                self.drained.notify_all()
 
     def get(self, path):
         with self.request("GET", path) as response:
@@ -194,8 +202,16 @@ class Upstream:
             return json.loads(data)
 
     def close(self):
+        with self.lock:
+            self.closing = True
+            responses = tuple(self.responses)
+        for response in responses:
+            response.close()
         self.session.close()
-        self.closed = True
+        with self.drained:
+            self.closed = self.drained.wait_for(
+                lambda: self.active == 0, timeout=self.args.timeout + 1
+            )
 
 
 def snapshot(upstream):
@@ -262,6 +278,7 @@ class Relay:
         self.diagnostics = []
         self.errors = []
         self.closed = False
+        self.active_handlers = 0
         self.lock = Lock()
 
     def check_body(self, body):
@@ -319,6 +336,15 @@ class Relay:
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+
+            def handle(self):
+                with relay.lock:
+                    relay.active_handlers += 1
+                try:
+                    super().handle()
+                finally:
+                    with relay.lock:
+                        relay.active_handlers -= 1
 
             def setup(self):
                 super().setup()
@@ -387,17 +413,26 @@ class Relay:
                         relay.forwarded += 1
                         total = 0
                         pending = bytearray()
-                        for part in response.iter_content(chunk_size=1024):
+                        for part in response.iter_content(chunk_size=1):
                             relay.upstream.remaining()
                             total += len(part)
                             require(total <= MAX_BYTES, "native_stream_too_large")
                             pending.extend(part)
-                            while (position := pending.find(b"\n")) >= 0:
-                                line = bytes(pending[:position]).rstrip(b"\r")
-                                del pending[: position + 1]
+                            if pending.endswith(b"\n"):
+                                line = bytes(pending[:-1]).rstrip(b"\r")
                                 relay.observe_line(line)
-                            self.wfile.write(part)
-                            self.wfile.flush()
+                                self.wfile.write(pending)
+                                self.wfile.flush()
+                                pending.clear()
+                                if (
+                                    line.startswith(b"data:")
+                                    and line[5:].strip() == b"[DONE]"
+                                ):
+                                    # Native SSE completion is authoritative even
+                                    # when its HTTP connection remains open.
+                                    self.wfile.write(b"\n")
+                                    self.wfile.flush()
+                                    break
                         if pending:
                             relay.observe_line(bytes(pending).rstrip(b"\r"))
                 except Exception as exc:
@@ -418,8 +453,13 @@ class Relay:
                 pass
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        # ThreadingHTTPServer defaults to daemon request threads. Explicitly
+        # join owned handlers before declaring cleanup or exporting counters.
+        self.server.daemon_threads = False
         self.thread = Thread(
-            target=lambda: self.server.serve_forever(poll_interval=0.05), daemon=True
+            target=lambda: self.server.serve_forever(poll_interval=0.05),
+            name="tool-recovery-relay",
+            daemon=True,
         )
         self.thread.start()
         return f"http://127.0.0.1:{self.server.server_port}"
@@ -428,7 +468,7 @@ class Relay:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=2)
-        self.closed = not self.thread.is_alive()
+        self.closed = not self.thread.is_alive() and self.active_handlers == 0
 
 
 def report_output(report):
@@ -536,6 +576,7 @@ def run_case(args, upstream, *, inject, records):
             native_diagnostics=relay.diagnostics,
             relay_error_types=relay.errors,
             relay_closed=relay.closed,
+            active_relay_handlers=relay.active_handlers,
             adapter_closed=adapter is not None,
         )
 
@@ -576,6 +617,9 @@ def run(args):
                 result.update(result="failed", snapshot_error_type=type(exc).__name__)
                 status = 1
         upstream.close()
+        if not upstream.closed:
+            result.update(result="failed", native_drain_failed=True)
+            status = 1
         result.update(
             native_http_counts=dict(upstream.counts),
             active_native_responses=upstream.active,

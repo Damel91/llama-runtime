@@ -9,7 +9,8 @@ import json
 from pathlib import Path
 import subprocess
 import sys
-from threading import Thread
+from threading import Event, Thread
+import time
 
 import pytest
 
@@ -135,8 +136,16 @@ def valid_frames(marker=None):
 def native_server():
     servers = []
 
-    def start(*, frames=None, loaded=True, redirect=False):
-        state = {"posts": [], "gets": [], "closed": False, "headers": []}
+    def start(
+        *, frames=None, loaded=True, redirect=False, keepalive=False, quiet=False
+    ):
+        state = {
+            "posts": [],
+            "gets": [],
+            "closed": False,
+            "headers": [],
+            "release": Event(),
+        }
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -191,9 +200,14 @@ def native_server():
                 )
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Content-Length", str(len(wire)))
+                if not keepalive and not quiet:
+                    self.send_header("Content-Length", str(len(wire)))
                 self.end_headers()
-                self.wfile.write(wire)
+                if not quiet:
+                    self.wfile.write(wire)
+                    self.wfile.flush()
+                if keepalive or quiet:
+                    state["release"].wait(timeout=3)
                 self.close_connection = True
 
             def log_message(self, *_args):
@@ -207,6 +221,7 @@ def native_server():
 
     yield start
     for server, thread, state in servers:
+        state["release"].set()
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
@@ -273,6 +288,41 @@ def test_native_marker_summary_never_exports_arbitrary_provider_strings():
     assert (
         probe.marker_summary("arbitrary provider body")["contract_shape_valid"] is False
     )
+
+
+def test_native_done_finishes_without_waiting_for_http_eof(native_server, tmp_path):
+    origin, state = native_server(frames=valid_frames(marker=[]), keepalive=True)
+    args = probe.parse_args(
+        ["--allow-live", *cli_args(tmp_path, origin), "--timeout", "1"]
+    )
+    started = time.monotonic()
+    status, report = probe.run(args)
+    elapsed = time.monotonic() - started
+    assert status == 0, report
+    assert elapsed < 2
+    assert not state["release"].is_set()
+    assert len(state["posts"]) == 2
+    assert report["active_native_responses"] == 0
+    assert report["closed"] is True
+    assert all(case["active_relay_handlers"] == 0 for case in report["cases"])
+    assert all(case["relay_closed"] for case in report["cases"])
+
+
+def test_silent_native_timeout_drains_handler_before_export(native_server, tmp_path):
+    origin, state = native_server(quiet=True)
+    args = probe.parse_args(
+        ["--allow-live", *cli_args(tmp_path, origin), "--timeout", "0.15"]
+    )
+    status, report = probe.run(args)
+    assert status == 1
+    assert len(state["posts"]) == 1
+    assert report["active_native_responses"] == 0
+    assert report["closed"] is True
+    case = report["cases"][0]
+    assert case["result"] == "failed"
+    assert case["active_relay_handlers"] == 0
+    assert case["relay_closed"] and case["adapter_closed"]
+    assert case["recovery"]["corrections_used"] == 0
 
 
 def test_unsuccessful_native_correction_cannot_forward_a_third_post(
