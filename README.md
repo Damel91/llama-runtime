@@ -6,9 +6,9 @@ embedding adapters for local servers, remote hosts and private networks. The Pyt
 `runtime_llama`. Python 3.11 or later is required. Runtime dependencies are
 `requests`, `urllib3` and `jsonschema`.
 
-The current stable release is **0.16.0**. See the
-[release assets](https://github.com/Damel91/llama-runtime/releases/tag/v0.16.0)
-and [verification record](docs/verification/PUBLIC-RELEASE-0.16.0.md), including
+The current stable release is **0.17.0**. See the
+[release assets](https://github.com/Damel91/llama-runtime/releases/tag/v0.17.0)
+and [verification record](docs/verification/PUBLIC-RELEASE-0.17.0.md), including
 the accepted numerical limitation of the measured server/model profile.
 
 ## Why this library exists
@@ -38,6 +38,7 @@ The project's engineering lifecycle is managed with
 | Structured output | Native llama.cpp JSON/schema forwarding; Strata JSON Schema projection and local validation before a successful complete response. |
 | Reasoning | Separate reasoning output, configurable reasoning policies and removal of inline thinking from visible text. |
 | Tool calls | Tool definitions and choice controls, streamed argument assembly, complete structured calls and correlation with tool results. |
+| Automatic tool recovery | Atomic proposal validation and up to three corrective generations per external invocation; preserves native rejection evidence, request-local budgets, selected route and typed attempt reports. |
 | Usage and outcomes | Token counters, terminal reasons, bounded transport metadata and optional typed native server timings; unavailable counters remain unknown. |
 | Embeddings | Query, document and raw input modes; optional normalization; validates result order, cardinality, vector dimensions and finite values. |
 | Task-aware preparation | Configurable model-specific query/document prefixes and exact server tokenization, including special tokens; measures oversized inputs and safely reuses verified counts. |
@@ -64,6 +65,27 @@ server build, model and chat template. Strata structured responses are validated
 locally before successful completion; llama.cpp retains native schema forwarding. Splitting source documents and tracking their
 fragments belong to the consuming application. The server's own auto-loading
 policy is supported.
+
+## Release 0.17.0: automatic tool-call recovery
+
+With declared tools, llama.cpp, Strata and automatic adapters validate a
+complete proposal before publishing its text or tool fragments. A safely
+recoverable rejection starts another generation inside the same SDK call,
+using the same runtime, model and request settings. The initial generation
+can be followed by at most three corrections; a new external call receives
+a fresh budget. Exhaustion raises `LLMToolRecoveryError` for that invocation.
+
+Results and metadata streams expose typed `tool_recovery` reports with
+per-attempt reasons, provenance, usage and timings. Native rejection evidence
+and local schema validation stay distinct. The SDK executes no tools, infers
+no failure from XML-like text, and does not regenerate after uncertain
+server-side effects or ordinary transport failures. Tool-enabled streaming
+waits for proposal validation; ordinary no-tool streaming remains progressive.
+
+See [the recovery API and examples](docs/TOOL-RECOVERY.md) for cancellation,
+iterator ownership, accounting and the native-diagnostic limitations. The
+embedding scheduler, calibration corpus and 80%/90% margins are unchanged.
+Publication does not update consumer installations.
 
 ## Release 0.16.0: Strata and automatic runtime selection
 
@@ -98,7 +120,9 @@ Every generation refreshes the configured runtime catalog and pins its selected
 backend and canonical model for that call. Stream events and blocking results
 carry their own `runtime_selection`. Unsupported or unreachable endpoints stay
 visible as diagnostics; model identity conflicts and ambiguous aliases fail
-explicitly. There is no silent model substitution or retry of a submitted POST.
+explicitly. There is no silent model substitution or transport replay of a
+submitted POST. Tool recovery uses a separate corrective generation on the
+same selected route under the contract above.
 
 Existing direct llama.cpp adapters and embedding contracts remain available.
 Strata support is LLM-only; this release does not add Ollama, OpenAI or LM Studio

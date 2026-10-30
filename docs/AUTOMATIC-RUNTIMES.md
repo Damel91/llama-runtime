@@ -119,7 +119,9 @@ Missing hashes remain missing and names never prove equal weights.
 Each generation refreshes discovery and fixes one selected backend, canonical
 model and client for the whole request. There is no global route mutation
 that can redirect an in-flight stream, no fallback to a different model after
-a lookup failure and no automatic replay of a submitted POST. Moving a model
+a lookup failure and no transport replay of a submitted POST. In 0.17.0,
+[tool recovery](TOOL-RECOVERY.md) can start a separate corrective generation
+inside that same pinned operation after a safely rejected proposal. Moving a model
 between servers takes effect on the next request. An observation cannot reserve
 the remote model or prevent an operator from changing it after the probe.
 
