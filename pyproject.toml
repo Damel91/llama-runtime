@@ -5,7 +5,7 @@ backend-path = ["."]
 
 [project]
 name = "runtime-llama"
-version = "0.16.0"
+version = "0.17.0"
 description = "Python inference client for llama.cpp and Strata: automatic runtime routing, streaming, tools and embeddings"
 readme = "README.md"
 requires-python = ">=3.11"
