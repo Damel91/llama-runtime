@@ -334,6 +334,94 @@ def test_missing_local_schema_reference_is_input_error_before_http():
         ToolRecoveryPolicy.from_request(request(schema={"$ref": "#/$defs/missing"}))
 
 
+@pytest.mark.parametrize("name", ["$ref", "$dynamicRef"])
+@pytest.mark.parametrize(
+    "dialect",
+    [
+        None,
+        "http://json-schema.org/draft-07/schema#",
+        "https://json-schema.org/draft/2020-12/schema",
+    ],
+)
+def test_property_names_that_look_like_reference_keywords_are_instance_fields(
+    name, dialect
+):
+    schema = {
+        "type": "object",
+        "properties": {name: {"type": "string"}},
+        "required": [name],
+    }
+    if dialect:
+        schema["$schema"] = dialect
+    policy = ToolRecoveryPolicy.from_request(request(schema=schema))
+    proposal = call(
+        arguments=json.dumps({name: "https://example.invalid/instance-data"})
+    )
+    assert policy.classify([], terminal([proposal])).accepted
+
+
+@pytest.mark.parametrize("keyword", ["const", "default", "examples"])
+def test_reference_keys_inside_instance_annotations_are_not_schema_references(keyword):
+    instance = {
+        "$ref": "https://example.invalid/ordinary-data",
+        "$dynamicRef": "file:///ordinary-data",
+    }
+    schema = {
+        "type": "object",
+        keyword: [instance] if keyword == "examples" else instance,
+    }
+    policy = ToolRecoveryPolicy.from_request(request(schema=schema))
+    assert policy.classify(
+        [], terminal([call(arguments=json.dumps(instance))])
+    ).accepted
+
+
+@pytest.mark.parametrize("keyword", ["$ref", "$dynamicRef"])
+@pytest.mark.parametrize("container", ["properties", "$defs"])
+def test_true_nested_remote_schema_references_remain_blocked(keyword, container):
+    schema = {
+        "type": "object",
+        container: {"nested": {keyword: "https://example.invalid/schema"}},
+    }
+    with pytest.raises(ValueError, match="requires_local_references"):
+        ToolRecoveryPolicy.from_request(request(schema=schema))
+
+
+def test_inactive_dynamic_reference_keyword_respects_draft7_dialect():
+    schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "$dynamicRef": "https://example.invalid/unknown-annotation-in-draft7",
+    }
+    assert (
+        ToolRecoveryPolicy.from_request(request(schema=schema))
+        .classify([], terminal([call()]))
+        .accepted
+    )
+
+
+@pytest.mark.parametrize("native_name", ["full", "native80", "normal"])
+def test_native_truncation_cannot_leak_registered_secret_prefix(native_name):
+    secret = "sk-proj-" + "X" * 100
+    name = (
+        secret
+        if native_name == "full"
+        else secret[:80]
+        if native_name == "native80"
+        else "write"
+    )
+    result = ToolRecoveryPolicy.from_request(request()).classify(
+        [], terminal(strata_rejected_tool_calls=native(name)), secrets=(secret,)
+    )
+    assert result.recoverable
+    if native_name == "normal":
+        assert result.native_rejections[0].name == "write"
+    else:
+        exported = json.dumps(result.to_dict())
+        assert "sk-proj-" not in exported and "X" * 20 not in exported
+        assert result.native_rejections[0].name == "<credential_redacted>"
+
+
 def test_report_uses_final_attempt_snapshots_and_keeps_unknown_fields_unknown():
     first = LLMToolRecoveryAttempt(
         0,

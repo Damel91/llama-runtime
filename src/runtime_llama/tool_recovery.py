@@ -26,8 +26,16 @@ _CREDENTIAL = re.compile(
 
 
 def _safe_name(value: str, secrets: Sequence[str]) -> str:
+    # Strata truncates names to80 characters before transmitting this field.
+    # Redact a registered secret split at that boundary before our own export.
+    native_boundary = len(value) >= 80
     for secret in sorted(set(filter(None, secrets)), key=len, reverse=True):
         value = value.replace(secret, "<credential_redacted>")
+        if native_boundary:
+            for size in range(min(len(secret) - 1, len(value)), 0, -1):
+                if value.endswith(secret[:size]):
+                    value = value[:-size] + "<credential_redacted>"
+                    break
     return sanitize_diagnostic(
         _CREDENTIAL.sub("<credential_redacted>", value), limit=80
     )
@@ -45,23 +53,10 @@ def _schema_validator(schema: Any):
     from jsonschema.exceptions import SchemaError
     from referencing import Registry, Resource
     from referencing.exceptions import Unresolvable
-    from referencing.jsonschema import DRAFT202012
+    from referencing.jsonschema import specification_with
 
     if not isinstance(schema, (dict, bool)):
         raise ValueError("tool_parameters_require_json_schema")
-    pending = [schema]
-    while pending:
-        node = pending.pop()
-        if isinstance(node, dict):
-            for key, value in node.items():
-                if key in {"$ref", "$dynamicRef"} and (
-                    not isinstance(value, str) or not value.startswith("#")
-                ):
-                    raise ValueError("tool_schema_requires_local_references")
-                if isinstance(value, (dict, list)):
-                    pending.append(value)
-        elif isinstance(node, list):
-            pending.extend(node)
     dialect = schema.get("$schema") if isinstance(schema, dict) else None
     if dialect is not None and not isinstance(dialect, str):
         raise ValueError("tool_schema_dialect_invalid")
@@ -77,20 +72,28 @@ def _schema_validator(schema: Any):
     registry = Registry()
     # Resolve local references against the actual resource scope before HTTP,
     # without following them recursively or registering a remote retriever.
-    root = Resource.from_contents(schema, default_specification=DRAFT202012)
-    resources = [(root, registry.resolver_with_root(root))]
+    specification = specification_with(
+        selected.META_SCHEMA.get("$id") or selected.META_SCHEMA["id"]
+    )
+    root = Resource.from_contents(schema, default_specification=specification)
+    resources = [(root, registry.resolver_with_root(root), selected)]
     while resources:
-        resource, resolver = resources.pop()
+        resource, resolver, parent_validator = resources.pop()
         value = resource.contents
+        node_validator = validators.validator_for(value, default=parent_validator)
         if isinstance(value, dict):
             for key in ("$ref", "$dynamicRef"):
-                if key in value:
+                if key in value and key in node_validator.VALIDATORS:
+                    if not isinstance(value[key], str) or not value[key].startswith(
+                        "#"
+                    ):
+                        raise ValueError("tool_schema_requires_local_references")
                     try:
                         resolver.lookup(value[key])
                     except Unresolvable:
                         raise ValueError("tool_schema_unresolvable") from None
         for child in resource.subresources():
-            resources.append((child, resolver.in_subresource(child)))
+            resources.append((child, resolver.in_subresource(child), node_validator))
     return selected(schema, registry=registry)
 
 
