@@ -49,6 +49,8 @@ from runtime_llama.embedding_preparation import (
 )
 from runtime_llama.embedding_preparation_cache import PreparationCache, PreparationKey
 from runtime_llama.embedding_halving import _RejectedEmbedding, _rejected_embedding
+from runtime_llama.embedding_halving import _HalvingResult, _halving_error
+from runtime_llama.runtime_discovery import _runtime_marker
 from runtime_llama.embedding_stream import (
     EmbeddingWindowStream,
     _EmbeddingWindowBridge,
@@ -62,9 +64,13 @@ _NATIVE_CLIENT_CLASS = LlamaCppClient
 class _CatalogObservation(dict):
     """One frozen boundary's root attestation; never an across-POST cache."""
 
-    def __init__(self, catalog, props, client, endpoint):
+    def __init__(
+        self, catalog, props, client, endpoint, *, health=None, explicit_direct=False
+    ):
         super().__init__(catalog)
         self.root_props, self.client, self.endpoint = props, client, endpoint
+        self.health = health
+        self.explicit_direct = explicit_direct
 
 
 class _TextInputs(Sequence):
@@ -124,6 +130,14 @@ class _Replica:
 
 
 @dataclass(frozen=True)
+class _ExplicitTargetAttestation:
+    """Fresh selected-target metadata, never proof of equal model weights."""
+
+    canonical_model: str
+    native_build: str | None
+
+
+@dataclass(frozen=True)
 class _Observation:
     context_length: int | None
     context_token_limit: int | None
@@ -134,6 +148,7 @@ class _Observation:
     native_microbatch_tokens: int | None = None
     total_slots: int | None = None
     vocab_size: int | None = None
+    explicit_target: _ExplicitTargetAttestation | None = None
 
 
 @dataclass(frozen=True)
@@ -186,6 +201,15 @@ class _DirectEmbeddingPolicy:
 
 
 @dataclass(frozen=True)
+class _ExplicitModelDirectPolicy:
+    """One selected native target; no content identity or reusable preparation."""
+
+    model: str
+    policy: str
+    prefix: str
+
+
+@dataclass(frozen=True)
 class _DirectInput:
     """Bounded queue reservation, not a measured or estimated input count."""
 
@@ -196,14 +220,15 @@ class _DirectInput:
     batch_token_limit: int | None
     max_input_tokens: int | None
     identity_verified: bool
-    content_sha256: str
-    embedding_sha256: str
-    _tokenizer_build: str
+    content_sha256: str | None
+    embedding_sha256: str | None
+    _tokenizer_build: str | None
     _policy: str
-    _direct_policy: _DirectEmbeddingPolicy
+    _direct_policy: _DirectEmbeddingPolicy | _ExplicitModelDirectPolicy
     _token_ids: None = None
     _text_wire_bytes: int = 0
     _tokens_wire_bytes: None = None
+    _explicit_target: _ExplicitTargetAttestation | None = None
 
     @property
     def token_count(self):
@@ -942,6 +967,9 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
     ) -> _Observation:
         replica = replica or self._primary
         remaining = call.remaining if call is not None else lambda: timeout
+        if catalog is None and self._explicit_direct_requested(call):
+            owners = call.calls if isinstance(call, _BatchCall) else (call,)
+            catalog = self._engine_catalog_shared(owners, phase=phase)
         entry = self._verify_discovered_replica(
             replica, timeout=remaining(), cancel=cancel, catalog=catalog, phase=phase
         )
@@ -949,10 +977,32 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         replica.props_checked = True
         self._props_checked = True
         try:
+            state = entry.get("status") if isinstance(entry, dict) else None
+            loaded = (
+                state.get("value") if isinstance(state, dict) else state
+            ) == "loaded"
+            owners = call.calls if isinstance(call, _BatchCall) else (call,)
+            only_explicit = bool(call) and all(
+                type(getattr(owner, "_direct_policy", None))
+                is _ExplicitModelDirectPolicy
+                for owner in owners
+            )
             if (
+                isinstance(catalog, _CatalogObservation)
+                and catalog.explicit_direct
+                and only_explicit
+                and not loaded
+            ):
+                # A model-selecting router props query may load an alias.
+                # The new direct path requires loaded proof before selecting it.
+                props = None
+            elif (
                 isinstance(catalog, _CatalogObservation)
                 and catalog.client is self._client
                 and catalog.endpoint == self.base_url
+                and isinstance(catalog.root_props, dict)
+                and catalog.root_props.get("role") != "router"
+                and isinstance(catalog.get("data"), list)
                 and len(catalog["data"]) == 1
                 and replica.model in self._catalog_aliases(catalog["data"][0])
             ):
@@ -1035,6 +1085,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             native.n_ubatch,
             native.total_slots,
             vocab_size,
+            self._explicit_target_attestation(replica, entry, props, catalog),
         )
 
     @staticmethod
@@ -1068,6 +1119,83 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             for entry in entries
             if isinstance(entry, dict) and model in cls._catalog_aliases(entry)
         ]
+
+    @staticmethod
+    def _explicit_direct_requested(call):
+        owners = call.calls if isinstance(call, _BatchCall) else (call,)
+        return any(
+            type(getattr(owner, "_direct_policy", None)) is _ExplicitModelDirectPolicy
+            for owner in owners
+        )
+
+    def _explicit_target_attestation(self, replica, entry, props, catalog):
+        """Attest only the requested native target, without inventing identity.
+
+        This optional observation does not strengthen or change the legacy
+        exact and hash-verified paths. The public explicit-direct path alone
+        requires it. Unknown or incompatible observations stay unverified.
+        """
+        if not (
+            isinstance(catalog, _CatalogObservation)
+            and catalog.client is self._client
+            and catalog.endpoint == self.base_url
+            and isinstance(catalog.health, dict)
+            and catalog.health.get("status") == "ok"
+            and catalog.health.get("loaded") is not False
+            and isinstance(entry, dict)
+            and isinstance(props, dict)
+            and props.get("is_sleeping") is not True
+        ):
+            return None
+        entries = catalog.get("data")
+        if not isinstance(entries, list) or any(
+            not isinstance(item, dict) for item in entries
+        ):
+            return None
+        matches = self._catalog_matches(replica.model, entries)
+        if len(matches) != 1 or matches[0] is not entry:
+            return None
+        canonical = entry.get("id")
+        aliases = entry.get("aliases", [])
+        status = entry.get("status")
+        state = status.get("value") if isinstance(status, dict) else status
+        capabilities = entry.get("capabilities")
+        if (
+            not isinstance(canonical, str)
+            or not canonical
+            or not isinstance(aliases, list)
+            or any(not isinstance(alias, str) or not alias for alias in aliases)
+            or state != "loaded"
+            or (isinstance(status, dict) and status.get("failed") is True)
+            or entry.get("failed") is True
+            or props.get("model_alias") not in self._catalog_aliases(entry)
+            or (
+                isinstance(capabilities, dict)
+                and capabilities.get("embeddings") is False
+            )
+        ):
+            return None
+        root = catalog.root_props
+        root = root if isinstance(root, dict) else {}
+        markers = {
+            marker
+            for value in (
+                catalog.health.get("service"),
+                root.get("build_info"),
+                props.get("build_info"),
+            )
+            if (marker := _runtime_marker(value)) is not None
+        }
+        if markers != {"llamacpp"}:
+            return None
+        builds = {
+            value
+            for value in (root.get("build_info"), props.get("build_info"))
+            if isinstance(value, str) and value
+        }
+        if len(builds) > 1:
+            return None
+        return _ExplicitTargetAttestation(canonical, next(iter(builds), None))
 
     def _input_limit(
         self,
@@ -1262,6 +1390,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             # The native server remains authoritative for actual token usage.
             reservation = 0
             call.check()
+            explicit = type(direct) is _ExplicitModelDirectPolicy
             return _DirectInput(
                 text=text,
                 input_type=input_type,
@@ -1269,13 +1398,16 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 context_token_limit=context_limit,
                 batch_token_limit=batch_limit,
                 max_input_tokens=self._minimum(context_limit, batch_limit),
-                identity_verified=True,
-                content_sha256=direct.content_sha256,
-                embedding_sha256=direct.embedding_sha256,
-                _tokenizer_build=direct.tokenizer_build,
+                identity_verified=not explicit,
+                content_sha256=None if explicit else direct.content_sha256,
+                embedding_sha256=None if explicit else direct.embedding_sha256,
+                _tokenizer_build=(
+                    observation.tokenizer_build if explicit else direct.tokenizer_build
+                ),
                 _policy=direct.policy,
                 _direct_policy=direct,
                 _text_wire_bytes=len(json.dumps(text, ensure_ascii=True)),
+                _explicit_target=observation.explicit_target if explicit else None,
             )
         if isinstance(item, PreparedEmbeddingInput):
             text, input_type = item.text, item.input_type
@@ -1781,6 +1913,8 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         if not callable(models):
             return None
         group.check()
+        if self._explicit_direct_requested(group):
+            return self._explicit_direct_catalog(group, phase=phase)
         catalog = (
             self._discovery_catalog(
                 timeout=group.remaining(), cancel=group.probe, phase=phase
@@ -1797,6 +1931,55 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         )
         group.check()
         return catalog
+
+    def _explicit_direct_catalog(self, group, *, phase):
+        """Observe native health/catalog/root props before selecting an alias.
+
+        Additional attestation failures retire explicit-direct owners during
+        their ordinary record validation. They do not change the legacy
+        exact path if it shares this metadata cohort.
+        """
+
+        def optional_metadata(method):
+            if not callable(getattr(self._client, method, None)):
+                return None
+            try:
+                return self._http_call(
+                    method,
+                    phase=phase,
+                    timeout=group.remaining(),
+                    cancel=group.probe,
+                    cancel_wait=True,
+                    **self._engine_response_options(),
+                )
+            except Exception:
+                # Preserve owner-local cancellation/deadlines, and allow an
+                # unrelated exact owner to use its original metadata path.
+                group.check()
+                return None
+
+        health = optional_metadata("health")
+        catalog = self._http_call(
+            "models",
+            phase=phase,
+            timeout=group.remaining(),
+            cancel=group.probe,
+            cancel_wait=True,
+            **self._engine_response_options(),
+        )
+        props = optional_metadata("props")
+        group.check()
+        catalog = attest_single_model_catalog(catalog, props)
+        if not isinstance(catalog, dict):
+            return catalog
+        return _CatalogObservation(
+            catalog,
+            props,
+            self._client,
+            self.base_url,
+            health=health,
+            explicit_direct=True,
+        )
 
     def _engine_observe(self, model, call, *, catalog=None):
         return self._observe_replica(
@@ -1816,6 +1999,18 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
                 or not record.text.startswith(record._direct_policy.prefix)
             ):
                 raise LLMBackendError("llamacpp_embedding_direct_policy_mismatch")
+            if type(record._direct_policy) is _ExplicitModelDirectPolicy:
+                previous, current = record._explicit_target, observation.explicit_target
+                if (
+                    previous is None
+                    or current is None
+                    or previous.canonical_model != current.canonical_model
+                    or (
+                        previous.native_build is not None
+                        and previous.native_build != current.native_build
+                    )
+                ):
+                    raise LLMBackendError("llamacpp_embedding_direct_target_changed")
             # A queue reservation is not evidence that the actual input is too
             # long. Fresh smaller contexts remain authoritative at inference;
             # retaining the older reservation only makes intake conservative.
@@ -2052,8 +2247,14 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
 
     def _validate_direct_policy(self, policy, input_type):
         self._validate_task(input_type)
-        if type(policy) is not _DirectEmbeddingPolicy:
+        if type(policy) not in {_DirectEmbeddingPolicy, _ExplicitModelDirectPolicy}:
             raise ValueError("policy must be a verified direct embedding policy")
+        if type(policy) is _ExplicitModelDirectPolicy and (
+            self._uses_verified_pool
+            or len(self._replicas) != 1
+            or policy.model != self._primary.model
+        ):
+            raise LLMBackendError("llamacpp_embedding_direct_single_target_required")
         prefix = (
             "" if input_type == "raw" else getattr(self._embedding_prefixes, input_type)
         )
@@ -2064,6 +2265,10 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
 
     def _validate_direct_observation(self, policy, input_type, replica, observation):
         self._validate_direct_policy(policy, input_type)
+        if type(policy) is _ExplicitModelDirectPolicy:
+            if replica.model != policy.model or observation.explicit_target is None:
+                raise LLMBackendError("llamacpp_embedding_direct_target_unverified")
+            return
         identity = replica.identity
         expected = (policy.content_sha256, policy.embedding_sha256)
         if identity is None or observation.identity_key is None:
@@ -2075,6 +2280,58 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             and observation.tokenizer_build != policy.tokenizer_build
         ):
             raise LLMBackendError("llamacpp_embedding_direct_tokenizer_changed")
+
+    @_release_exception_frames
+    def embed_texts_direct(
+        self,
+        texts: Sequence[str],
+        *,
+        input_type: Literal["document", "query", "raw"] = "document",
+        timeout=None,
+        cancel=None,
+    ) -> list[list[float]]:
+        """Embed strings on one explicit native target without tokenization.
+
+        This additive path requires discovery to be disabled and one configured
+        target. Fresh health, catalog and properties attest its loaded native
+        endpoint at admission and each POST boundary. They do not prove equal
+        weights: content/semantic identities remain unknown and no replicas,
+        preparation cache, token IDs or calibration are used.
+
+        A split-required error retains successful indexed vectors and source
+        halves. Its ``unverified-call:...`` representation ID is a random,
+        request-local correlation only, never model identity or a reusable key.
+        Exact ``embed_texts``/``prepare_texts`` and verified automatic embedding
+        retain their existing contracts and use the same engine and scheduler.
+        """
+        self._validate_task(input_type)
+        prefix = (
+            "" if input_type == "raw" else getattr(self._embedding_prefixes, input_type)
+        )
+        policy = _ExplicitModelDirectPolicy(
+            self._primary.model, self._policy(input_type), prefix
+        )
+        self._validate_direct_policy(policy, input_type)
+        if isinstance(texts, (str, bytes)) or not isinstance(texts, Sequence):
+            raise ValueError("texts must be a sequence of strings")
+        call = _Call(self, cancel, timeout)
+        call._direct_policy = policy
+        if not texts:
+            return []
+        self._direct_token_accounting.set()
+        result = self._execute(
+            _TextInputs(self._snapshot_inputs(texts, call), prefix, input_type),
+            operation="embed",
+            timeout=timeout,
+            cancel=cancel,
+            call=call,
+        )
+        if isinstance(result, _HalvingResult):
+            error = _halving_error(
+                result, "unverified-call:" + secrets.token_hex(16), input_type
+            )
+            raise error from next(iter(result.rejections.values())).original
+        return result
 
     @_release_exception_frames
     def _embed_texts_direct(
