@@ -5,8 +5,8 @@ backend-path = ["."]
 
 [project]
 name = "runtime-llama"
-version = "0.17.0"
-description = "Python inference client for llama.cpp and Strata: automatic runtime routing, streaming, tools and embeddings"
+version = "0.18.0"
+description = "Python inference client and optional local HTTP relay for llama.cpp and Strata, with routing, streaming, tools and embeddings"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -20,14 +20,18 @@ Documentation = "https://github.com/Damel91/llama-runtime#readme"
 Issues = "https://github.com/Damel91/llama-runtime/issues"
 
 [project.optional-dependencies]
-dev = ["build>=1.2,<2", "pytest>=8,<10", "ruff>=0.11,<1"]
+relay = ["starlette>=1.0,<2", "uvicorn>=0.42,<1"]
+dev = ["build>=1.2,<2", "httpx>=0.28,<1", "pytest>=8,<10", "ruff>=0.11,<1"]
+
+[project.scripts]
+llama-runtime-relay = "runtime_llama.relay.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["runtime_llama*"]
 
 [tool.setuptools.package-data]
-runtime_llama = ["py.typed", "_vendor/*.LICENSE", "calibration_corpus/*.json", "calibration_corpus/*.jsonl", "calibration_corpus/*.md"]
+runtime_llama = ["py.typed", "_vendor/*.LICENSE", "calibration_corpus/*.json", "calibration_corpus/*.jsonl", "calibration_corpus/*.md", "relay/static/*.html", "relay/static/*.css", "relay/static/*.js"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

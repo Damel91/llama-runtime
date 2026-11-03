@@ -40,14 +40,20 @@ def test_factories_reject_wrong_role():
 
 def test_import_without_model_or_sdk_packages():
     script = """
-import importlib.abc, sys
+import importlib.abc, sys, threading
 class Block(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname.split('.')[0] in {'lmstudio', 'openai', 'llamatelemetry', 'torch', 'transformers', 'flow_of_work_mcp', 'codingcastle'}:
+        if fullname.split('.')[0] in {'lmstudio', 'openai', 'llamatelemetry', 'torch', 'transformers', 'flow_of_work_mcp', 'codingcastle', 'starlette', 'uvicorn'}:
             raise AssertionError('forbidden import: ' + fullname)
 sys.meta_path.insert(0, Block())
+def no_runtime_effect(event, args):
+    if event in {'socket.bind', 'socket.connect', 'subprocess.Popen', 'os.exec'}:
+        raise AssertionError('import started a runtime effect: ' + event)
+sys.addaudithook(no_runtime_effect)
+before = threading.enumerate()
 import runtime_llama
-assert runtime_llama.__version__ == '0.17.0'
+assert runtime_llama.__version__ == '0.18.0'
+assert threading.enumerate() == before
 """
     environment = dict(os.environ)
     environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")

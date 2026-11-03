@@ -3,6 +3,7 @@ include _build_backend.py
 recursive-include docs *.md
 recursive-include src/runtime_llama *.LICENSE py.typed
 recursive-include src/runtime_llama/calibration_corpus *.json *.jsonl *.md
+recursive-include src/runtime_llama/relay/static *.html *.css *.js
 include tools/generate_calibration_corpus.py
 include tools/calibration-hard-selection.json
 recursive-include tests *.py
