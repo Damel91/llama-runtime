@@ -37,7 +37,7 @@
       </header>
       <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
       <div id="conflict-notice" class="notice error" role="alert" hidden><strong>Settings changed in another session.</strong><span>Your draft is still here. Reload to use the saved settings, or keep reviewing your draft.</span><button type="button" class="button secondary" id="resolve-conflict">Discard draft and reload</button></div>
-      <div id="restart-notice" class="notice" hidden>Listener settings were saved. Restart the relay explicitly to use the new address; current requests keep their original settings.</div>
+      <div id="restart-notice" class="notice" hidden>Configured listener differs from the running address. Restart the relay explicitly to use the configured address; current requests keep their original settings.</div>
 
       <section id="view-models" class="view" aria-labelledby="models-heading">
         <div class="section-heading"><div><h2 id="models-heading">Observed catalog</h2><p id="catalog-observed">No discovery has run yet.</p></div><div class="inline-actions"><button type="button" class="button secondary" id="open-export">Export OpenCode settings</button><button type="button" class="button primary" id="refresh-catalog">Refresh catalog</button></div></div>

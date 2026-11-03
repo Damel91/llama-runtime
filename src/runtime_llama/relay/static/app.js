@@ -429,9 +429,13 @@ const RelayConsole = (() => {
     if (description) section.append(node("p", "", description));
     const grid = node("div", "form-grid"); render(grid); section.append(grid); container.append(section);
   }
+  function onValueEdit(control, update) {
+    control.addEventListener("input", update);
+    control.addEventListener("change", update);
+  }
   function editField(control, errorKey, mutate) {
     const error = node("span", "field-error"); error.hidden = true;
-    control.addEventListener("change", () => {
+    onValueEdit(control, () => {
       try { mutate(control.value); state.errors.delete(errorKey); error.hidden = true; control.removeAttribute("aria-invalid"); }
       catch (failure) { state.errors.set(errorKey, failure.message); error.textContent = failure.message; error.hidden = false; control.setAttribute("aria-invalid", "true"); }
       markDirty();
@@ -517,7 +521,7 @@ const RelayConsole = (() => {
       choice.value = own(settings, "embedding_prefixes") ? "custom" : "inherit";
       const prefixes = node("div", "prefix-fields");
       const controls = {};
-      for (const type of ["query", "document"]) { const prefixWrap = field(`${type === "query" ? "Query" : "Document"} prefix`); const input = node("textarea"); input.rows = 2; input.spellcheck = false; input.value = settings.embedding_prefixes?.[type] ?? ""; controls[type] = input; input.addEventListener("change", () => { if (choice.value === "custom") { settings.embedding_prefixes = {query: controls.query.value, document: controls.document.value}; markDirty(); } }); prefixWrap.append(input); prefixes.append(prefixWrap); }
+      for (const type of ["query", "document"]) { const prefixWrap = field(`${type === "query" ? "Query" : "Document"} prefix`); const input = node("textarea"); input.rows = 2; input.spellcheck = false; input.value = settings.embedding_prefixes?.[type] ?? ""; controls[type] = input; onValueEdit(input, () => { if (choice.value === "custom") { settings.embedding_prefixes = {query: controls.query.value, document: controls.document.value}; markDirty(); } }); prefixWrap.append(input); prefixes.append(prefixWrap); }
       prefixes.hidden = choice.value !== "custom";
       choice.addEventListener("change", () => { prefixes.hidden = choice.value !== "custom"; if (choice.value === "custom") settings.embedding_prefixes = {query: controls.query.value, document: controls.document.value}; else delete settings.embedding_prefixes; markDirty(); });
       wrap.append(choice); grid.append(wrap, prefixes);
@@ -555,13 +559,13 @@ const RelayConsole = (() => {
     };
     const llm = node("details", "advanced-settings"); llm.open = true; llm.append(node("summary", "", "Generation overrides")); const llmContent = node("div"); renderLLM(llmContent, working.llm, `model:${id}:llm`); llm.append(llmContent);
     const embedding = node("details", "advanced-settings"); embedding.append(node("summary", "", "Embedding overrides")); const embeddingContent = node("div"); renderEmbedding(embeddingContent, working.embedding, `model:${id}:embedding`); embedding.append(embeddingContent);
-    const editor = node("div"); editor.append(llm, embedding); editor.addEventListener("change", commit);
+    const editor = node("div"); editor.append(llm, embedding); onValueEdit(editor, commit);
     target.append(editor);
   }
   function textSetting(grid, target, key, label, help, options = {}) {
     const wrap = field(label, help); const input = node(options.multiline ? "textarea" : "input"); if (!options.multiline) input.type = options.secret ? "password" : "text";
     input.value = target[key] ?? ""; input.autocomplete = options.secret ? "new-password" : "off"; if (options.placeholder) input.placeholder = options.placeholder;
-    input.addEventListener("change", () => { if (input.value === "" && options.optional) delete target[key]; else target[key] = options.trim === false ? input.value : input.value.trim(); markDirty(); });
+    onValueEdit(input, () => { if (input.value === "" && options.optional) delete target[key]; else target[key] = options.trim === false ? input.value : input.value.trim(); markDirty(); });
     wrap.append(input); grid.append(wrap); return input;
   }
   function secretSetting(grid, target, key, label, pointer) {
@@ -598,7 +602,7 @@ const RelayConsole = (() => {
     group(container, "Listener", "Saved address changes require an explicit relay restart. The current browser stays connected to its existing address.", (grid) => {
       textSetting(grid, state.config.listener, "host", "Bind host", "Loopback is the default.");
       numberField(grid, state.config.listener, "listener", "port", "Listening port", "A TCP port from 1 to 65535.", true);
-      const wrap = field("Allowed hostnames", "One hostname per line. Wildcards are not accepted."); wrap.classList.add("span-all"); const input = node("textarea"); input.rows = 3; input.value = (state.config.listener.allowed_hosts || []).join("\n"); input.addEventListener("change", () => { state.config.listener.allowed_hosts = input.value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean); markDirty(); }); wrap.append(input); grid.append(wrap);
+      const wrap = field("Allowed hostnames", "One hostname per line. Wildcards are not accepted."); wrap.classList.add("span-all"); const input = node("textarea"); input.rows = 3; input.value = (state.config.listener.allowed_hosts || []).join("\n"); onValueEdit(input, () => { state.config.listener.allowed_hosts = input.value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean); markDirty(); }); wrap.append(input); grid.append(wrap);
     });
     group(container, "Inference API authentication", "This key protects consumer access to /v1. It is distinct from backend API keys and the browser’s local administration session.", (grid) => {
       secretSetting(grid, state.config.access, "api_key", "Relay API key", "/access/api_key");
