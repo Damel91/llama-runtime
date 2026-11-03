@@ -152,29 +152,44 @@ class RelayGeneration:
 
     def _close_if_drained(self) -> None:
         with self._lock:
-            if not self._retired or self._leases or self._closing:
+            if (
+                not self._retired
+                or self._leases
+                or self._closing
+                or self._drained.is_set()
+            ):
                 return
             self._closing = True
-            resources = tuple(
-                {id(value): value for value in self._resources.values()}.values()
-            )
-            self._resources.clear()
-            on_drained, self._on_drained = self._on_drained, None
+            resources = {id(value): value for value in self._resources.values()}
+        pending = set(resources)
         errors = []
+        on_drained = None
         try:
-            for resource in resources:
-                close = getattr(resource, "close", None)
-                if callable(close):
-                    try:
+            for identity, resource in resources.items():
+                try:
+                    close = getattr(resource, "close", None)
+                    if callable(close):
                         close()
-                    except Exception as error:
-                        # Do not retain an exception/traceback, provider strings
-                        # or a failed resource in long-lived manager state.
-                        errors.append(type(error).__name__)
+                except BaseException as error:
+                    # Retain ownership, but no exception, traceback or provider
+                    # strings. A later explicit retirement may retry this close.
+                    errors.append(type(error).__name__)
+                    if not isinstance(error, Exception):
+                        raise
+                else:
+                    pending.remove(identity)
         finally:
             with self._lock:
+                self._resources = {
+                    key: value
+                    for key, value in self._resources.items()
+                    if id(value) in pending
+                }
                 self._close_errors = tuple(errors)
-            self._drained.set()
+                self._closing = False
+                if not pending:
+                    on_drained, self._on_drained = self._on_drained, None
+                    self._drained.set()
             if on_drained is not None:
                 on_drained(self)
 

@@ -151,28 +151,169 @@ def test_shutdown_waits_for_actual_resource_close_and_callback_is_outside_lock()
     assert manager.wait_drained(0)
 
 
-def test_failing_close_does_not_keep_traceback_or_skip_other_resources():
-    generation = RelayGeneration(RelayConfigStore().snapshot())
+def test_failed_close_retains_live_worker_until_explicit_retry_without_traceback():
+    manager = RelayGenerationManager(RelayConfigStore().snapshot())
+    attempts, traceback_references = [], []
+
+    class WorkerResource:
+        def __init__(self):
+            self.stop = Event()
+            self.thread = Thread(target=self.stop.wait, daemon=True)
+            self.thread.start()
+
+        def close(self):
+            attempts.append(1)
+            if len(attempts) == 1:
+                traceback_sentinel = Resource()
+                traceback_references.append(weakref.ref(traceback_sentinel))
+                raise RuntimeError("a-private-fixture-value")
+            self.stop.set()
+            self.thread.join(2)
+            assert not self.thread.is_alive()
+
+    lease = manager.acquire()
+    failing = lease.resource("failing", WorkerResource)
+    reference = weakref.ref(failing)
+    stop, worker = failing.stop, failing.thread
+    resource = lease.resource("second", Resource)
+    lease.resource("alias", lambda: resource)
+    lease.release()
+    del failing
+    try:
+        manager.close()
+        gc.collect()
+        assert worker.is_alive()
+        assert reference() is not None
+        assert traceback_references[0]() is None
+        assert not manager.wait_drained(0)
+        assert resource.closed == 1
+        diagnostics = manager.diagnostics()
+        assert len(diagnostics["generations"]) == 1
+        generation = diagnostics["generations"][0]
+        assert generation["close_error_types"] == ["RuntimeError"]
+        assert generation["resources"] == 1
+        assert generation["retired"] and not generation["drained"]
+        assert "private-fixture" not in json.dumps(diagnostics)
+
+        manager.close()
+        manager.close()
+        gc.collect()
+        assert not worker.is_alive()
+        assert reference() is None
+        assert resource.closed == 1
+        assert len(attempts) == 2
+        assert manager.wait_drained(0)
+        assert manager.diagnostics()["generations"] == []
+    finally:
+        stop.set()
+        worker.join(2)
+
+
+def test_concurrent_closes_coalesce_without_automatic_retry_after_failure():
+    manager = RelayGenerationManager(RelayConfigStore().snapshot())
+    started, finish = Event(), Event()
+    attempts = []
+
+    class BlockingResource:
+        def close(self):
+            attempts.append(1)
+            if len(attempts) == 1:
+                started.set()
+                assert finish.wait(2)
+                raise RuntimeError("a-private-fixture-value")
+
+    with manager.acquire() as lease:
+        lease.resource("blocking", BlockingResource)
+    thread = Thread(target=manager.close)
+    thread.start()
+    try:
+        assert started.wait(2)
+        with ThreadPoolExecutor(8) as pool:
+            list(pool.map(lambda _index: manager.close(), range(16)))
+        assert len(attempts) == 1
+        assert not manager.wait_drained(0)
+        finish.set()
+        thread.join(2)
+        assert not thread.is_alive()
+        assert len(attempts) == 1
+        assert not manager.wait_drained(0)
+
+        manager.close()
+        manager.close()
+        assert len(attempts) == 2
+        assert manager.wait_drained(0)
+    finally:
+        finish.set()
+        thread.join(2)
+
+
+def test_failed_retired_generation_remains_owned_until_manager_close_retries():
+    store = RelayConfigStore()
+    manager = RelayGenerationManager(store.snapshot())
+    attempts = []
 
     class FailingResource:
         def close(self):
-            raise RuntimeError("a-private-fixture-value")
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise RuntimeError("fixture")
 
-    lease = generation.acquire()
-    failing = lease.resource("failing", FailingResource)
-    reference = weakref.ref(failing)
-    resource = lease.resource("second", Resource)
-    lease.resource("alias", lambda: resource)
-    generation.retire()
-    lease.release()
-    del failing
+    with manager.acquire() as lease:
+        resource = lease.resource("failing", FailingResource)
+        reference = weakref.ref(resource)
+    del resource
+    manager.replace(store.replace(0, {}))
+    gc.collect()
+    assert reference() is not None
+    diagnostics = manager.diagnostics()
+    assert diagnostics["current_revision"] == 1
+    assert len(diagnostics["generations"]) == 2
+    failed = next(item for item in diagnostics["generations"] if item["revision"] == 0)
+    assert failed["resources"] == 1 and not failed["drained"]
+    assert failed["close_error_types"] == ["RuntimeError"]
+    with manager.acquire() as current:
+        assert current.snapshot.revision == 1
+    manager.close()
     gc.collect()
     assert reference() is None
-    assert resource.closed == 1
+    assert len(attempts) == 2
+    assert manager.wait_drained(0)
+
+
+def test_interrupted_close_preserves_failed_and_unattempted_resources_for_retry():
+    callbacks, attempts = [], []
+    generation = RelayGeneration(
+        RelayConfigStore().snapshot(), on_drained=lambda _item: callbacks.append(1)
+    )
+
+    class InterruptedResource:
+        def close(self):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise KeyboardInterrupt("a-private-fixture-value")
+
+    with generation.acquire() as lease:
+        successful = lease.resource("first", Resource)
+        lease.resource("interrupted", InterruptedResource)
+        unattempted = lease.resource("last", Resource)
+    with pytest.raises(KeyboardInterrupt):
+        generation.retire()
     diagnostics = generation.diagnostics()
-    assert diagnostics["close_error_types"] == ["RuntimeError"]
+    assert diagnostics["resources"] == 2 and not diagnostics["drained"]
+    assert diagnostics["close_error_types"] == ["KeyboardInterrupt"]
     assert "private-fixture" not in json.dumps(diagnostics)
-    assert diagnostics["resources"] == 0 and diagnostics["drained"]
+    assert successful.closed == 1 and unattempted.closed == 0
+    assert not generation.wait_drained(0)
+    assert callbacks == []
+
+    generation.retire()
+    generation.retire()
+    assert len(attempts) == 2
+    assert successful.closed == 1 and unattempted.closed == 1
+    assert callbacks == [1]
+    assert generation.wait_drained(0)
+    assert generation.diagnostics()["resources"] == 0
+    assert generation.diagnostics()["close_error_types"] == []
 
 
 def test_many_reconfigurations_do_not_retain_old_generations():
