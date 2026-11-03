@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="description" content="Configure the local llama-runtime relay and inspect its observed models and requests.">
+  <title>llama-runtime · Local relay</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script defer src="/static/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#workspace">Skip to workspace</a>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Relay navigation">
+      <a class="brand" href="#models" aria-label="llama-runtime models">
+        <svg viewBox="0 0 40 40" width="34" height="34" aria-hidden="true"><rect x="2" y="2" width="36" height="36" rx="10" fill="currentColor"/><path d="M11 12v16h7m4-16v16h7M14 20h12" fill="none" stroke="white" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>llama-runtime<small>Local relay</small></span>
+      </a>
+      <nav class="nav-list" aria-label="Workspace">
+        <a href="#models" data-view="models" class="nav-link" aria-current="page"><span class="nav-symbol" aria-hidden="true">◈</span>Models</a>
+        <a href="#connections" data-view="connections" class="nav-link"><span class="nav-symbol" aria-hidden="true">⇄</span>Connections</a>
+        <a href="#requests" data-view="requests" class="nav-link"><span class="nav-symbol" aria-hidden="true">≋</span>Requests<span id="active-nav-count" class="nav-count" hidden></span></a>
+        <a href="#settings" data-view="settings" class="nav-link"><span class="nav-symbol" aria-hidden="true">⚙</span>Settings</a>
+      </nav>
+      <div class="sidebar-bottom">
+        <span id="service-state" class="status-tag">Connecting</span>
+        <p>One local API.<br>Native inference, remotely.</p>
+        <button class="text-button" type="button" id="copy-api">Copy API URL</button>
+        <code id="api-url">—</code>
+      </div>
+    </aside>
+    <main id="workspace" tabindex="-1">
+      <header class="workspace-header">
+        <div><h1 id="view-title">Models</h1><p id="view-description">The models your configured runtimes actually report.</p></div>
+        <div class="header-actions"><span id="dirty-label" class="dirty-label" hidden>Unsaved changes</span><button type="button" class="button secondary" id="reload-config">Reload settings</button><button type="button" class="button primary" id="save-config" disabled>Save changes</button></div>
+      </header>
+      <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+      <div id="conflict-notice" class="notice error" role="alert" hidden><strong>Settings changed in another session.</strong><span>Your draft is still here. Reload to use the saved settings, or keep reviewing your draft.</span><button type="button" class="button secondary" id="resolve-conflict">Discard draft and reload</button></div>
+      <div id="restart-notice" class="notice" hidden>Listener settings were saved. Restart the relay explicitly to use the new address; current requests keep their original settings.</div>
+
+      <section id="view-models" class="view" aria-labelledby="models-heading">
+        <div class="section-heading"><div><h2 id="models-heading">Observed catalog</h2><p id="catalog-observed">No discovery has run yet.</p></div><div class="inline-actions"><button type="button" class="button secondary" id="open-export">Export OpenCode settings</button><button type="button" class="button primary" id="refresh-catalog">Refresh catalog</button></div></div>
+        <div id="runtime-rail" class="runtime-rail" aria-label="Observed connections"></div>
+        <div class="catalog-toolbar"><label class="search-field"><span class="sr-only">Search models, aliases or connections</span><input type="search" id="model-search" placeholder="Search models, aliases or connections" autocomplete="off"></label><label>Capability<select id="model-kind"><option value="all">All models</option><option value="chat">Chat</option><option value="embeddings">Embeddings</option><option value="unknown">Unknown</option></select></label><label>Availability<select id="model-availability"><option value="all">All states</option><option value="loaded">Loaded</option><option value="not-loaded">Not loaded</option><option value="unavailable">Unavailable</option></select></label></div>
+        <div class="catalog-layout">
+          <div class="catalog-main"><div class="table-wrap"><table class="model-table"><caption class="sr-only">Observed models. Select a model name to inspect it; check chat models for OpenCode export.</caption><thead><tr><th class="checkbox-column"><input type="checkbox" id="select-visible-models" aria-label="Select visible chat models for export"></th><th scope="col">Model</th><th scope="col">Runtime</th><th scope="col">Availability</th><th scope="col">Capability</th><th scope="col">Context</th></tr></thead><tbody id="model-rows"></tbody></table></div><div id="models-empty" class="empty-state"><span class="empty-mark" aria-hidden="true">◈</span><h3>No observed models yet</h3><p>Add a connection, then refresh the catalog. Discovery reads runtime metadata; it does not load models.</p><button type="button" class="button primary" data-navigate="connections">Configure a connection</button></div><p class="table-footer" id="model-count">No catalog observation.</p></div>
+          <aside id="model-detail" class="model-detail" aria-label="Selected model" hidden></aside>
+        </div>
+      </section>
+
+      <section id="view-connections" class="view" aria-labelledby="connections-heading" hidden>
+        <div class="section-heading"><div><h2 id="connections-heading">Runtime connections</h2><p>Use the server origin, including its listening port. Runtime selection follows the requested model.</p></div><button type="button" class="button primary" id="add-endpoint">Add connection</button></div>
+        <div id="endpoint-list" class="connection-list"></div>
+        <div id="connections-empty" class="empty-state"><span class="empty-mark" aria-hidden="true">⇄</span><h3>Connect an inference runtime</h3><p>Add a llama.cpp or Strata endpoint. Models and processes stay under your server operator’s control.</p><button type="button" class="button primary" data-action="add-endpoint">Add connection</button></div>
+        <p class="section-note">Saved connection changes apply to new requests. Refresh the catalog explicitly to observe the new configuration.</p>
+      </section>
+
+      <section id="view-requests" class="view" aria-labelledby="requests-heading" hidden>
+        <div class="section-heading"><div><h2 id="requests-heading">Active requests</h2><p>Metadata for work currently owned by this relay. Prompts and tool arguments are not shown.</p></div><button type="button" class="button secondary" id="refresh-requests">Refresh requests</button></div>
+        <div id="active-requests" class="request-list"></div><div id="requests-empty" class="empty-state compact"><h3>No active requests</h3><p>Requests appear here when a consumer uses the relay API.</p></div>
+        <div class="section-heading secondary-heading"><div><h2>Last completed request</h2><p>This is one completion summary, not a request history.</p></div><button type="button" class="button secondary" id="clear-last" disabled>Clear summary</button></div><div id="last-request"></div><p id="last-empty" class="section-note">No completion summary is retained.</p>
+      </section>
+
+      <section id="view-settings" class="view" aria-labelledby="settings-heading" hidden>
+        <div class="section-heading"><div><h2 id="settings-heading">Relay settings</h2><p>Defaults apply when a consumer does not supply an override. Empty optional fields inherit the SDK default.</p></div><span id="config-revision" class="revision-label">Revision —</span></div>
+        <div class="settings-tabs" role="tablist" aria-label="Settings categories"><button type="button" role="tab" id="tab-generation" aria-selected="true" aria-controls="settings-generation" data-settings-tab="generation">Generation</button><button type="button" role="tab" id="tab-embedding" aria-selected="false" aria-controls="settings-embedding" data-settings-tab="embedding">Embeddings</button><button type="button" role="tab" id="tab-overrides" aria-selected="false" aria-controls="settings-overrides" data-settings-tab="overrides">Per-model settings</button><button type="button" role="tab" id="tab-tailnet" aria-selected="false" aria-controls="settings-tailnet" data-settings-tab="tailnet">Private network</button><button type="button" role="tab" id="tab-access" aria-selected="false" aria-controls="settings-access" data-settings-tab="access">Local access</button></div>
+        <div id="settings-generation" class="settings-panel" role="tabpanel" aria-labelledby="tab-generation"><div id="llm-default-fields"></div></div>
+        <div id="settings-embedding" class="settings-panel" role="tabpanel" aria-labelledby="tab-embedding" hidden><div id="embedding-default-fields"></div></div>
+        <div id="settings-overrides" class="settings-panel" role="tabpanel" aria-labelledby="tab-overrides" hidden><div class="override-picker"><label>Model selector<input type="text" id="override-model" list="known-models" placeholder="Choose or enter an exact model ID" autocomplete="off"><datalist id="known-models"></datalist></label><button type="button" class="button secondary" id="edit-override">Edit model settings</button></div><div id="override-fields"><p class="section-note">Choose an observed model or enter the selector you want to configure. This does not load a model.</p></div></div>
+        <div id="settings-tailnet" class="settings-panel" role="tabpanel" aria-labelledby="tab-tailnet" hidden><div class="section-heading"><div><h3>Tailscale / Headscale helper</h3><p>Use the optional userspace helper. A stopped helper makes its selected connections unavailable.</p></div><span id="tailnet-state" class="status-tag">Unknown</span></div><label class="check-field"><input type="checkbox" id="tailnet-enabled">Configure the embedded private-network client</label><div id="tailnet-fields"></div><div class="inline-actions settings-actions"><button type="button" class="button primary" id="start-tailnet">Start saved helper</button><button type="button" class="button secondary" id="stop-tailnet">Stop helper</button></div><p class="section-note">Starting uses the saved configuration. Enrollment is explicit; no system VPN, routes or DNS are changed by this console.</p></div>
+        <div id="settings-access" class="settings-panel" role="tabpanel" aria-labelledby="tab-access" hidden><div id="access-fields"></div></div>
+      </section>
+      <footer class="workspace-footer"><span id="footer-state">Connecting to the local relay.</span><span>Inference API <code>/v1</code></span></footer>
+    </main>
+  </div>
+
+  <dialog id="endpoint-dialog" class="dialog endpoint-dialog" aria-labelledby="endpoint-dialog-title"><form id="endpoint-form"><div class="dialog-heading"><div><h2 id="endpoint-dialog-title">Add connection</h2><p>Connect to a server you already manage.</p></div><button type="button" class="icon-button" data-close-dialog="endpoint-dialog" aria-label="Close connection editor">×</button></div><div id="endpoint-error" class="notice error" role="alert" hidden></div><div class="form-grid"><label>Connection name<input id="endpoint-name" name="name" type="text" required autocomplete="off" placeholder="inference-workstation"></label><label>Server origin<input id="endpoint-url" name="base_url" type="url" required placeholder="http://localhost:8080" spellcheck="false"></label><label>Runtime<select id="endpoint-backend"><option value="auto">Detect automatically</option><option value="llamacpp">llama.cpp</option><option value="strata">Strata</option></select></label><label>Transport<select id="endpoint-transport"><option value="direct">Direct / existing network</option><option value="tailnet">Embedded Tailscale / Headscale</option></select></label><label class="check-field"><input id="endpoint-tls" type="checkbox" checked>Verify the server’s TLS certificate</label><label>HTTP connections<select id="endpoint-http"><option value="close">Independent connections</option><option value="reuse">Keep-alive, explicitly enabled</option></select></label><label>Authentication<select id="endpoint-auth"><option value="none">No authentication</option><option value="env">Environment variable</option><option value="key">API key</option></select></label><label id="endpoint-env-field" hidden>API key environment variable<input id="endpoint-key-env" type="text" autocomplete="off" placeholder="INFERENCE_API_KEY"></label><label id="endpoint-key-field" hidden>API key<input id="endpoint-key" type="password" autocomplete="new-password"><small id="endpoint-key-help">Enter a key. It will not be read back by the browser.</small></label><label>Proxy setting<select id="endpoint-proxy-action"><option value="keep">Keep current setting</option><option value="replace">Set a proxy URL</option><option value="clear">No proxy</option></select></label><label id="endpoint-proxy-field" hidden>Proxy URL<input id="endpoint-proxy" type="password" autocomplete="new-password" placeholder="http://proxy.example:port"><small>Proxy credentials are treated as a secret and will not be read back.</small></label></div><p class="section-note">Changing a saved connection name changes its secret identity. Re-enter or explicitly remove any saved key or proxy when renaming.</p><div class="dialog-actions"><button type="button" class="button secondary" data-close-dialog="endpoint-dialog">Cancel</button><button type="submit" class="button primary">Apply to draft</button></div></form></dialog>
+
+  <dialog id="export-dialog" class="dialog export-dialog" aria-labelledby="export-heading"><div class="dialog-heading"><div><h2 id="export-heading">Connect OpenCode</h2><p>Export settings for the chosen client version. Existing consumer files are never edited.</p></div><button type="button" class="icon-button" data-close-dialog="export-dialog" aria-label="Close export">×</button></div><div class="inline-actions"><label>OpenCode version<select id="export-version"><option value="v2">V2 configuration</option><option value="v1">V1 configuration</option></select></label><button type="button" class="button primary" id="generate-export">Generate settings</button></div><p id="export-selection" class="section-note">Uses the checked chat models, or the exportable observed catalog when none are checked.</p><div id="export-warnings" class="notice" hidden></div><label class="export-output-label">Configuration<textarea id="export-output" rows="15" readonly spellcheck="false" placeholder="Generate settings to preview the configuration."></textarea></label><div class="dialog-actions"><button type="button" class="button secondary" id="copy-export" disabled>Copy configuration</button><button type="button" class="button primary" id="download-export" disabled>Download configuration</button></div></dialog>
+  <noscript><p class="noscript">This local configuration console needs JavaScript. The inference API does not depend on an open browser.</p></noscript>
+</body>
+</html>
