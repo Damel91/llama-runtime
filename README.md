@@ -6,10 +6,9 @@ embedding adapters for local servers, remote hosts and private networks. The Pyt
 `runtime_llama`. Python 3.11 or later is required. Runtime dependencies are
 `requests`, `urllib3` and `jsonschema`.
 
-The current stable release is **0.17.0**. See the
-[release assets](https://github.com/Damel91/llama-runtime/releases/tag/v0.17.0)
-and [verification record](docs/verification/PUBLIC-RELEASE-0.17.0.md), including
-the accepted numerical limitation of the measured server/model profile.
+**0.18.0** adds an optional local HTTP relay and browser console. See the
+[release assets](https://github.com/Damel91/llama-runtime/releases/tag/v0.18.0)
+and [verification record](docs/verification/PUBLIC-RELEASE-0.18.0.md).
 
 ## Why this library exists
 
@@ -58,6 +57,7 @@ The project's engineering lifecycle is managed with
 | Optional server-observation SDK | Typed snapshot and conditional-admission contracts for a separately negotiated provider; native fresh checks remain the default. No real-server extension is installed or implied. |
 | Optional embedded VPN client | A separately built Go tsnet helper for Tailscale or Headscale, with consumer-owned configuration, authenticated loopback proxy, verified peer routing, TLS and bounded teardown; no system VPN installation. |
 | MCP data contracts | Validated integration, call, event and result types for consumer-managed MCP execution. |
+| Optional local relay | An OpenAI-compatible HTTP interface for catalog, chat, tool calls and embeddings, with a web console for configuration, diagnostics and OpenCode export. |
 
 The consumer executes tools and MCP calls and supplies subsequent conversation
 messages. Reasoning and structured-output behavior depend on the selected
@@ -65,6 +65,18 @@ server build, model and chat template. Strata structured responses are validated
 locally before successful completion; llama.cpp retains native schema forwarding. Splitting source documents and tracking their
 fragments belong to the consuming application. The server's own auto-loading
 policy is supported.
+
+## Release 0.18.0: local inference relay
+
+Install the optional `runtime-llama[relay]` extra and run
+`llama-runtime-relay --config ./relay.json`. The default web console listens at
+`http://127.0.0.1:8088`, with inference under `/v1`. Add your server connections,
+save the configuration and refresh the catalog to see available models.
+
+The relay uses the same SDK routing, tool proposal validation and embedding
+scheduler as Python callers. Existing `runtime_llama` imports continue to work
+with the base distribution. See the [relay guide](docs/RELAY.md) and
+[0.18.0 verification record](docs/verification/PUBLIC-RELEASE-0.18.0.md).
 
 ## Release 0.17.0: automatic tool-call recovery
 
@@ -404,10 +416,10 @@ results and deployment boundaries.
 With Python 3.11 or later, install the tagged source:
 
 ```bash
-python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.16.0'
+python -m pip install 'git+https://github.com/Damel91/llama-runtime.git@v0.18.0'
 ```
 
-Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.16.0),
+Alternatively, install a wheel from the [GitHub release](https://github.com/Damel91/llama-runtime/releases/tag/v0.18.0),
 or run the following from a checkout:
 
 ```bash
@@ -608,7 +620,7 @@ Run the deterministic tests, HTTP loopback fixtures, lint checks and package
 build from the checkout:
 
 ```bash
-python -m pip install '.[dev]'
+python -m pip install '.[dev,relay]'
 python -m pytest -q
 ruff check src tests probes _build_backend.py
 ruff format --check src tests probes _build_backend.py
@@ -656,6 +668,7 @@ requires its separately distributed native helper.
 - [Functional parity and limits](docs/FUNCTIONAL-PARITY.md)
 - [Read-only model discovery](docs/MODEL-DISCOVERY.md)
 - [Automatic runtime routing and Strata](docs/AUTOMATIC-RUNTIMES.md)
+- [Local relay and OpenCode](docs/RELAY.md)
 - [Embedding preparation and batching](docs/EMBEDDING-CONTRACTS.md)
 - [Progressive preparation and native token inputs](docs/PROGRESSIVE-EMBEDDING.md)
 - [Asynchronous embedding windows](docs/ASYNC-EMBEDDING-WINDOWS.md)
