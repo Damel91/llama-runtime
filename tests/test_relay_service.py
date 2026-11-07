@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from dataclasses import replace
 import json
 from threading import Event
 
@@ -14,6 +15,7 @@ from runtime_llama.model_discovery import (
     ModelCatalog,
     ModelIdentity,
     ModelObservation,
+    ObservedInt,
 )
 from runtime_llama.runtime_discovery import RuntimeCatalog, RuntimeObservation
 from runtime_llama.relay.config import RelayConfigStore, RelayConfigConflict
@@ -437,6 +439,97 @@ def test_opencode_export_is_versioned_and_never_exports_the_relay_key():
         service.export_opencode("v2", [], "http://localhost:8088/v1")
     )
     service.close()
+
+
+def test_configured_opencode_separates_training_context_and_rejects_stale_choices():
+    context = 8192
+
+    def discover(endpoints, **_kwargs):
+        models = (
+            replace(
+                observe("coder/a"),
+                loaded_context=ObservedInt(context, "catalog.meta.n_ctx"),
+            ),
+            replace(
+                observe("coder-b"),
+                training_context=ObservedInt(131072, "catalog.meta.n_ctx_train"),
+            ),
+            observe("embedding", chat=False, embedding=True),
+        )
+        return RuntimeCatalog(
+            (
+                RuntimeObservation(
+                    endpoints[0],
+                    "llamacpp",
+                    ModelCatalog(models, (), 3, 0.0),
+                    (),
+                    3,
+                    0.0,
+                    True,
+                ),
+            ),
+            0.0,
+        )
+
+    service = RelayService(
+        RelayConfigStore(initial_config=config()), discovery=discover
+    )
+    base_url = "http://localhost:8088/v1"
+    try:
+        catalog = service.refresh_catalog()
+        assert catalog["runtimes"][0]["models"][1]["loaded_context"] is None
+        payload = {
+            "version": "v2",
+            "catalog_revision": catalog["revision"],
+            "default_model": "coder-b",
+            "models": {
+                "coder/a": {"observed_context": 8192, "context": 8192, "output": 1024},
+                "coder-b": {"observed_context": None, "context": 4096, "output": 512},
+            },
+        }
+        exported = service.export_configured_opencode(payload, base_url)["config"]
+        assert exported["model"] == "llama-relay/coder-b"
+        assert exported["providers"]["llama-relay"]["models"] == {
+            "coder/a": {"name": "coder/a", "limit": {"context": 8192, "output": 1024}},
+            "coder-b": {"name": "coder-b", "limit": {"context": 4096, "output": 512}},
+        }
+
+        for field, value, code in [
+            ("output", 8192, "relay_opencode_output_invalid"),
+            ("output", True, "relay_opencode_output_invalid"),
+            ("context", 131072, "relay_opencode_context_invalid"),
+        ]:
+            invalid = deepcopy(payload)
+            invalid["models"]["coder/a"][field] = value
+            with pytest.raises(RelayError) as error:
+                service.export_configured_opencode(invalid, base_url)
+            assert (error.value.status, error.value.code) == (400, code)
+        with pytest.raises(RelayError, match="relay_opencode_default_model_invalid"):
+            service.export_configured_opencode(
+                {**payload, "default_model": "embedding"}, base_url
+            )
+        with pytest.raises(RelayError, match="relay_opencode_model_not_available"):
+            service.export_configured_opencode(
+                {
+                    **payload,
+                    "models": {
+                        **payload["models"],
+                        "embedding": payload["models"]["coder-b"],
+                    },
+                },
+                base_url,
+            )
+
+        context = 4096
+        with pytest.raises(RelayError, match="relay_opencode_context_changed") as error:
+            service.export_configured_opencode(payload, base_url)
+        assert error.value.status == 409
+        service.replace_config(0, config())
+        with pytest.raises(RelayError, match="relay_opencode_catalog_changed") as error:
+            service.export_configured_opencode(payload, base_url)
+        assert error.value.status == 409
+    finally:
+        service.close()
 
 
 def test_stream_terminal_follows_adapter_close_and_failed_close_has_no_success():

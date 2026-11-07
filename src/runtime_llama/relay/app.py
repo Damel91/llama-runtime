@@ -381,6 +381,16 @@ def create_app(config_path=None, initial_config=None, service=None):
             return admin_json(await blocking(request, lambda _cancel: method()))
         if path == "/api/admin/opencode":
             authority_url = str(request.base_url).rstrip("/") + "/v1"
+            if request.method == "POST":
+                payload = await body(request)
+                return admin_json(
+                    await blocking(
+                        request,
+                        lambda cancel: service.export_configured_opencode(
+                            payload, authority_url, cancel
+                        ),
+                    )
+                )
             return admin_json(
                 service.export_opencode(
                     request.query_params.get("version", "v2"),

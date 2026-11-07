@@ -13,7 +13,7 @@ from runtime_llama import (
     build_adapter,
     build_embedding_adapter,
 )
-from runtime_llama.errors import LLMCancelledError
+from runtime_llama.errors import LLMBackendError, LLMCancelledError
 from runtime_llama.runtime_discovery import RuntimeEndpoint, discover_runtimes
 from runtime_llama.tailnet import TailnetConfig, TailnetHelper
 from runtime_llama.relay.config import RelayConfigStore
@@ -326,6 +326,16 @@ class RelayService:
                             "chat": model.capabilities.chat,
                             "embeddings": model.capabilities.embeddings,
                         },
+                        "opencode_chat": (
+                            runtime.available
+                            and model.state == "loaded"
+                            and model.failed is not True
+                            and model.capabilities.chat is not False
+                            and (
+                                runtime.backend != "strata"
+                                or model.id == runtime.llm_model_id
+                            )
+                        ),
                         "context": context,
                         "loaded_context": context,
                         "training_context": model.training_context.value
@@ -803,6 +813,90 @@ class RelayService:
             raise RelayError(400, "relay_opencode_model_not_available")
         entries = {model: {"name": model} for model in selected}
         access = self.config_store.snapshot().config["access"]
+        return self._opencode_config(version, entries, base_url, access)
+
+    def export_configured_opencode(self, payload, base_url, cancel_event=None):
+        if not isinstance(payload, dict) or payload.keys() != {
+            "version",
+            "catalog_revision",
+            "default_model",
+            "models",
+        }:
+            raise RelayError(400, "relay_opencode_export_shape_invalid")
+        version, revision = payload["version"], payload["catalog_revision"]
+        if version not in ("v1", "v2"):
+            raise RelayError(400, "relay_opencode_version_unsupported")
+        if type(revision) is not int or revision < 0:
+            raise RelayError(400, "relay_opencode_catalog_revision_invalid")
+        models, default = payload["models"], payload["default_model"]
+        if not isinstance(models, dict) or not models:
+            raise RelayError(400, "relay_opencode_model_selection_invalid")
+        if not isinstance(default, str) or default not in models:
+            raise RelayError(400, "relay_opencode_default_model_invalid")
+        for limits in models.values():
+            self._validate_opencode_limits(limits)
+
+        entries = {}
+        with self._operation("catalog", "", cancel_event) as operation:
+            if operation.snapshot.revision != revision:
+                raise RelayError(409, "relay_opencode_catalog_changed")
+            catalog, _lease, _epoch, _rendered = self._discover_for(operation)
+            for model, limits in models.items():
+                operation.check()
+                try:
+                    selected = catalog.select(model, purpose="llm").model
+                except LLMBackendError:
+                    raise RelayError(
+                        409, "relay_opencode_model_not_available"
+                    ) from None
+                if selected.id != model:
+                    raise RelayError(409, "relay_opencode_model_not_available")
+                observed = selected.loaded_context
+                effective = observed.value if observed is not None else None
+                if effective != limits["observed_context"]:
+                    raise RelayError(409, "relay_opencode_context_changed")
+                entries[model] = {
+                    "name": model,
+                    "limit": {"context": limits["context"], "output": limits["output"]},
+                }
+            with self._lock:
+                if self.config_store.snapshot().revision != revision:
+                    raise RelayError(409, "relay_opencode_catalog_changed")
+                return self._opencode_config(
+                    version,
+                    entries,
+                    base_url,
+                    operation.snapshot.config["access"],
+                    default,
+                )
+
+    @staticmethod
+    def _validate_opencode_limits(limits):
+        if not isinstance(limits, dict) or limits.keys() != {
+            "observed_context",
+            "context",
+            "output",
+        }:
+            raise RelayError(400, "relay_opencode_model_limits_invalid")
+        observed, context, output = (
+            limits["observed_context"],
+            limits["context"],
+            limits["output"],
+        )
+        if (
+            type(context) is not int
+            or context <= 0
+            or (
+                observed is not None
+                and (type(observed) is not int or observed != context)
+            )
+        ):
+            raise RelayError(400, "relay_opencode_context_invalid")
+        if type(output) is not int or not 0 < output < context:
+            raise RelayError(400, "relay_opencode_output_invalid")
+
+    @staticmethod
+    def _opencode_config(version, entries, base_url, access, default=None):
         authenticated = bool(access.get("api_key") or access.get("api_key_env"))
         environment_name = access.get("api_key_env") or "LLAMA_RELAY_API_KEY"
         api_key = "{env:" + environment_name + "}" if authenticated else "relay-local"
@@ -811,9 +905,14 @@ class RelayService:
             warnings.append(
                 f"Set {environment_name} in OpenCode's environment; the relay key is never exported."
             )
-        warnings.append(
-            "Model limits/capabilities not proved by the runtime are not invented; review the selected OpenCode version's defaults."
-        )
+        if default is None:
+            warnings.append(
+                "Model limits/capabilities not proved by the runtime are not invented; review the selected OpenCode version's defaults."
+            )
+        else:
+            warnings.append(
+                "Review OpenCode's defaults for capabilities the relay did not observe."
+            )
         if version == "v1":
             config = {
                 "$schema": "https://opencode.ai/config.json",
@@ -838,6 +937,8 @@ class RelayService:
                     }
                 },
             }
+        if default is not None:
+            config["model"] = f"llama-relay/{default}"
         return {
             "version": version,
             "config": config,

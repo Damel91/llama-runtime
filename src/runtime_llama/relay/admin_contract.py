@@ -21,6 +21,7 @@ ADMIN_ROUTES = (
     ("POST", "/api/admin/tailnet/start"),
     ("POST", "/api/admin/tailnet/stop"),
     ("GET", "/api/admin/opencode"),
+    ("POST", "/api/admin/opencode"),
 )
 
 _CONTRACT = {
@@ -63,6 +64,12 @@ _CONTRACT = {
     },
     "error_response": {"error": {"code": "string", "message": "safe string"}},
     "opencode_versions": ["v1", "v2"],
+    "opencode_export_request": {
+        "version": "v1 or v2",
+        "catalog_revision": "configuration revision of the observed catalog",
+        "default_model": "selected exact model ID",
+        "models": "map of model IDs to observed_context, context and output",
+    },
 }
 
 

@@ -202,6 +202,59 @@ def token(api):
     return {"X-Relay-Admin-Token": response.json()["admin_token"], "Origin": ORIGIN}
 
 
+@pytest.mark.parametrize(
+    "version,provider_key,options_key",
+    [
+        ("v1", "provider", "options"),
+        ("v2", "providers", "settings"),
+    ],
+)
+def test_configured_opencode_reads_remote_context_and_exports_through_relay(
+    native_servers, version, provider_key, options_key
+):
+    url, upstream = native_servers(key="upstream-secret")
+    config = config_for((url, {"api_key": "upstream-secret"}))
+    config["access"]["api_key"] = "local-secret"
+    with client(config) as (api, _app):
+        headers = token(api)
+        catalog = api.post("/api/admin/catalog/refresh", headers=headers).json()
+        model = catalog["runtimes"][0]["models"][0]
+        assert model["opencode_chat"] and model["loaded_context"] == 2048
+        payload = {
+            "version": version,
+            "catalog_revision": catalog["revision"],
+            "default_model": model["id"],
+            "models": {
+                model["id"]: {"observed_context": 2048, "context": 2048, "output": 512}
+            },
+        }
+        assert api.post("/api/admin/opencode", json=payload).status_code == 401
+        response = api.post("/api/admin/opencode", headers=headers, json=payload)
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-store"
+        assert (
+            "upstream-secret" not in response.text
+            and "local-secret" not in response.text
+        )
+        exported = response.json()["config"]
+        assert exported["model"] == "llama-relay/" + model["id"]
+        provider = exported[provider_key]["llama-relay"]
+        assert provider[options_key] == {
+            "baseURL": ORIGIN + "/v1",
+            "apiKey": "{env:LLAMA_RELAY_API_KEY}",
+        }
+        assert provider["models"][model["id"]]["limit"] == {
+            "context": 2048,
+            "output": 512,
+        }
+        assert [path for path, _key in upstream["gets"]] == [
+            "/health",
+            "/props",
+            "/v1/models",
+        ] * 2
+        assert not upstream["posts"]
+
+
 def test_static_assets_and_inert_admin_reads_are_served_without_native_probe():
     with client() as (api, app):
         page = api.get("/")
