@@ -4,6 +4,7 @@
 const RelayConsole = (() => {
   const PREFIX = "/api/admin";
   const TOKEN_HEADER = "X-Relay-Admin-Token";
+  const THEME_KEY = "llama-runtime.relay.theme";
   const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
   const clone = (value) => JSON.parse(JSON.stringify(value));
   const state = {
@@ -11,7 +12,7 @@ const RelayConsole = (() => {
     catalog: {revision: null, observed_at: null, runtimes: []}, status: null,
     requests: {active: [], last_completed: null}, view: "models", settingsTab: "generation",
     dirty: false, errors: new Map(), rawFields: new Map(), selectedRow: null,
-    selectedModels: new Set(), endpointIndex: null, exportValue: null, poll: null, tailnetDraft: null,
+    selectedModels: new Set(), endpointIndex: null, exportDraft: null, exportValue: null, poll: null, tailnetDraft: null,
   };
 
   function optionalValue(target, key, raw, kind = "number") {
@@ -89,6 +90,24 @@ const RelayConsole = (() => {
   }
 
   const $ = (id) => document.getElementById(id);
+  function setupTheme() {
+    const picker = $("relay-theme");
+    const apply = (value) => {
+      const theme = value === "dark" ? "dark" : "light";
+      document.documentElement.dataset.theme = theme;
+      picker.value = theme;
+      return theme;
+    };
+    let saved;
+    try { saved = window.localStorage.getItem(THEME_KEY); }
+    catch { /* Theme selection still works when storage is disabled. */ }
+    apply(saved);
+    picker.addEventListener("change", () => {
+      const theme = apply(picker.value);
+      try { window.localStorage.setItem(THEME_KEY, theme); }
+      catch { /* Keep the current choice for this page. */ }
+    });
+  }
   function node(tag, className, text) {
     const value = document.createElement(tag);
     if (className) value.className = className;
@@ -155,6 +174,7 @@ const RelayConsole = (() => {
   }
   function loadConfig(value) {
     state.revision = value.revision;
+    if (state.exportDraft && state.exportDraft.catalog.revision !== state.revision) invalidateExport();
     state.config = clone(value.config);
     state.secretFields = [...(value.secret_fields || [])];
     state.endpointSecrets = new Map(state.config.runtime_endpoints.map((endpoint, index) => [endpoint.name, {
@@ -273,11 +293,11 @@ const RelayConsole = (() => {
       const checkCell = node("td", "checkbox-column");
       const check = node("input"); check.type = "checkbox"; check.dataset.exportModel = row.model.id;
       check.setAttribute("aria-label", `Select ${row.model.id} for OpenCode export`);
-      check.checked = state.selectedModels.has(row.model.id);
-      check.disabled = row.model.capabilities?.chat === false || modelAvailability(row) !== "loaded";
+      check.disabled = row.model.opencode_chat !== true;
+      check.checked = !check.disabled && state.selectedModels.has(row.model.id);
       check.addEventListener("change", () => {
         check.checked ? state.selectedModels.add(row.model.id) : state.selectedModels.delete(row.model.id);
-        for (const input of document.querySelectorAll("[data-export-model]")) if (input.dataset.exportModel === row.model.id) input.checked = check.checked;
+        for (const input of document.querySelectorAll("[data-export-model]:not(:disabled)")) if (input.dataset.exportModel === row.model.id) input.checked = check.checked;
         updateModelSelection();
       });
       checkCell.append(check); tr.append(checkCell);
@@ -332,7 +352,6 @@ const RelayConsole = (() => {
     $("select-visible-models").checked = candidates.length > 0 && checked === candidates.length;
     $("select-visible-models").indeterminate = checked > 0 && checked < candidates.length;
     $("select-visible-models").disabled = candidates.length === 0;
-    $("export-selection").textContent = state.selectedModels.size ? `${state.selectedModels.size} selected model selector${state.selectedModels.size === 1 ? "" : "s"}. The export uses saved relay settings and observed capabilities.` : "No models checked: use the exportable observed chat catalog. Unknown client capabilities are reported in the export warnings.";
   }
   function detailPair(container, label, value, technical = false) {
     container.append(node("dt", "", label), node("dd", technical ? "technical-value" : "", value));
@@ -354,7 +373,8 @@ const RelayConsole = (() => {
   async function refreshCatalog(control = $("refresh-catalog")) {
     await busy(control, async () => {
       state.catalog = await api("/catalog/refresh", {method: "POST"});
-      const ids = new Set(rowsFromCatalog(state.catalog).map((row) => row.model.id));
+      if (state.exportDraft) invalidateExport();
+      const ids = new Set(rowsFromCatalog(state.catalog).filter((row) => row.model.opencode_chat === true).map((row) => row.model.id));
       state.selectedModels = new Set([...state.selectedModels].filter((id) => ids.has(id)));
       renderModels(); renderConnections();
       notice(`Catalog refreshed: ${rowsFromCatalog(state.catalog).length.toLocaleString()} observed model entries. No model was loaded.`);
@@ -645,19 +665,129 @@ const RelayConsole = (() => {
     if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(value);
     else { const input = node("textarea"); input.value = value; input.setAttribute("aria-label", "Text to copy"); document.body.append(input); input.select(); const copied = document.execCommand("copy"); input.remove(); if (!copied) throw new Error("Your browser could not copy this value. Select it and copy manually."); }
   }
+  function invalidateExport() {
+    if (state.exportDraft) state.exportDraft.edit += 1;
+    state.exportValue = null;
+    $("export-output").value = "";
+    $("copy-export").disabled = true;
+    $("download-export").disabled = true;
+    $("export-error").hidden = true;
+    $("export-warnings").replaceChildren();
+    $("export-warnings").hidden = true;
+  }
+  function exportTokenField(title, help, value = null) {
+    const label = node("label", "", title);
+    const input = node("input");
+    input.type = "number";
+    input.min = "1";
+    input.step = "1";
+    input.required = true;
+    if (value !== null) {
+      input.value = String(value);
+      input.readOnly = true;
+    }
+    label.append(input, node("small", "", help));
+    return {label, input};
+  }
   function openExport() {
-    updateModelSelection(); $("export-dialog").showModal(); $("export-version").focus();
+    const fields = new Map();
+    const catalog = state.catalog;
+    state.exportDraft = {catalog, fields, edit: 0, pending: false};
+    invalidateExport();
+    const settings = $("export-model-settings");
+    const defaultModel = $("export-default");
+    const prompt = node("option", "", "Choose a model");
+    prompt.value = "";
+    defaultModel.replaceChildren(prompt);
+    settings.replaceChildren();
+    for (const {model} of rowsFromCatalog(catalog)) {
+      const id = model.id;
+      if (model.opencode_chat !== true || fields.has(id) || (state.selectedModels.size && !state.selectedModels.has(id))) continue;
+      const option = node("option", "", id);
+      option.value = id;
+      defaultModel.append(option);
+      const observedContext = model.loaded_context ?? null;
+      const context = observedContext === null
+        ? exportTokenField("Context (tokens)", "The server did not report its loaded context. Enter the effective value for one conversation.")
+        : exportTokenField("Loaded context (tokens)", "Reported by the server for the loaded model.", observedContext);
+      const output = exportTokenField("Maximum output tokens", "Per generation. Choose a value below the context.");
+      const fieldset = node("fieldset", "export-model");
+      const grid = node("div", "form-grid");
+      grid.append(context.label, output.label);
+      fieldset.append(node("legend", "", id), grid);
+      settings.append(fieldset);
+      fields.set(id, {observedContext, context: context.input, output: output.input});
+    }
+    defaultModel.value = fields.size === 1 ? fields.keys().next().value : "";
+    defaultModel.disabled = fields.size === 0;
+    const generate = $("generate-export");
+    generate.disabled = fields.size === 0;
+    generate.removeAttribute("aria-busy");
+    $("export-selection").textContent = fields.size
+      ? `${fields.size} chat ${fields.size === 1 ? "model" : "models"} to export from ${state.selectedModels.size ? "your selection" : "the observed catalog"}.`
+      : "No exportable chat models. Close this dialog and refresh the catalog or change your selection.";
+    $("export-dialog").showModal();
+    $("export-version").focus();
+  }
+  function exportTokenCount(input, message) {
+    const value = input.valueAsNumber;
+    if (Number.isSafeInteger(value) && value > 0) return value;
+    input.focus();
+    throw new Error(message);
+  }
+  function exportPayload(draft) {
+    if (draft.catalog !== state.catalog || draft.catalog.revision !== state.revision) {
+      throw new Error("The catalog or saved settings changed. Close this dialog, refresh the catalog and reopen the export.");
+    }
+    const defaultModel = $("export-default").value;
+    if (!draft.fields.has(defaultModel)) {
+      $("export-default").focus();
+      throw new Error("Choose the default model for OpenCode.");
+    }
+    const models = Object.fromEntries([...draft.fields].map(([id, {observedContext, context, output}]) => {
+      const contextTokens = exportTokenCount(context, `Enter a positive whole number for the context of ${id}.`);
+      const outputTokens = exportTokenCount(output, `Enter a positive whole number for the maximum output of ${id}.`);
+      if (outputTokens >= contextTokens) {
+        output.focus();
+        throw new Error(`Maximum output for ${id} must be below its context of ${formatNumber(contextTokens)} tokens.`);
+      }
+      return [id, {observed_context: observedContext, context: contextTokens, output: outputTokens}];
+    }));
+    return {version: $("export-version").value, catalog_revision: draft.catalog.revision, default_model: defaultModel, models};
   }
   async function generateExport() {
-    const query = new URLSearchParams({version: $("export-version").value});
-    for (const id of state.selectedModels) query.append("models", id);
-    const value = await api(`/opencode?${query.toString()}`);
-    state.exportValue = {config: value.config, filename: value.filename || `opencode-relay-${$("export-version").value}.json`};
-    $("export-output").value = JSON.stringify(value.config, null, 2) + "\n";
-    $("copy-export").disabled = false; $("download-export").disabled = false;
-    $("export-warnings").replaceChildren();
-    for (const warning of value.warnings || []) $("export-warnings").append(node("div", "", warning));
-    $("export-warnings").hidden = !(value.warnings || []).length;
+    const draft = state.exportDraft;
+    if (!draft || draft.pending || !draft.fields.size) return;
+    invalidateExport();
+    const edit = draft.edit;
+    const current = () => state.exportDraft === draft && draft.edit === edit && $("export-dialog").open;
+    const generate = $("generate-export");
+    try {
+      const payload = exportPayload(draft);
+      draft.pending = true;
+      generate.disabled = true;
+      generate.setAttribute("aria-busy", "true");
+      const value = await api("/opencode", {method: "POST", body: payload});
+      if (!current()) return;
+      state.exportValue = {config: value.config, filename: value.filename || `opencode-relay-${payload.version}.json`};
+      $("export-output").value = JSON.stringify(value.config, null, 2) + "\n";
+      $("copy-export").disabled = false;
+      $("download-export").disabled = false;
+      for (const warning of value.warnings || []) $("export-warnings").append(node("div", "", warning));
+      $("export-warnings").hidden = !(value.warnings || []).length;
+    } catch (error) {
+      if (!current()) return;
+      $("export-error").textContent = error.status === 409
+        ? "A model or the saved settings changed. Close this dialog, refresh the catalog and reopen the export."
+        : error.message;
+      $("export-error").hidden = false;
+    } finally {
+      draft.pending = false;
+      if (state.exportDraft === draft) {
+        generate.disabled = false;
+        generate.removeAttribute("aria-busy");
+      }
+    }
   }
   function downloadExport() {
     if (!state.exportValue) return;
@@ -675,7 +805,7 @@ const RelayConsole = (() => {
     for (const id of ["reload-config", "resolve-conflict"]) $(id).addEventListener("click", () => busy($(id), () => reloadConfig(true)));
     $("copy-api").addEventListener("click", () => busy($("copy-api"), async () => { await copyText(`${window.location.origin}/v1`); notice("Local API URL copied."); }));
     for (const id of ["model-search", "model-kind", "model-availability"]) $(id).addEventListener(id === "model-search" ? "input" : "change", renderModels);
-    $("select-visible-models").addEventListener("change", () => { const selected = $("select-visible-models").checked; for (const row of visibleRows()) if (row.model.capabilities?.chat !== false && modelAvailability(row) === "loaded") selected ? state.selectedModels.add(row.model.id) : state.selectedModels.delete(row.model.id); renderModels(); });
+    $("select-visible-models").addEventListener("change", () => { const selected = $("select-visible-models").checked; for (const row of visibleRows()) if (row.model.opencode_chat === true) selected ? state.selectedModels.add(row.model.id) : state.selectedModels.delete(row.model.id); renderModels(); });
     $("refresh-catalog").addEventListener("click", () => refreshCatalog());
     $("add-endpoint").addEventListener("click", () => editEndpoint());
     for (const control of document.querySelectorAll('[data-action="add-endpoint"]')) control.addEventListener("click", () => editEndpoint());
@@ -697,11 +827,16 @@ const RelayConsole = (() => {
       markDirty(); renderTailnet(); renderStatus();
     });
     for (const [id, action] of [["start-tailnet", "start"], ["stop-tailnet", "stop"]]) $(id).addEventListener("click", () => busy($(id), async () => { await api(`/tailnet/${action}`, {method: "POST"}); await refreshLocalState(); notice(action === "start" ? "Helper start requested using saved settings. Refresh the catalog to observe its connections." : "Helper stop completed. Private-network connections do not fall back to direct access."); }));
-    $("open-export").addEventListener("click", openExport); $("generate-export").addEventListener("click", () => busy($("generate-export"), generateExport));
+    $("open-export").addEventListener("click", openExport);
+    $("export-form").addEventListener("submit", (event) => { event.preventDefault(); void generateExport(); });
+    $("export-form").addEventListener("input", invalidateExport);
+    $("export-form").addEventListener("change", invalidateExport);
+    $("export-dialog").addEventListener("close", () => { state.exportDraft = null; invalidateExport(); });
     $("copy-export").addEventListener("click", () => busy($("copy-export"), async () => { if (state.exportValue) { await copyText(JSON.stringify(state.exportValue.config, null, 2) + "\n"); notice("OpenCode configuration copied. Existing files were not changed."); } }));
     $("download-export").addEventListener("click", downloadExport);
   }
   async function boot() {
+    setupTheme();
     bind(); navigate(window.location.hash.slice(1));
     try {
       const session = await api("/session", {token: false});

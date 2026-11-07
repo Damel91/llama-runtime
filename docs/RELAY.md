@@ -52,6 +52,9 @@ The console shows when the configured listener differs from the running address.
    separates accepted usage from observed attempts and records missing
    counters as unknown.
 
+Use **Theme** in the header to switch between **Light** and **Dark**. The
+browser remembers your choice for this relay.
+
 The console uses its own local administration session. A relay inference key
 protects `/v1` and is separate from upstream server keys. Prefer environment
 references where available. Literal secrets belong in the private configuration
@@ -118,10 +121,20 @@ memory quotas. Optional capacity policies remain explicit.
 
 ## OpenCode export
 
-In **Models**, refresh the catalog and choose the models to export. In
-**Export OpenCode settings**, pick your OpenCode major version, then copy or
-download the JSON. Merge the generated provider into your own configuration
-and select one of the exported model IDs. The console only creates the export.
+In **Models**, refresh the catalog and select the chat models to export. If
+none are checked, the dialog offers all eligible loaded chat models.
+Open **Export OpenCode settings**, choose the OpenCode major version and
+default model, and enter the maximum output tokens per generation for each
+model. Model loading settings stay on the remote server. The dialog uses
+the observed loaded context where available and asks for the effective
+context for one conversation when the runtime omits it. It checks that the
+output is positive and below that context.
+
+**Generate settings** checks the models and observed context against the
+current remote catalog before creating the JSON. If a model or context
+has changed, refresh the catalog and reopen the export. Copy or download
+the result and merge the generated provider and `model` into your OpenCode
+configuration. The console writes no existing configuration files.
 
 | OpenCode | Provider shape |
 | --- | --- |
@@ -132,8 +145,11 @@ Both exports use the [OpenCode configuration schema](https://opencode.ai/config.
 and the relay's `/v1` URL. When relay inference authentication is enabled, the
 export carries an environment reference such as `{env:LLAMA_RELAY_API_KEY}`.
 Set that variable in OpenCode's environment. An unauthenticated local relay
-exports the placeholder `relay-local`. Review OpenCode's defaults for model
-limits and capabilities the runtime did not report.
+exports the placeholder `relay-local`. Each exported model includes
+`limit.context` and `limit.output`. Review OpenCode's defaults for
+capabilities the runtime did not report. OpenCode's compaction settings
+control when it summarizes the conversation independently of the output
+budget.
 
 Client retries and timeouts are independent of the relay's SDK recovery.
 Every client retry starts a new invocation with a fresh correction budget.

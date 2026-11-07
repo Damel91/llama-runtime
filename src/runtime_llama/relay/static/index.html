@@ -33,7 +33,15 @@
     <main id="workspace" tabindex="-1">
       <header class="workspace-header">
         <div><h1 id="view-title">Models</h1><p id="view-description">The models your configured runtimes actually report.</p></div>
-        <div class="header-actions"><span id="dirty-label" class="dirty-label" hidden>Unsaved changes</span><button type="button" class="button secondary" id="reload-config">Reload settings</button><button type="button" class="button primary" id="save-config" disabled>Save changes</button></div>
+        <div class="header-actions">
+          <span id="dirty-label" class="dirty-label" hidden>Unsaved changes</span>
+          <div class="theme-picker">
+            <label for="relay-theme">Theme</label>
+            <select id="relay-theme"><option value="light">Light</option><option value="dark">Dark</option></select>
+          </div>
+          <button type="button" class="button secondary" id="reload-config">Reload settings</button>
+          <button type="button" class="button primary" id="save-config" disabled>Save changes</button>
+        </div>
       </header>
       <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
       <div id="conflict-notice" class="notice error" role="alert" hidden><strong>Settings changed in another session.</strong><span>Your draft is still here. Reload to use the saved settings, or keep reviewing your draft.</span><button type="button" class="button secondary" id="resolve-conflict">Discard draft and reload</button></div>
@@ -77,7 +85,22 @@
 
   <dialog id="endpoint-dialog" class="dialog endpoint-dialog" aria-labelledby="endpoint-dialog-title"><form id="endpoint-form"><div class="dialog-heading"><div><h2 id="endpoint-dialog-title">Add connection</h2><p>Connect to a server you already manage.</p></div><button type="button" class="icon-button" data-close-dialog="endpoint-dialog" aria-label="Close connection editor">×</button></div><div id="endpoint-error" class="notice error" role="alert" hidden></div><div class="form-grid"><label>Connection name<input id="endpoint-name" name="name" type="text" required autocomplete="off" placeholder="inference-workstation"></label><label>Server origin<input id="endpoint-url" name="base_url" type="url" required placeholder="http://localhost:8080" spellcheck="false"></label><label>Runtime<select id="endpoint-backend"><option value="auto">Detect automatically</option><option value="llamacpp">llama.cpp</option><option value="strata">Strata</option></select></label><label>Transport<select id="endpoint-transport"><option value="direct">Direct / existing network</option><option value="tailnet">Embedded Tailscale / Headscale</option></select></label><label class="check-field"><input id="endpoint-tls" type="checkbox" checked>Verify the server’s TLS certificate</label><label>HTTP connections<select id="endpoint-http"><option value="close">Independent connections</option><option value="reuse">Keep-alive, explicitly enabled</option></select></label><label>Authentication<select id="endpoint-auth"><option value="none">No authentication</option><option value="env">Environment variable</option><option value="key">API key</option></select></label><label id="endpoint-env-field" hidden>API key environment variable<input id="endpoint-key-env" type="text" autocomplete="off" placeholder="INFERENCE_API_KEY"></label><label id="endpoint-key-field" hidden>API key<input id="endpoint-key" type="password" autocomplete="new-password"><small id="endpoint-key-help">Enter a key. It will not be read back by the browser.</small></label><label>Proxy setting<select id="endpoint-proxy-action"><option value="keep">Keep current setting</option><option value="replace">Set a proxy URL</option><option value="clear">No proxy</option></select></label><label id="endpoint-proxy-field" hidden>Proxy URL<input id="endpoint-proxy" type="password" autocomplete="new-password" placeholder="http://proxy.example:port"><small>Proxy credentials are treated as a secret and will not be read back.</small></label></div><p class="section-note">Changing a saved connection name changes its secret identity. Re-enter or explicitly remove any saved key or proxy when renaming.</p><div class="dialog-actions"><button type="button" class="button secondary" data-close-dialog="endpoint-dialog">Cancel</button><button type="submit" class="button primary">Apply to draft</button></div></form></dialog>
 
-  <dialog id="export-dialog" class="dialog export-dialog" aria-labelledby="export-heading"><div class="dialog-heading"><div><h2 id="export-heading">Connect OpenCode</h2><p>Export settings for the chosen client version. Existing consumer files are never edited.</p></div><button type="button" class="icon-button" data-close-dialog="export-dialog" aria-label="Close export">×</button></div><div class="inline-actions"><label>OpenCode version<select id="export-version"><option value="v2">V2 configuration</option><option value="v1">V1 configuration</option></select></label><button type="button" class="button primary" id="generate-export">Generate settings</button></div><p id="export-selection" class="section-note">Uses the checked chat models, or the exportable observed catalog when none are checked.</p><div id="export-warnings" class="notice" hidden></div><label class="export-output-label">Configuration<textarea id="export-output" rows="15" readonly spellcheck="false" placeholder="Generate settings to preview the configuration."></textarea></label><div class="dialog-actions"><button type="button" class="button secondary" id="copy-export" disabled>Copy configuration</button><button type="button" class="button primary" id="download-export" disabled>Download configuration</button></div></dialog>
+  <dialog id="export-dialog" class="dialog export-dialog" aria-labelledby="export-heading">
+    <form id="export-form" novalidate>
+      <div class="dialog-heading"><div><h2 id="export-heading">Connect OpenCode</h2><p>Choose the default chat model and the maximum output per generation. The export points OpenCode to this relay.</p></div><button type="button" class="icon-button" data-close-dialog="export-dialog" aria-label="Close export">×</button></div>
+      <div class="form-grid">
+        <label>OpenCode version<select id="export-version"><option value="v2">V2 configuration</option><option value="v1">V1 configuration</option></select></label>
+        <label>Default model<select id="export-default"></select></label>
+      </div>
+      <p id="export-selection" class="section-note"></p>
+      <div id="export-model-settings" class="export-model-settings"></div>
+      <div id="export-error" class="notice error" role="alert" hidden></div>
+      <div class="inline-actions"><button type="submit" class="button primary" id="generate-export">Generate settings</button></div>
+      <div id="export-warnings" class="notice" hidden></div>
+      <label class="export-output-label">Configuration<textarea id="export-output" rows="12" readonly spellcheck="false" placeholder="Generate settings to preview the configuration."></textarea></label>
+      <div class="dialog-actions"><button type="button" class="button secondary" id="copy-export" disabled>Copy configuration</button><button type="button" class="button primary" id="download-export" disabled>Download configuration</button></div>
+    </form>
+  </dialog>
   <noscript><p class="noscript">This local configuration console needs JavaScript. The inference API does not depend on an open browser.</p></noscript>
 </body>
 </html>
