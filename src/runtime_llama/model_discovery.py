@@ -39,6 +39,7 @@ ObservationSource = Literal[
     "catalog.meta.n_ctx",
     "root_props.default_generation_settings.n_ctx",
     "root_props.total_slots",
+    "health.max_context",
 ]
 _STATES = frozenset(
     {"loaded", "loading", "unloaded", "sleeping", "downloading", "downloaded"}
@@ -231,6 +232,21 @@ def _observe(entry: dict[str, Any], diagnostics: set[str]) -> ModelObservation:
     )
 
 
+def _matching_root_sleep_state(
+    model: ModelObservation, props: dict[str, Any]
+) -> bool | None:
+    alias = props.get("model_alias")
+    sleeping = props.get("is_sleeping")
+    if (
+        ("role" in props and props["role"] != "model")
+        or not isinstance(alias, str)
+        or alias not in model.aliases
+        or not isinstance(sleeping, bool)
+    ):
+        return None
+    return sleeping
+
+
 def _root_proof(
     observations: list[ModelObservation],
     props: Any,
@@ -244,14 +260,8 @@ def _root_proof(
         diagnostics.add("root_props_load_state_unverified")
         return
     observed = observations[0]
-    alias = props.get("model_alias")
-    sleeping = props.get("is_sleeping")
-    if (
-        ("role" in props and props["role"] != "model")
-        or not isinstance(alias, str)
-        or alias not in observed.aliases
-        or not isinstance(sleeping, bool)
-    ):
+    sleeping = _matching_root_sleep_state(observed, props)
+    if sleeping is None:
         diagnostics.add("root_props_load_state_unverified")
         return
     settings = props.get("default_generation_settings")

@@ -27,7 +27,9 @@ from runtime_llama.errors import LLMBackendError, LLMCancelledError, LLMTimeoutE
 from runtime_llama.model_discovery import (
     ModelCatalog,
     ModelObservation,
+    ObservedInt,
     _ENV_NAME,
+    _matching_root_sleep_state,
     _observe,
     _root_proof,
 )
@@ -374,12 +376,28 @@ def _catalog(
             isinstance(status, dict) and status.get("value") is None
         )
         _root_proof(observations, props, diagnostics, eligible=eligible)
+    elif backend == "llamacpp" and len(observations) == 1:
+        model = observations[0]
+        if (
+            model.state == "loaded"
+            and model.loaded_context is None
+            and _matching_root_sleep_state(model, props) is False
+        ):
+            settings = props.get("default_generation_settings")
+            context = settings.get("n_ctx") if isinstance(settings, dict) else None
+            if type(context) is int and context > 0:
+                observations[0] = replace(
+                    model,
+                    loaded_context=ObservedInt(
+                        context, "root_props.default_generation_settings.n_ctx"
+                    ),
+                )
     return tuple(observations)
 
 
 def _strata_model(
     health: dict[str, Any], props: dict[str, Any], models: tuple[ModelObservation, ...]
-) -> str | None:
+) -> ModelObservation | None:
     """Accept one canonical LLM only when all independent markers agree."""
     canonical = health.get("model")
     selected = [item for item in models if item.id == canonical]
@@ -394,23 +412,24 @@ def _strata_model(
     ):
         return None
     observed = selected[0]
-    contexts = []
+    contexts = [observed.loaded_context] if observed.loaded_context else []
     settings = props.get("default_generation_settings")
     if settings is not None and not isinstance(settings, dict):
         return None
-    for value in (
-        health.get("max_context"),
-        settings.get("n_ctx") if settings else None,
+    for value, source in (
+        (
+            settings.get("n_ctx") if settings else None,
+            "root_props.default_generation_settings.n_ctx",
+        ),
+        (health.get("max_context"), "health.max_context"),
     ):
         if value is not None:
             if type(value) is not int or value <= 0:
                 return None
-            contexts.append(value)
-    if observed.loaded_context is not None:
-        contexts.append(observed.loaded_context.value)
-    if len(set(contexts)) > 1:
+            contexts.append(ObservedInt(value, source))
+    if len({context.value for context in contexts}) > 1:
         return None
-    return canonical
+    return replace(observed, loaded_context=contexts[0]) if contexts else observed
 
 
 def _probe_endpoint(
@@ -475,10 +494,16 @@ def _probe_endpoint(
                 payload, props, backend, diagnostics, check=remaining
             )
             if backend == "strata":
-                llm_model_id = _strata_model(health, props, observations)
-                if llm_model_id is None:
+                strata_model = _strata_model(health, props, observations)
+                if strata_model is None:
                     available = False
                     diagnostics.add("runtime_model_state_incoherent")
+                else:
+                    llm_model_id = strata_model.id
+                    observations = tuple(
+                        strata_model if model.id == llm_model_id else model
+                        for model in observations
+                    )
             remaining()
             catalog = ModelCatalog(
                 observations,

@@ -10,6 +10,7 @@ import traceback
 import pytest
 
 from runtime_llama.errors import LLMBackendError, LLMCancelledError
+from runtime_llama.model_discovery import ObservedInt
 from runtime_llama.runtime_discovery import RuntimeEndpoint, discover_runtimes
 import runtime_llama.runtime_discovery as discovery
 from test_model_discovery_transport import endpoint as endpoint, send
@@ -101,6 +102,87 @@ def test_native_standalone_props_reused_without_repeated_catalog(endpoint):
     assert selected.model.loaded_context.value == 8192
     assert selected.model.slots.value == 4
     assert len(calls) == 3
+
+
+@pytest.mark.parametrize(
+    "props_patch,meta,expected",
+    [
+        ({}, {}, ObservedInt(8192, "root_props.default_generation_settings.n_ctx")),
+        ({}, {"n_ctx": 4096}, ObservedInt(4096, "catalog.meta.n_ctx")),
+        ({"role": "router"}, {}, None),
+        ({"model_alias": "different"}, {}, None),
+        ({"is_sleeping": True}, {}, None),
+        ({"default_generation_settings": {"n_ctx": True}}, {}, None),
+    ],
+)
+def test_native_explicit_load_uses_only_matching_effective_context(
+    endpoint, props_patch, meta, expected
+):
+    base_url, calls = server(
+        endpoint,
+        entries=[
+            {
+                "id": "chosen",
+                "aliases": ["friendly"],
+                "status": {"value": "loaded"},
+                "context_length": 131072,
+                "meta": meta,
+            }
+        ],
+        props={
+            "build_info": "b11548-781dbc5ac",
+            "model_alias": "friendly",
+            "is_sleeping": False,
+            "default_generation_settings": {"n_ctx": 8192},
+            "total_slots": 4,
+            **props_patch,
+        },
+    )
+    selected = discover_runtimes([RuntimeEndpoint("local", base_url)]).select("chosen")
+    assert selected.model.loaded_context == expected
+    assert selected.model.training_context == ObservedInt(
+        131072, "catalog.context_length"
+    )
+    assert calls == [("/health", None), ("/props", None), ("/v1/models", None)]
+
+
+@pytest.mark.parametrize(
+    "max_context,props_context,expected",
+    [
+        (8192, None, ObservedInt(8192, "health.max_context")),
+        (None, 8192, ObservedInt(8192, "root_props.default_generation_settings.n_ctx")),
+        (8192, 8192, ObservedInt(8192, "root_props.default_generation_settings.n_ctx")),
+        (None, None, None),
+    ],
+)
+def test_strata_preserves_observed_effective_context_for_the_canonical_model(
+    endpoint, max_context, props_context, expected
+):
+    base_url, calls = server(
+        endpoint,
+        backend="strata",
+        entries=[
+            {"id": "chosen", "status": "loaded", "context_length": 131072},
+            {"id": "other", "status": "loaded"},
+        ],
+        health={
+            "status": "ok",
+            "service": "strata",
+            "loaded": True,
+            "model": "chosen",
+            "max_context": max_context,
+        },
+        props={
+            "build_info": "Strata 0.1.57",
+            "model_alias": "chosen",
+            "is_sleeping": False,
+            "default_generation_settings": {"n_ctx": props_context},
+        },
+    )
+    catalog = discover_runtimes([RuntimeEndpoint("local", base_url)])
+    assert catalog.select("chosen").model.loaded_context == expected
+    assert catalog.runtimes[0].loaded_models[1].loaded_context is None
+    assert calls == [("/health", None), ("/props", None), ("/v1/models", None)]
 
 
 def test_strata_explicit_alias_rows_collapsed_and_selected_as_canonical(endpoint):
