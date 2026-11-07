@@ -64,12 +64,18 @@ recoverably invalid, the call raises an exhausted error. A new external call
 starts with the full budget, including after exhaustion. Concurrent calls have
 independent budgets and private corrective histories.
 
-For requests declaring tools, the SDK stages native events until the complete
+By default, for requests declaring tools the SDK stages native events until the complete
 proposal can be classified. Content and executable tool fragments from a
 rejected attempt never escape through the public stream. An accepted attempt
 is projected once, in its original event order. This can delay the first
 visible event until that native generation finishes. A mixed proposal is
 regenerated as a whole only because none of its proposed calls was released.
+
+The [HTTP relay](RELAY.md#http-contract) opts into progressive visible text
+for plain-text SSE. Tool fragments and reasoning still wait for validation.
+If validation fails after visible text was published, the relay reports a
+terminal error so the client can retain the partial text without a replacement
+generation in the same request.
 
 Ordinary requests without declared tools retain progressive streaming. An
 explicit nonempty or malformed native rejection marker is an exception: it

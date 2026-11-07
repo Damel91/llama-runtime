@@ -512,7 +512,9 @@ class RelayService:
                 result = adapter.generate_with_metadata(request.messages, **options)
                 self._record_event(operation, result)
                 return result
-            events = adapter.stream_with_metadata(request.messages, **options)
+            events = adapter.stream_with_metadata(
+                request.messages, _progressive_tool_text=True, **options
+            )
             try:
                 for event in events:
                     operation.check()

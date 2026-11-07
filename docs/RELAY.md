@@ -13,7 +13,7 @@ the optional relay, download the wheel from the [latest GitHub release](https://
 and install it with the `relay` extra. You can also install from a source checkout.
 
 ```bash
-python -m pip install './runtime_llama-0.20.1-py3-none-any.whl[relay]'
+python -m pip install './runtime_llama-0.20.2-py3-none-any.whl[relay]'
 # From a source checkout:
 python -m pip install '.[relay]'
 ```
@@ -90,13 +90,17 @@ curl http://127.0.0.1:8088/v1/embeddings \
 
 For chat, set `stream: true` to receive `text/event-stream`. The relay sends
 an opening SSE comment and a keepalive comment about every 15 seconds while
-it waits for events. SSE clients ignore comments. Ordinary text streams
-progressively. With declared tools the SDK stages each proposal until it can
-validate it, then emits the accepted content and tool calls. A safely
-recoverable rejection may trigger up to three corrections after the initial
-generation on the same route. The client executes tools, retains tool call
-IDs and submits the results in subsequent messages. See
-[tool-call recovery](TOOL-RECOVERY.md).
+it waits for events. SSE clients ignore comments. For plain-text chat, visible
+text streams as it is generated, including when the request declares tools.
+The relay stages reasoning and tool fragments until it validates the proposal.
+Before any visible text, a recoverable rejection can trigger up to three
+corrections on the same route. After visible text, a rejected tool proposal
+ends the stream with a tool protocol error. The client keeps the partial text
+and receives no executable tool fragment from that proposal.
+
+The client executes validated tools, retains tool call IDs and submits results
+in subsequent messages. JSON responses and structured output with declared
+tools use the [default atomic SDK behavior](TOOL-RECOVERY.md).
 
 Set `stream_options.include_usage` to request stream usage. Available counters
 describe the accepted generation. Missing counters remain unknown. Client

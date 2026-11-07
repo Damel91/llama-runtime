@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 import gc
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from itertools import chain
 import json
 import select
 import socket
@@ -26,6 +27,22 @@ from runtime_llama.relay.app import create_app
 from runtime_llama.relay.config import RelayConfigStore, default_config
 from runtime_llama.relay.service import RelayService
 from test_generation import _chunk
+
+
+INSPECT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "inspect",
+            "parameters": {
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "required": ["key"],
+                "additionalProperties": False,
+            },
+        },
+    }
+]
 
 
 def eventually(predicate, timeout=5):
@@ -61,16 +78,29 @@ def native_server(kind="llamacpp", chat_responses=None):
         def log_message(self, *_args):
             pass
 
-        def reply(self, value, *, sse=False, status=200):
-            wire = value if isinstance(value, bytes) else json.dumps(value).encode()
+        def reply(self, value, *, status=200):
+            wire = json.dumps(value).encode()
             self.send_response(status)
-            self.send_header(
-                "Content-Type", "text/event-stream" if sse else "application/json"
-            )
+            self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(wire)))
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(wire)
+            self.close_connection = True
+
+        def stream_frames(self, frames):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            wire = (
+                b"data: " + json.dumps(frame).encode() + b"\n\n" for frame in frames
+            )
+            for event in chain(wire, (b"data: [DONE]\n\n",)):
+                self.wfile.write(f"{len(event):x}\r\n".encode() + event + b"\r\n")
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
             self.close_connection = True
 
         def do_GET(self):
@@ -153,14 +183,7 @@ def native_server(kind="llamacpp", chat_responses=None):
                     if frames == "quiet":
                         self.quiet()
                     else:
-                        self.reply(
-                            b"".join(
-                                b"data: " + json.dumps(frame).encode() + b"\n\n"
-                                for frame in frames
-                            )
-                            + b"data: [DONE]\n\n",
-                            sse=True,
-                        )
+                        self.stream_frames(frames)
                 else:
                     self.reply({"error": "unexpected fixture endpoint"}, status=404)
             finally:
@@ -366,6 +389,83 @@ def test_tcp_10000_direct_texts_release_records_owners_handoff_and_transports(
     )
 
 
+def test_tcp_tool_sse_streams_guarded_text_before_tool_validation(monkeypatch):
+    monkeypatch.setattr("runtime_llama.relay.app._SSE_KEEPALIVE_SECONDS", 0.02)
+    release = Event()
+    call = {
+        "index": 0,
+        "id": "accepted-after-validation",
+        "type": "function",
+        "function": {"name": "inspect", "arguments": '{"key":"fixture"}'},
+    }
+
+    def responses(_index, _request):
+        yield _chunk(reasoning="held until validation")
+        yield _chunk(tools=[call])
+        yield _chunk(content="<think>INLINE-PRIVATE</think>Visible ")
+        yield _chunk(content="before validation.")
+        if release.wait(5):
+            yield _chunk(finish="tool_calls")
+
+    with native_server("strata", responses) as (url, model, native):
+        with tcp_relay(configuration(url)) as (api, _app, service):
+            try:
+                with api.stream(
+                    "POST",
+                    "/v1/chat/completions",
+                    json={
+                        "model": model,
+                        "messages": [{"role": "user", "content": "synthetic request"}],
+                        "tools": INSPECT_TOOLS,
+                        "stream": True,
+                    },
+                ) as response:
+                    assert response.status_code == 200
+                    lines = response.iter_lines()
+                    before = []
+                    for line in lines:
+                        if line.startswith("data: "):
+                            assert line != "data: [DONE]"
+                            choice = json.loads(line[6:])["choices"][0]
+                            assert choice["finish_reason"] is None
+                            before.append(choice["delta"])
+                        if line == ": keep-alive" and any(
+                            delta.get("content") == "before validation."
+                            for delta in before
+                        ):
+                            break
+                    assert before == [
+                        {"role": "assistant"},
+                        {"content": "Visible "},
+                        {"content": "before validation."},
+                    ]
+                    assert native["active"] == 1
+                    assert not release.is_set()
+                    release.set()
+                    after = list(lines)
+            finally:
+                release.set()
+
+            assert after[-2] == "data: [DONE]"
+            choices = [
+                json.loads(line[6:])["choices"][0]
+                for line in after
+                if line.startswith("data: ") and line != "data: [DONE]"
+            ]
+            assert [choice["delta"] for choice in choices] == [
+                {"reasoning_content": "held until validation"},
+                {"tool_calls": [call]},
+                {},
+            ]
+            assert [choice["finish_reason"] for choice in choices] == [
+                None,
+                None,
+                "tool_calls",
+            ]
+            assert native["requests"]["POST /v1/chat/completions"] == 1
+            assert service.registry.snapshot()["active"] == []
+
+
 def test_tcp_tool_only_fragmented_multiple_calls_and_tool_result_history():
     def responses(index, _request):
         if index:
@@ -399,20 +499,6 @@ def test_tcp_tool_only_fragmented_multiple_calls_and_tool_result_history():
             _chunk(finish="tool_calls"),
         ]
 
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "inspect",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"key": {"type": "string"}},
-                    "required": ["key"],
-                    "additionalProperties": False,
-                },
-            },
-        }
-    ]
     with native_server("strata", responses) as (url, model, native):
         with tcp_relay(configuration(url)) as (api, _app, service):
             initial = [{"role": "user", "content": "synthetic request"}]
@@ -422,7 +508,7 @@ def test_tcp_tool_only_fragmented_multiple_calls_and_tool_result_history():
                 json={
                     "model": model,
                     "messages": initial,
-                    "tools": tools,
+                    "tools": INSPECT_TOOLS,
                     "stream": True,
                 },
             ) as response:
@@ -476,7 +562,7 @@ def test_tcp_tool_only_fragmented_multiple_calls_and_tool_result_history():
             ]
             followup = api.post(
                 "/v1/chat/completions",
-                json={"model": model, "messages": history, "tools": tools},
+                json={"model": model, "messages": history, "tools": INSPECT_TOOLS},
             )
             assert (
                 followup.status_code == 200

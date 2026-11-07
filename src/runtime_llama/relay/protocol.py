@@ -301,7 +301,12 @@ class ChatStreamProjection:
                 raise RelayError(502, "relay_malformed_sdk_tool_delta")
             chunks.append(self._chunk({"tool_calls": deepcopy(calls)}))
         elif event.kind == "terminal":
-            chunks.append(self._chunk({}, finish_reason(event)))
+            reason = (
+                "length"
+                if event.terminal_reason == "visible_output_cap"
+                else finish_reason(event)
+            )
+            chunks.append(self._chunk({}, reason))
             if self.include_usage:
                 usage = usage_payload(self.usage)
                 if usage is not None:
@@ -359,7 +364,9 @@ def map_error(error: BaseException) -> RelayError:
     if isinstance(error, LLMTimeoutError):
         return RelayError(504, "relay_upstream_timeout")
     if isinstance(error, LLMToolRecoveryError):
-        return RelayError(502, error.terminal_reason)
+        # A client must keep the published prefix rather than auto-retry it.
+        status = 422 if error.content_already_streamed else 502
+        return RelayError(status, error.terminal_reason)
     if isinstance(error, LLMRunawayError):
         return RelayError(502, "relay_runaway_generation")
     if isinstance(error, (ValueError, TypeError)):

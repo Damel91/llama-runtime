@@ -57,6 +57,7 @@ class LLMToolRecoveryError(LLMBackendError):
 
     ``last_proposal`` is retained solely for explicit, non-executable inspection.
     It never appears in exception text, repr or the ordinary diagnostic export.
+    ``content_already_streamed`` marks an irrevocable visible prefix.
     A failure does not modify the adapter or a later invocation's budget.
     """
 
@@ -69,6 +70,7 @@ class LLMToolRecoveryError(LLMBackendError):
         tool_recovery: LLMToolRecoveryReport,
         last_proposal: object = None,
         diagnostics: LLMTransportAttempt | None = None,
+        content_already_streamed: bool = False,
     ) -> None:
         # Only a protocol reason belongs in automatic exception logging.
         safe_message = (
@@ -84,6 +86,7 @@ class LLMToolRecoveryError(LLMBackendError):
         )
         super().__init__(safe_message, diagnostics=diagnostics)
         self.tool_recovery = tool_recovery
+        self.content_already_streamed = content_already_streamed
         self._last_proposal = deepcopy(last_proposal)
         self.terminal_reason = (
             "tool_recovery_exhausted"

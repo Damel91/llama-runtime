@@ -100,7 +100,7 @@ from runtime_llama.tailnet import TailnetConfig, TailnetError, TailnetHelper
 
 from runtime_llama.embedding_records import EmbeddingRecordResult, EmbeddingRecordStream
 
-__version__ = "0.20.1"
+__version__ = "0.20.2"
 
 __all__ = [
     "StrataAdapter",

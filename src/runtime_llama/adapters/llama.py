@@ -95,6 +95,7 @@ _MESSAGE_FIELDS = (
     "function_call",
     "reasoning_content",
 )
+_GUARDED_TOOL_TEXT = "_guarded_tool_text"
 
 
 @dataclass
@@ -834,6 +835,7 @@ class LlamaCppAdapter(LLMAdapter):
         request_options: Optional[Mapping[str, Any]] = None,
         thinking_diagnostics: Optional[ThinkingDiagnosticsConfig] = None,
         thinking_sink: Optional[ThinkingDiagnosticSink] = None,
+        progressive_tool_text: bool = False,
     ) -> Iterator[LLMStreamEvent]:
         idle = self._stream_idle(timeout)
         self._raise_if_cancelled(cancellation_probe, timeout=idle)
@@ -911,6 +913,16 @@ class LlamaCppAdapter(LLMAdapter):
         history = deepcopy(body["messages"])
         attempts: List[LLMToolRecoveryAttempt] = []
         staged: List[LLMStreamEvent] = []
+        response_format = body.get("response_format")
+        stream_text = progressive_tool_text and (
+            response_format is None
+            or (
+                isinstance(response_format, Mapping)
+                and response_format.get("type") == "text"
+            )
+        )
+        text_published = False
+        leading_whitespace: List[str] = []
 
         def native_cancelled() -> bool:
             # The native request owns its interruption even with a borrowed
@@ -932,6 +944,21 @@ class LlamaCppAdapter(LLMAdapter):
             return LLMToolRecoveryReport(
                 tuple(attempts), exhausted, (time.monotonic() - started) * 1000
             )
+
+        def project_guarded(chunks, *, publish):
+            nonlocal text_published
+            for chunk in chunks:
+                if not publish:
+                    continue
+                if not text_published and not chunk.strip():
+                    leading_whitespace.append(chunk)
+                    continue
+                check_cancelled()
+                if leading_whitespace:
+                    chunk = "".join(leading_whitespace) + chunk
+                    leading_whitespace.clear()
+                text_published = True
+                yield LLMStreamEvent(kind=_GUARDED_TOOL_TEXT, text=chunk)
 
         def snapshot(index, outcome, decision=None, diagnostic=None, error=None):
             def latest(attribute):
@@ -968,8 +995,10 @@ class LlamaCppAdapter(LLMAdapter):
             for index in range(4):
                 check_cancelled()
                 staged.clear()
+                leading_whitespace.clear()
                 terminal = None
                 local_cap = False
+                native_rejected = False
                 guard = _StreamAccumulator(
                     self,
                     visible_output_token_limit=num_predict,
@@ -991,13 +1020,24 @@ class LlamaCppAdapter(LLMAdapter):
                             staged.append(event)
                             if event.kind == "terminal":
                                 terminal = event
-                            for _ in guard.consume(event):
-                                pass
+                            if (
+                                stream_text
+                                and event.kind == "tool_diagnostic"
+                                and event.data
+                                and event.data.get("strata_rejected_tool_calls", [])
+                                != []
+                            ):
+                                native_rejected = True
+                            yield from project_guarded(
+                                guard.consume(event),
+                                publish=stream_text and not native_rejected,
+                            )
                             if guard.visible_limit_reached:
                                 local_cap = True
                                 break
-                        for _ in guard.finish():
-                            pass
+                        yield from project_guarded(
+                            guard.finish(), publish=stream_text and not native_rejected
+                        )
                         local_cap = local_cap or guard.visible_limit_reached
                     finally:
                         stream.close()
@@ -1025,7 +1065,9 @@ class LlamaCppAdapter(LLMAdapter):
                     "visible_output_cap",
                     "content_filter",
                 }
-                if local_cap or incomplete:
+                # A partial answer is useful unless the native stream already
+                # identified the proposal as rejected in progressive mode.
+                if (local_cap or incomplete) and not native_rejected:
                     reason = (
                         "visible_output_cap" if local_cap else terminal.terminal_reason
                     )
@@ -1076,17 +1118,18 @@ class LlamaCppAdapter(LLMAdapter):
                     thinking_diagnostics,
                     thinking_sink,
                 )
+                can_correct = decision.recoverable and not text_published
                 attempts.append(
                     snapshot(
                         index,
-                        "rejected" if decision.recoverable else "unsafe",
+                        "rejected" if can_correct else "unsafe",
                         decision,
                         diagnostic,
                     )
                 )
-                exhausted = decision.recoverable and index == 3
+                exhausted = can_correct and index == 3
                 current_report = report(exhausted=exhausted)
-                if not decision.recoverable or exhausted:
+                if not can_correct or exhausted:
                     error = LLMToolRecoveryError(
                         "tool_recovery_exhausted"
                         if exhausted
@@ -1094,6 +1137,7 @@ class LlamaCppAdapter(LLMAdapter):
                         tool_recovery=current_report,
                         last_proposal=self._recovery_proposal(staged),
                         diagnostics=attempts[-1].transport,
+                        content_already_streamed=text_published,
                     )
                     if diagnostic is not None:
                         error.thinking_diagnostic = diagnostic
@@ -1123,6 +1167,7 @@ class LlamaCppAdapter(LLMAdapter):
             raise
         finally:
             staged.clear()
+            leading_whitespace.clear()
             history.clear()
 
     @staticmethod
@@ -1171,6 +1216,7 @@ class LlamaCppAdapter(LLMAdapter):
         tool_choice: Any = None,
         thinking_diagnostics: Optional[ThinkingDiagnosticsConfig] = None,
         thinking_sink: Optional[ThinkingDiagnosticSink] = None,
+        _progressive_tool_text: bool = False,
     ) -> Iterator[LLMStreamEvent]:
         self._set_last_usage(None)
         self._set_last_server_timings(None)
@@ -1185,6 +1231,7 @@ class LlamaCppAdapter(LLMAdapter):
             request_options=self._tool_options(request_options, tools, tool_choice),
             thinking_diagnostics=thinking_diagnostics,
             thinking_sink=thinking_sink,
+            **({"progressive_tool_text": True} if _progressive_tool_text else {}),
         )
         accumulator = _StreamAccumulator(
             self,
@@ -1195,17 +1242,30 @@ class LlamaCppAdapter(LLMAdapter):
         )
         terminal: Optional[LLMStreamEvent] = None
         recovery_active = False
+        text_published = False
         try:
             for event in events:
-                recovery_active = recovery_active or event.tool_recovery is not None
+                guarded_text = event.kind == _GUARDED_TOOL_TEXT
+                recovery_active = (
+                    recovery_active or guarded_text or event.tool_recovery is not None
+                )
                 self._raise_if_projection_cancelled(
                     cancellation_probe, timeout=timeout, recovery_active=recovery_active
                 )
+                if guarded_text:
+                    text_published = True
+                    yield replace(event, kind="content")
+                    continue
                 if event.kind == "content":
                     for chunk in accumulator.consume(event):
-                        yield (
-                            event if chunk == event.text else replace(event, text=chunk)
-                        )
+                        # Replay accepted raw events for diagnostics and limits
+                        # without displaying a second copy of guarded text.
+                        if not text_published:
+                            yield (
+                                event
+                                if chunk == event.text
+                                else replace(event, text=chunk)
+                            )
                 else:
                     for _ in accumulator.consume(event):
                         pass
@@ -1213,7 +1273,7 @@ class LlamaCppAdapter(LLMAdapter):
                         terminal = event
                     else:
                         yield event
-                if accumulator.visible_limit_reached:
+                if accumulator.visible_limit_reached and not text_published:
                     break
             self._raise_if_projection_cancelled(
                 cancellation_probe, timeout=timeout, recovery_active=recovery_active
@@ -1222,7 +1282,8 @@ class LlamaCppAdapter(LLMAdapter):
                 self._raise_if_projection_cancelled(
                     cancellation_probe, timeout=timeout, recovery_active=recovery_active
                 )
-                yield LLMStreamEvent(kind="content", text=chunk)
+                if not text_published:
+                    yield LLMStreamEvent(kind="content", text=chunk)
             self._raise_if_projection_cancelled(
                 cancellation_probe, timeout=timeout, recovery_active=recovery_active
             )
@@ -1248,11 +1309,6 @@ class LlamaCppAdapter(LLMAdapter):
                         else {}
                     ),
                     "tool_calls": list(result.tool_calls),
-                    **(
-                        {"finish_reason": terminal.data["finish_reason"]}
-                        if terminal is not None and terminal.data is not None
-                        else {}
-                    ),
                 },
                 thinking_diagnostic=result.thinking_diagnostic,
                 server_timings=result.server_timings,

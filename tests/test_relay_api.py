@@ -617,18 +617,20 @@ def test_chat_json_native_sdk_preserves_structured_history_and_options(native_se
         assert app.state.relay_service.registry.snapshot()["active"] == []
 
 
-def test_sse_recovery_stages_rejected_content_and_budget_resets(native_servers):
+def test_sse_recovery_stages_rejected_reasoning_and_budget_resets(native_servers):
     def responses(index, _request):
         if index == 0:
             return [
-                _chunk(content="NEVER-PUBLISH"),
-                _chunk(finish="stop"),
+                _chunk(content=" \t"),
+                _chunk(reasoning="NEVER-PUBLISH"),
                 {
                     "choices": [],
                     "strata_rejected_tool_calls": [
                         {"name": "wrong", "reason": "undeclared"}
                     ],
                 },
+                _chunk(content="AFTER-NATIVE-REJECTION"),
+                _chunk(finish="stop"),
             ]
         return [
             _chunk(reasoning="accepted-reasoning"),
@@ -665,6 +667,7 @@ def test_sse_recovery_stages_rejected_content_and_budget_resets(native_servers):
         response = api.post("/v1/chat/completions", json=payload)
         assert response.status_code == 200
         assert "NEVER-PUBLISH" not in response.text
+        assert "AFTER-NATIVE-REJECTION" not in response.text
         assert "tool_recovery" not in response.text
         frames = [
             json.loads(line[6:])
@@ -672,6 +675,11 @@ def test_sse_recovery_stages_rejected_content_and_budget_resets(native_servers):
             if line.startswith("data: ") and line != "data: [DONE]"
         ]
         assert all(frame.get("usage", "missing") is None for frame in frames[:-1])
+        assert not any(
+            "content" in choice["delta"]
+            for frame in frames
+            for choice in frame["choices"]
+        )
         assert len({(f["id"], f["created"], f["model"]) for f in frames}) == 1
         assert any(
             f["choices"]
@@ -703,6 +711,164 @@ def test_sse_recovery_stages_rejected_content_and_budget_resets(native_servers):
             ]
             == 0
         )
+
+
+@pytest.mark.parametrize("mode", ["json", "structured-sse", "text-sse"])
+def test_tool_recovery_after_prose_depends_on_output_mode(native_servers, mode):
+    structured = mode == "structured-sse"
+    committed = '{"answer":"unvalidated"}' if structured else "committed answer"
+    corrected = '{"answer":"corrected"}' if structured else "corrected answer"
+
+    def responses(index, _request):
+        if index:
+            return [_chunk(content=corrected), _chunk(finish="stop")]
+        return [
+            _chunk(content=committed),
+            _chunk(reasoning="PRIVATE-REJECTED-REASONING"),
+            _chunk(
+                tools=[
+                    {
+                        "index": 0,
+                        "id": "private-rejected-call",
+                        "type": "function",
+                        "function": {"name": "wrong", "arguments": '{"key":"x"}'},
+                    }
+                ]
+            ),
+            _chunk(finish="tool_calls"),
+            {
+                "choices": [],
+                "strata_rejected_tool_calls": [
+                    {"name": "wrong", "reason": "undeclared"}
+                ],
+            },
+        ]
+
+    url, state = native_servers(responses=responses)
+    payload = {
+        "model": "chat-model",
+        "messages": [{"role": "user", "content": "fixture"}],
+        "tools": TOOLS,
+        "stream": mode != "json",
+    }
+    if structured:
+        payload["response_format"] = {"type": "json_object"}
+    with client(config_for((url, {}))) as (api, app):
+        response = api.post("/v1/chat/completions", json=payload)
+        assert response.status_code == 200, response.text
+        assert "PRIVATE-REJECTED-REASONING" not in response.text
+        assert "private-rejected-call" not in response.text
+        snapshot = app.state.relay_service.registry.snapshot()
+        assert snapshot["active"] == []
+        summary = snapshot["last_completed"]
+        if mode != "text-sse":
+            assert summary["corrections_used"] == 1
+            assert len(state["posts"]) == 2
+            if structured:
+                frames = [
+                    json.loads(line[6:])
+                    for line in response.text.splitlines()
+                    if line.startswith("data: ") and line != "data: [DONE]"
+                ]
+                assert [frame["choices"][0]["delta"] for frame in frames] == [
+                    {"role": "assistant"},
+                    {"content": corrected},
+                    {},
+                ]
+                assert response.text.endswith("data: [DONE]\n\n")
+                assert all(
+                    body["response_format"] == payload["response_format"]
+                    for _, body, _ in state["posts"]
+                )
+            else:
+                assert response.json()["choices"][0]["message"]["content"] == corrected
+                assert committed not in response.text
+            return
+
+        assert "[DONE]" not in response.text
+        frames = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        assert frames[-1]["error"]["code"] == "tool_protocol_error"
+        assert frames[-1]["error"]["type"] == "invalid_request_error"
+        deltas = [frame["choices"][0] for frame in frames[:-1]]
+        assert [choice["delta"] for choice in deltas] == [
+            {"role": "assistant"},
+            {"content": committed},
+        ]
+        assert all(choice["finish_reason"] is None for choice in deltas)
+        assert summary["status"] == "failed"
+        assert summary["error_code"] == "tool_protocol_error"
+        assert len(state["posts"]) == 1
+
+
+@pytest.mark.parametrize("rejected", [False, True], ids=["partial", "rejected"])
+def test_tool_sse_visible_cap_withholds_unconfirmed_calls(native_servers, rejected):
+    native_frames = [
+        _chunk(
+            tools=[
+                {
+                    "index": 0,
+                    "id": "unconfirmed-call",
+                    "type": "function",
+                    "function": {"name": "inspect", "arguments": '{"key":"x"}'},
+                }
+            ]
+        ),
+        _chunk(content="abcdefgh"),
+        _chunk(finish="tool_calls"),
+    ]
+    if rejected:
+        native_frames.insert(
+            0,
+            {
+                "choices": [],
+                "strata_rejected_tool_calls": [
+                    {"name": "wrong", "reason": "undeclared"}
+                ],
+            },
+        )
+    url, state = native_servers(responses=lambda _index, _request: native_frames)
+    config = config_for((url, {}))
+    config["llm_defaults"]["runtime_char_token_ratio_seed"] = 1
+    with client(config) as (api, app):
+        response = api.post(
+            "/v1/chat/completions",
+            json={
+                "model": "chat-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "tools": TOOLS,
+                "stream": True,
+                "max_tokens": 3,
+            },
+        )
+        assert response.status_code == 200
+        assert len(state["posts"]) == 1
+        assert not app.state.relay_service.registry.snapshot()["active"]
+        if rejected:
+            assert "[DONE]" not in response.text
+            frames = [
+                json.loads(line[6:])
+                for line in response.text.splitlines()
+                if line.startswith("data: ")
+            ]
+            assert len(frames) == 1
+            assert frames[0]["error"]["code"] == "tool_protocol_error"
+            return
+        assert response.text.endswith("data: [DONE]\n\n")
+        choices = [
+            json.loads(line[6:])["choices"][0]
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert [choice["delta"] for choice in choices] == [
+            {"role": "assistant"},
+            {"content": "abc"},
+            {},
+        ]
+        assert [choice["finish_reason"] for choice in choices] == [None, None, "length"]
 
 
 @pytest.mark.parametrize("stream", [False, True])
