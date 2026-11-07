@@ -12,7 +12,7 @@ const RelayConsole = (() => {
     catalog: {revision: null, observed_at: null, runtimes: []}, status: null,
     requests: {active: [], last_completed: null}, view: "models", settingsTab: "generation",
     dirty: false, errors: new Map(), rawFields: new Map(), selectedRow: null,
-    selectedModels: new Set(), endpointIndex: null, exportDraft: null, exportValue: null, poll: null, tailnetDraft: null,
+    selectedModels: new Set(), endpointIndex: null, exportDraft: null, exportValue: null, exportApplying: false, poll: null, tailnetDraft: null,
   };
 
   function optionalValue(target, key, raw, kind = "number") {
@@ -671,9 +671,27 @@ const RelayConsole = (() => {
     $("export-output").value = "";
     $("copy-export").disabled = true;
     $("download-export").disabled = true;
+    clearExportFeedback();
+    updateExportActions();
+  }
+  function clearExportFeedback() {
     $("export-error").hidden = true;
+    $("export-applied").hidden = true;
     $("export-warnings").replaceChildren();
     $("export-warnings").hidden = true;
+  }
+  function updateExportActions() {
+    const draft = state.exportDraft;
+    const unavailable = !draft?.fields.size || Boolean(draft.pending);
+    const generate = $("generate-export");
+    const apply = $("apply-export");
+    generate.disabled = unavailable;
+    apply.hidden = $("export-version").value !== "v2";
+    apply.disabled = unavailable || state.exportApplying;
+    for (const [control, busy] of [[generate, draft?.pending === "generate"], [apply, state.exportApplying]]) {
+      if (busy) control.setAttribute("aria-busy", "true");
+      else control.removeAttribute("aria-busy");
+    }
   }
   function exportTokenField(title, help, value = null) {
     const label = node("label", "", title);
@@ -692,7 +710,7 @@ const RelayConsole = (() => {
   function openExport() {
     const fields = new Map();
     const catalog = state.catalog;
-    state.exportDraft = {catalog, fields, edit: 0, pending: false};
+    state.exportDraft = {catalog, fields, edit: 0, pending: null};
     invalidateExport();
     const settings = $("export-model-settings");
     const defaultModel = $("export-default");
@@ -720,9 +738,7 @@ const RelayConsole = (() => {
     }
     defaultModel.value = fields.size === 1 ? fields.keys().next().value : "";
     defaultModel.disabled = fields.size === 0;
-    const generate = $("generate-export");
-    generate.disabled = fields.size === 0;
-    generate.removeAttribute("aria-busy");
+    updateExportActions();
     $("export-selection").textContent = fields.size
       ? `${fields.size} chat ${fields.size === 1 ? "model" : "models"} to export from ${state.selectedModels.size ? "your selection" : "the observed catalog"}.`
       : "No exportable chat models. Close this dialog and refresh the catalog or change your selection.";
@@ -755,38 +771,56 @@ const RelayConsole = (() => {
     }));
     return {version: $("export-version").value, catalog_revision: draft.catalog.revision, default_model: defaultModel, models};
   }
-  async function generateExport() {
+  async function submitExport(apply = false) {
     const draft = state.exportDraft;
     if (!draft || draft.pending || !draft.fields.size) return;
-    invalidateExport();
+    if (apply && (state.exportApplying || $("export-version").value !== "v2")) return;
+    if (apply) clearExportFeedback();
+    else invalidateExport();
     const edit = draft.edit;
     const current = () => state.exportDraft === draft && draft.edit === edit && $("export-dialog").open;
-    const generate = $("generate-export");
     try {
       const payload = exportPayload(draft);
-      draft.pending = true;
-      generate.disabled = true;
-      generate.setAttribute("aria-busy", "true");
-      const value = await api("/opencode", {method: "POST", body: payload});
+      draft.pending = apply ? "apply" : "generate";
+      if (apply) state.exportApplying = true;
+      updateExportActions();
+      const value = await api(apply ? "/opencode/apply" : "/opencode", {method: "POST", body: payload});
+      if (apply) {
+        const result = value.changed
+          ? `Saved OpenCode V2 settings in ${value.filename}. Reopen OpenCode to load them.`
+          : `${value.filename} already contains these OpenCode V2 settings.`;
+        const message = value.backup ? `${result} Previous settings saved in ${value.backup}.` : result;
+        if (!current()) { notice(message); return; }
+        $("export-applied").textContent = message;
+        $("export-applied").hidden = false;
+      } else if (current()) {
+        state.exportValue = {config: value.config, filename: value.filename || `opencode-relay-${payload.version}.json`};
+        $("export-output").value = JSON.stringify(value.config, null, 2) + "\n";
+        $("copy-export").disabled = false;
+        $("download-export").disabled = false;
+      }
       if (!current()) return;
-      state.exportValue = {config: value.config, filename: value.filename || `opencode-relay-${payload.version}.json`};
-      $("export-output").value = JSON.stringify(value.config, null, 2) + "\n";
-      $("copy-export").disabled = false;
-      $("download-export").disabled = false;
       for (const warning of value.warnings || []) $("export-warnings").append(node("div", "", warning));
       $("export-warnings").hidden = !(value.warnings || []).length;
     } catch (error) {
-      if (!current()) return;
-      $("export-error").textContent = error.status === 409
+      const messages = {
+        relay_opencode_apply_local_only: "Open the relay panel on this computer to apply settings to OpenCode.",
+        relay_opencode_apply_v2_required: "Select OpenCode V2 to apply settings.",
+        relay_opencode_apply_invalid_export: "Refresh the model catalog and reopen this dialog before applying settings.",
+        relay_opencode_config_invalid: "Check the OpenCode configuration file for syntax or settings errors before applying.",
+        relay_opencode_config_conflict: "Review the OpenCode configuration file and its location before trying again.",
+        relay_opencode_config_write_failed: "Check write access to the OpenCode configuration folder, then try again.",
+      };
+      const message = messages[error.code] || (error.status === 409
         ? "A model or the saved settings changed. Close this dialog, refresh the catalog and reopen the export."
-        : error.message;
+        : error.message);
+      if (!current()) { if (apply) notice(message, true); return; }
+      $("export-error").textContent = message;
       $("export-error").hidden = false;
     } finally {
-      draft.pending = false;
-      if (state.exportDraft === draft) {
-        generate.disabled = false;
-        generate.removeAttribute("aria-busy");
-      }
+      draft.pending = null;
+      if (apply) state.exportApplying = false;
+      updateExportActions();
     }
   }
   function downloadExport() {
@@ -828,7 +862,8 @@ const RelayConsole = (() => {
     });
     for (const [id, action] of [["start-tailnet", "start"], ["stop-tailnet", "stop"]]) $(id).addEventListener("click", () => busy($(id), async () => { await api(`/tailnet/${action}`, {method: "POST"}); await refreshLocalState(); notice(action === "start" ? "Helper start requested using saved settings. Refresh the catalog to observe its connections." : "Helper stop completed. Private-network connections do not fall back to direct access."); }));
     $("open-export").addEventListener("click", openExport);
-    $("export-form").addEventListener("submit", (event) => { event.preventDefault(); void generateExport(); });
+    $("export-form").addEventListener("submit", (event) => { event.preventDefault(); void submitExport(); });
+    $("apply-export").addEventListener("click", () => { void submitExport(true); });
     $("export-form").addEventListener("input", invalidateExport);
     $("export-form").addEventListener("change", invalidateExport);
     $("export-dialog").addEventListener("close", () => { state.exportDraft = null; invalidateExport(); });

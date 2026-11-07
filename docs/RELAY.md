@@ -13,7 +13,7 @@ the optional relay, download the wheel from the [latest GitHub release](https://
 and install it with the `relay` extra. You can also install from a source checkout.
 
 ```bash
-python -m pip install './runtime_llama-0.19.0-py3-none-any.whl[relay]'
+python -m pip install './runtime_llama-0.20.0-py3-none-any.whl[relay]'
 # From a source checkout:
 python -m pip install '.[relay]'
 ```
@@ -133,8 +133,18 @@ output is positive and below that context.
 **Generate settings** checks the models and observed context against the
 current remote catalog before creating the JSON. If a model or context
 has changed, refresh the catalog and reopen the export. Copy or download
-the result and merge the generated provider and `model` into your OpenCode
-configuration. The console writes no existing configuration files.
+the result if you want to apply it on another computer or to a project file.
+
+From the loopback console, select V2 and choose **Apply to OpenCode V2** to
+apply those choices directly on the relay host. It runs the same checks
+before updating `providers.llama-relay` and `model` in OpenCode's global
+configuration. Other settings stay in place. The relay keeps a private
+backup of the previous file when it changes an existing configuration.
+The target is the OpenCode config directory selected by `OPENCODE_CONFIG_DIR`
+or the user config directory, normally `~/.config/opencode`. If both files
+exist, the action edits `opencode.jsonc`, which OpenCode loads last.
+Project and managed settings can override the global default. If an open
+OpenCode session still shows older settings, run `opencode reload`.
 
 | OpenCode | Provider shape |
 | --- | --- |

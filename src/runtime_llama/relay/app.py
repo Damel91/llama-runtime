@@ -6,6 +6,7 @@ import asyncio
 from contextlib import asynccontextmanager
 import hmac
 from importlib.resources import files
+from ipaddress import ip_address
 import os
 import secrets
 import time
@@ -214,6 +215,14 @@ def create_app(config_path=None, initial_config=None, service=None):
         ):
             raise RelayError(401, "relay_admin_token_required")
 
+    def is_loopback(host):
+        if host == "localhost":
+            return True
+        try:
+            return ip_address((host or "").strip("[]")).is_loopback
+        except ValueError:
+            return False
+
     def inference_access(request):
         access = service.config_store.snapshot().config["access"]
         key = access.get("api_key")
@@ -379,7 +388,15 @@ def create_app(config_path=None, initial_config=None, service=None):
                 else service.stop_tailnet
             )
             return admin_json(await blocking(request, lambda _cancel: method()))
-        if path == "/api/admin/opencode":
+        if path in {"/api/admin/opencode", "/api/admin/opencode/apply"}:
+            apply = path.endswith("/apply")
+            if apply and not (
+                request.client
+                and is_loopback(request.client.host)
+                and is_loopback(service.listener["host"])
+                and is_loopback(request.url.hostname)
+            ):
+                raise RelayError(403, "relay_opencode_apply_local_only")
             authority_url = str(request.base_url).rstrip("/") + "/v1"
             if request.method == "POST":
                 payload = await body(request)
@@ -387,7 +404,7 @@ def create_app(config_path=None, initial_config=None, service=None):
                     await blocking(
                         request,
                         lambda cancel: service.export_configured_opencode(
-                            payload, authority_url, cancel
+                            payload, authority_url, cancel, apply=apply
                         ),
                     )
                 )

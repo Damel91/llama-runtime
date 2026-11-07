@@ -22,6 +22,7 @@ ADMIN_ROUTES = (
     ("POST", "/api/admin/tailnet/stop"),
     ("GET", "/api/admin/opencode"),
     ("POST", "/api/admin/opencode"),
+    ("POST", "/api/admin/opencode/apply"),
 )
 
 _CONTRACT = {

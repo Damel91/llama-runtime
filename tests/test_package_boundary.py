@@ -52,7 +52,7 @@ def no_runtime_effect(event, args):
 sys.addaudithook(no_runtime_effect)
 before = threading.enumerate()
 import runtime_llama
-assert runtime_llama.__version__ == '0.19.0'
+assert runtime_llama.__version__ == '0.20.0'
 assert threading.enumerate() == before
 """
     environment = dict(os.environ)

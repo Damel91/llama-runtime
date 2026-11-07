@@ -17,6 +17,7 @@ from runtime_llama.errors import LLMBackendError, LLMCancelledError
 from runtime_llama.runtime_discovery import RuntimeEndpoint, discover_runtimes
 from runtime_llama.tailnet import TailnetConfig, TailnetHelper
 from runtime_llama.relay.config import RelayConfigStore
+from runtime_llama.relay.opencode_config import apply_opencode_v2
 from runtime_llama.relay.state import (
     RelayGeneration,
     RelayGenerationManager,
@@ -815,7 +816,9 @@ class RelayService:
         access = self.config_store.snapshot().config["access"]
         return self._opencode_config(version, entries, base_url, access)
 
-    def export_configured_opencode(self, payload, base_url, cancel_event=None):
+    def export_configured_opencode(
+        self, payload, base_url, cancel_event=None, *, apply=False
+    ):
         if not isinstance(payload, dict) or payload.keys() != {
             "version",
             "catalog_revision",
@@ -824,6 +827,8 @@ class RelayService:
         }:
             raise RelayError(400, "relay_opencode_export_shape_invalid")
         version, revision = payload["version"], payload["catalog_revision"]
+        if apply and version != "v2":
+            raise RelayError(400, "relay_opencode_apply_v2_required")
         if version not in ("v1", "v2"):
             raise RelayError(400, "relay_opencode_version_unsupported")
         if type(revision) is not int or revision < 0:
@@ -862,13 +867,22 @@ class RelayService:
             with self._lock:
                 if self.config_store.snapshot().revision != revision:
                     raise RelayError(409, "relay_opencode_catalog_changed")
-                return self._opencode_config(
+                exported = self._opencode_config(
                     version,
                     entries,
                     base_url,
                     operation.snapshot.config["access"],
                     default,
                 )
+                if not apply:
+                    return exported
+                operation.check()
+                config = exported["config"]
+                return {
+                    **apply_opencode_v2(config),
+                    "model": config["model"],
+                    "warnings": exported["warnings"],
+                }
 
     @staticmethod
     def _validate_opencode_limits(limits):

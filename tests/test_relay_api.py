@@ -175,13 +175,15 @@ def native_servers():
 
 
 @contextmanager
-def client(config=None, service=None):
+def client(config=None, service=None, **client_options):
     app = (
         create_app(initial_config=config)
         if service is None
         else create_app(service=service)
     )
-    with TestClient(app, base_url=ORIGIN, raise_server_exceptions=False) as api:
+    with TestClient(
+        app, base_url=ORIGIN, raise_server_exceptions=False, **client_options
+    ) as api:
         yield api, app
     assert app.state.relay_bridges == {}
 
@@ -200,6 +202,96 @@ def token(api):
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
     return {"X-Relay-Admin-Token": response.json()["admin_token"], "Origin": ORIGIN}
+
+
+def test_opencode_apply_only_changes_the_local_provider_and_default(
+    native_servers, tmp_path, monkeypatch
+):
+    url, upstream = native_servers(key="upstream-secret")
+    config = config_for((url, {"api_key": "upstream-secret"}))
+    config["access"]["api_key"] = "private-relay-key"
+    monkeypatch.setenv("OPENCODE_CONFIG_DIR", str(tmp_path))
+    target = tmp_path / "opencode.jsonc"
+    original = '{\n  // Keep these settings\n  "providers": {"other": {"settings": {"apiKey": "other-private-key"}},},\n  "model": "other/default",\n  "permissions": [],\n}\n'
+    target.write_text(original, encoding="utf-8")
+    with client(config, client=("127.0.0.1", 40001)) as (api, _app):
+        headers = token(api)
+        catalog = api.post("/api/admin/catalog/refresh", headers=headers).json()
+        model = catalog["runtimes"][0]["models"][0]["id"]
+        payload = {
+            "version": "v2",
+            "catalog_revision": catalog["revision"],
+            "default_model": model,
+            "models": {
+                model: {"observed_context": 2048, "context": 2048, "output": 512}
+            },
+        }
+        preview = api.post("/api/admin/opencode", headers=headers, json=payload)
+        assert preview.status_code == 200 and target.read_text() == original
+        response = api.post("/api/admin/opencode/apply", headers=headers, json=payload)
+        assert response.status_code == 200
+        value = response.json()
+        assert value["changed"] and value["model"] == "llama-relay/" + model
+        assert value["filename"] == target.name
+        assert (tmp_path / value["backup"]).read_text() == original
+        assert not any(
+            key in response.text
+            for key in ("other-private-key", "private-relay-key", "upstream-secret")
+        )
+        written = target.read_text()
+        assert all(
+            segment in written
+            for segment in (
+                "// Keep these settings",
+                "other-private-key",
+                '"permissions": []',
+                '"apiKey": "{env:LLAMA_RELAY_API_KEY}"',
+                '"output": 512',
+                '"baseURL": "' + ORIGIN + '/v1"',
+            )
+        )
+        repeated = api.post("/api/admin/opencode/apply", headers=headers, json=payload)
+        assert repeated.status_code == 200 and repeated.json()["changed"] is False
+        assert target.read_text() == written
+
+        payload["models"][model] = {
+            "observed_context": 4096,
+            "context": 4096,
+            "output": 512,
+        }
+        stale = api.post("/api/admin/opencode/apply", headers=headers, json=payload)
+        assert stale.status_code == 409
+        assert stale.json()["error"]["code"] == "relay_opencode_context_changed"
+        assert target.read_text() == written and not upstream["posts"]
+
+
+@pytest.mark.parametrize(
+    "listener,peer,status,code",
+    [
+        ("127.0.0.1", "192.0.2.12", 403, "relay_opencode_apply_local_only"),
+        ("0.0.0.0", "127.0.0.1", 403, "relay_opencode_apply_local_only"),
+        ("127.0.0.1", "127.0.0.1", 400, "relay_opencode_apply_v2_required"),
+    ],
+)
+def test_opencode_apply_requires_loopback_and_v2(
+    listener, peer, status, code, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OPENCODE_CONFIG_DIR", str(tmp_path))
+    config = default_config()
+    config["listener"]["host"] = listener
+    with client(config, client=(peer, 40001)) as (api, _app):
+        path = "/api/admin/opencode/apply"
+        payload = {
+            "version": "v1",
+            "catalog_revision": 0,
+            "default_model": "chat",
+            "models": {},
+        }
+        assert api.post(path, json=payload).status_code == 401
+        response = api.post(path, json=payload, headers=token(api))
+        assert response.status_code == status
+        assert response.json()["error"]["code"] == code
+        assert not list(tmp_path.iterdir())
 
 
 @pytest.mark.parametrize(
