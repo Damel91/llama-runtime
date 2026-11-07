@@ -9,11 +9,11 @@ runtime builds and hardware.
 ## Install and connect
 
 The base distribution keeps the existing `runtime_llama` imports. To install
-the optional relay, use the extra with the 0.18.0 wheel, or install from a
-checkout that contains the relay.
+the optional relay, download the wheel from the [latest GitHub release](https://github.com/Damel91/llama-runtime/releases/latest)
+and install it with the `relay` extra. You can also install from a source checkout.
 
 ```bash
-python -m pip install 'runtime_llama-0.18.0-py3-none-any.whl[relay]'
+python -m pip install './runtime_llama-0.19.0-py3-none-any.whl[relay]'
 # From a source checkout:
 python -m pip install '.[relay]'
 ```
