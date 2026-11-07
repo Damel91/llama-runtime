@@ -38,6 +38,9 @@ from runtime_llama.relay.protocol import (
 from runtime_llama.relay.service import RelayService
 
 
+_SSE_KEEPALIVE_SECONDS = 15.0
+
+
 class _SafeErrors:
     """Map failures before Starlette's generic error handler re-raises to logs.
 
@@ -87,6 +90,29 @@ class _RelayStream(Response):
         self.bridge, self.projection, self.cleanup = bridge, projection, cleanup
 
     async def __call__(self, scope, receive, send):
+        async def send_chunk(chunk):
+            await send({"type": "http.response.body", "body": chunk, "more_body": True})
+
+        async def next_event():
+            if self.projection.finished:
+                return await anext(self.bridge)
+            # A keepalive timeout must not cancel the SDK invocation or
+            # start another read from the bridge.
+            pending = asyncio.create_task(anext(self.bridge))
+            try:
+                while not pending.done():
+                    ready, _ = await asyncio.wait(
+                        (pending,), timeout=_SSE_KEEPALIVE_SECONDS
+                    )
+                    if not ready:
+                        await send_chunk(b": keep-alive\n\n")
+            except BaseException:
+                if not pending.done():
+                    pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+                raise
+            return pending.result()
+
         async def stream():
             await send(
                 {
@@ -95,28 +121,19 @@ class _RelayStream(Response):
                     "headers": self.raw_headers,
                 }
             )
+            await send_chunk(b": relay connected\n\n")
             try:
-                async for event in self.bridge:
+                while True:
+                    try:
+                        event = await next_event()
+                    except StopAsyncIteration:
+                        break
                     for chunk in self.projection.consume(event):
-                        await send(
-                            {
-                                "type": "http.response.body",
-                                "body": chunk,
-                                "more_body": True,
-                            }
-                        )
+                        await send_chunk(chunk)
                 if not self.projection.finished:
                     raise RelayError(502, "relay_stream_ended_without_terminal")
-            except asyncio.CancelledError:
-                raise
             except Exception as error:
-                await send(
-                    {
-                        "type": "http.response.body",
-                        "body": sse(map_error(error).payload()),
-                        "more_body": True,
-                    }
-                )
+                await send_chunk(sse(map_error(error).payload()))
             await send({"type": "http.response.body", "body": b"", "more_body": False})
 
         async def disconnected():

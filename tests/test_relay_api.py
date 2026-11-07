@@ -761,10 +761,11 @@ def test_embedding_direct_http_order_prefix_and_no_tokenizer(native_servers):
 class ControlledService(RelayService):
     """Owned SDK-work stand-in for ASGI disconnect/backpressure tests only."""
 
-    def __init__(self, *, first_event=False):
+    def __init__(self, *, first_event=False, first_event_gate=None):
         super().__init__()
         self.started, self.release, self.stopped = Event(), Event(), Event()
         self.first_event = first_event
+        self.first_event_gate = first_event_gate
 
     def chat(self, request, *, emit=None, cancel_event=None, request_id=None):
         with self._operation(
@@ -773,6 +774,9 @@ class ControlledService(RelayService):
             self.started.set()
             try:
                 if emit and self.first_event:
+                    if self.first_event_gate is not None:
+                        while not self.first_event_gate.wait(0.002):
+                            operation.check()
                     for _ in range(3):
                         emit(LLMStreamEvent("content", "fixture"))
                 while not self.release.wait(0.002):
@@ -823,11 +827,57 @@ async def invoke(app, *, stream, messages, sent, send_block=None):
         if (
             send_block is not None
             and message["type"] == "http.response.body"
-            and message.get("body")
+            and message.get("body", b"").startswith(b"data: ")
         ):
             await send_block.wait()
 
     await app(scope, messages.get, send)
+
+
+def test_sse_opens_and_keeps_idle_without_cancelling_or_buffering_data(monkeypatch):
+    monkeypatch.setattr("runtime_llama.relay.app._SSE_KEEPALIVE_SECONDS", 0.01)
+
+    async def scenario():
+        first_event_gate = Event()
+        service = ControlledService(first_event=True, first_event_gate=first_event_gate)
+        app = create_app(service=service)
+        messages, sent = asyncio.Queue(), []
+        task = asyncio.create_task(
+            invoke(app, stream=True, messages=messages, sent=sent)
+        )
+
+        def bodies():
+            return [message["body"] for message in sent if "body" in message]
+
+        try:
+            await until(lambda: bodies().count(b": keep-alive\n\n") >= 2)
+            assert sent[0]["type"] == "http.response.start"
+            assert dict(sent[0]["headers"])[b"content-type"].startswith(
+                b"text/event-stream"
+            )
+            assert bodies()[0] == b": relay connected\n\n"
+            assert all(body.startswith(b":") for body in bodies())
+            assert not service.stopped.is_set()
+
+            first_event_gate.set()
+            await until(
+                lambda: any(b'"content":"fixture"' in body for body in bodies())
+            )
+            assert not service.stopped.is_set()
+            assert b"data: [DONE]\n\n" not in bodies()
+
+            service.release.set()
+            await asyncio.wait_for(task, 3)
+            assert bodies()[-2:] == [b"data: [DONE]\n\n", b""]
+            assert service.stopped.is_set()
+            assert app.state.relay_bridges == {}
+        finally:
+            first_event_gate.set()
+            service.release.set()
+            await asyncio.gather(task, return_exceptions=True)
+            service.close()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("stream", [False, True])
@@ -872,6 +922,15 @@ def test_stop_interrupts_backpressured_send_and_does_not_cancel_sibling():
         ]
         try:
             await until(lambda: len(service.registry.snapshot()["active"]) == 2)
+            await until(
+                lambda: all(
+                    any(
+                        message.get("body", b"").startswith(b"data: ")
+                        for message in out
+                    )
+                    for out in sent
+                )
+            )
             identifier = service.registry.snapshot()["active"][0]["request_id"]
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=app), base_url=ORIGIN

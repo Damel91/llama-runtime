@@ -80,15 +80,17 @@ header if you configured an inference key.
 
 ```bash
 curl http://127.0.0.1:8088/v1/models
-curl http://127.0.0.1:8088/v1/chat/completions \
+curl --no-buffer http://127.0.0.1:8088/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"chat-model","messages":[{"role":"user","content":"Explain this change."}],"stream":false}'
+  -d '{"model":"chat-model","messages":[{"role":"user","content":"Explain this change."}],"stream":true}'
 curl http://127.0.0.1:8088/v1/embeddings \
   -H 'Content-Type: application/json' \
   -d '{"model":"embedding-model","input":["first text","second text"],"input_type":"document"}'
 ```
 
-For chat, set `stream: true` to receive SSE. Ordinary text streams
+For chat, set `stream: true` to receive `text/event-stream`. The relay sends
+an opening SSE comment and a keepalive comment about every 15 seconds while
+it waits for events. SSE clients ignore comments. Ordinary text streams
 progressively. With declared tools the SDK stages each proposal until it can
 validate it, then emits the accepted content and tool calls. A safely
 recoverable rejection may trigger up to three corrections after the initial
