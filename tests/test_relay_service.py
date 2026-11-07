@@ -33,6 +33,7 @@ from runtime_llama.usage import LLMCallResult, LLMStreamEvent
 
 from test_tool_recovery import SequenceClient, TOOLS, rejected, valid
 from test_embedding_explicit_direct import NativeClient
+from test_generation import _chunk
 
 
 def observe(identifier, *, chat=True, embedding=False, verified=False, state="loaded"):
@@ -97,7 +98,12 @@ def config(**changes):
 
 
 def test_relay_calls_actual_sdk_recovery_once_and_hides_rejected_attempt():
-    client = SequenceClient([rejected(), valid()])
+    attempt = [
+        _chunk(content=" \n<tool_"),
+        _chunk(content="call><function=write>not executed</tool_call>"),
+        *rejected()[1:],
+    ]
+    client = SequenceClient([attempt, valid()])
     seen = []
 
     def factory(profile):

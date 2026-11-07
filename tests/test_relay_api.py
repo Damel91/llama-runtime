@@ -871,6 +871,38 @@ def test_tool_sse_visible_cap_withholds_unconfirmed_calls(native_servers, reject
         assert [choice["finish_reason"] for choice in choices] == [None, None, "length"]
 
 
+def test_tool_sse_preserves_accepted_literal_tool_markup(native_servers):
+    prefix, suffix = "<tool_", "call>literal example</tool_call>"
+    url, state = native_servers(
+        responses=lambda _index, _request: [
+            _chunk(content=prefix),
+            _chunk(content=suffix),
+            _chunk(finish="stop"),
+        ]
+    )
+    with client(config_for((url, {}))) as (api, _app):
+        response = api.post(
+            "/v1/chat/completions",
+            json={
+                "model": "chat-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "tools": TOOLS,
+                "stream": True,
+            },
+        )
+    assert response.status_code == 200
+    choices = [
+        json.loads(line[6:])["choices"][0]
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    assert (
+        "".join(choice["delta"].get("content", "") for choice in choices)
+        == prefix + suffix
+    )
+    assert choices[-1]["finish_reason"] == "stop" and len(state["posts"]) == 1
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_native_error_is_not_success_or_retried(native_servers, stream):
     url, state = native_servers(responses=lambda _i, _r: 500)

@@ -96,6 +96,7 @@ _MESSAGE_FIELDS = (
     "reasoning_content",
 )
 _GUARDED_TOOL_TEXT = "_guarded_tool_text"
+_TOOL_CALL_OPEN = "<tool_call>"
 
 
 @dataclass
@@ -922,7 +923,9 @@ class LlamaCppAdapter(LLMAdapter):
             )
         )
         text_published = False
-        leading_whitespace: List[str] = []
+        leading_chunks: List[str] = []
+        leading_marker = ""
+        tool_markup = False
 
         def native_cancelled() -> bool:
             # The native request owns its interruption even with a borrowed
@@ -946,17 +949,29 @@ class LlamaCppAdapter(LLMAdapter):
             )
 
         def project_guarded(chunks, *, publish):
-            nonlocal text_published
+            nonlocal text_published, leading_marker, tool_markup
             for chunk in chunks:
-                if not publish:
+                if not publish or tool_markup:
                     continue
-                if not text_published and not chunk.strip():
-                    leading_whitespace.append(chunk)
-                    continue
+                if not text_published:
+                    candidate = leading_marker + (
+                        chunk if leading_marker else chunk.lstrip()
+                    )
+                    if candidate.startswith(_TOOL_CALL_OPEN):
+                        # A backend can report rejection after a tool envelope
+                        # was emitted as text. Hold it for native evidence, but
+                        # still replay accepted XML as ordinary text.
+                        tool_markup = True
+                        leading_chunks.clear()
+                        continue
+                    if _TOOL_CALL_OPEN.startswith(candidate):
+                        leading_marker = candidate
+                        leading_chunks.append(chunk)
+                        continue
                 check_cancelled()
-                if leading_whitespace:
-                    chunk = "".join(leading_whitespace) + chunk
-                    leading_whitespace.clear()
+                if leading_chunks:
+                    chunk = "".join(leading_chunks) + chunk
+                    leading_chunks.clear()
                 text_published = True
                 yield LLMStreamEvent(kind=_GUARDED_TOOL_TEXT, text=chunk)
 
@@ -995,7 +1010,9 @@ class LlamaCppAdapter(LLMAdapter):
             for index in range(4):
                 check_cancelled()
                 staged.clear()
-                leading_whitespace.clear()
+                leading_chunks.clear()
+                leading_marker = ""
+                tool_markup = False
                 terminal = None
                 local_cap = False
                 native_rejected = False
@@ -1167,7 +1184,7 @@ class LlamaCppAdapter(LLMAdapter):
             raise
         finally:
             staged.clear()
-            leading_whitespace.clear()
+            leading_chunks.clear()
             history.clear()
 
     @staticmethod

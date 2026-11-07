@@ -93,6 +93,8 @@ an opening SSE comment and a keepalive comment about every 15 seconds while
 it waits for events. SSE clients ignore comments. For plain-text chat, visible
 text streams as it is generated, including when the request declares tools.
 The relay stages reasoning and tool fragments until it validates the proposal.
+Text starting with the native `<tool_call>` marker waits for validation as
+well. An accepted literal example is returned as text.
 Before any visible text, a recoverable rejection can trigger up to three
 corrections on the same route. After visible text, a rejected tool proposal
 ends the stream with a tool protocol error. The client keeps the partial text
