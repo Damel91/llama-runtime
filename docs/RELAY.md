@@ -13,7 +13,7 @@ the optional relay, download the wheel from the [latest GitHub release](https://
 and install it with the `relay` extra. You can also install from a source checkout.
 
 ```bash
-python -m pip install './runtime_llama-0.20.0-py3-none-any.whl[relay]'
+python -m pip install './runtime_llama-0.20.1-py3-none-any.whl[relay]'
 # From a source checkout:
 python -m pip install '.[relay]'
 ```
