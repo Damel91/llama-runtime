@@ -1073,6 +1073,20 @@ class LlamaCppAdapter(LLMAdapter):
                     error.tool_recovery = report()
                     if diagnostic is not None:
                         error.thinking_diagnostic = diagnostic
+                    if repairing_committed and isinstance(
+                        error, (LLMBackendError, LLMTimeoutError, LLMRunawayError)
+                    ):
+                        # A failed private repair must not make the client
+                        # replay a turn that has already shown text.
+                        failure = LLMToolRecoveryError(
+                            "tool_recovery_incomplete",
+                            tool_recovery=error.tool_recovery,
+                            diagnostics=attempts[-1].transport,
+                            content_already_streamed=True,
+                        )
+                        if diagnostic is not None:
+                            failure.thinking_diagnostic = diagnostic
+                        raise failure from error
                     raise
 
                 check_cancelled()

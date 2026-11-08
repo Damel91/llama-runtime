@@ -841,7 +841,13 @@ def test_tool_recovery_after_prose_depends_on_output_mode(native_servers, mode):
 
 @pytest.mark.parametrize(
     ("failure", "posts"),
-    [("no-tool", 4), ("server-mcp", 1), ("repair-server-mcp", 2), ("incomplete", 2)],
+    [
+        ("no-tool", 4),
+        ("server-mcp", 1),
+        ("repair-server-mcp", 2),
+        ("incomplete", 2),
+        ("early-eof", 2),
+    ],
 )
 def test_late_tool_recovery_failure_keeps_committed_prose(
     native_servers, failure, posts
@@ -850,6 +856,8 @@ def test_late_tool_recovery_failure_keeps_committed_prose(
 
     def responses(index, _request):
         if index:
+            if failure == "early-eof":
+                return [_chunk(content="PRIVATE-REPLACEMENT")]
             if failure == "repair-server-mcp":
                 return [
                     _chunk(tools=[inspect_delta("private-repair", '{"key":"ok"}')]),
