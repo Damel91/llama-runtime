@@ -364,9 +364,10 @@ def map_error(error: BaseException) -> RelayError:
     if isinstance(error, LLMTimeoutError):
         return RelayError(504, "relay_upstream_timeout")
     if isinstance(error, LLMToolRecoveryError):
-        # A client must keep the published prefix rather than auto-retry it.
-        status = 422 if error.content_already_streamed else 502
-        return RelayError(status, error.terminal_reason)
+        if error.content_already_streamed:
+            # Clients can keep the published prefix without retrying the turn.
+            return RelayError(422, "tool_protocol_error")
+        return RelayError(502, error.terminal_reason)
     if isinstance(error, LLMRunawayError):
         return RelayError(502, "relay_runaway_generation")
     if isinstance(error, (ValueError, TypeError)):

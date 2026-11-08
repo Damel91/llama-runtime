@@ -211,6 +211,7 @@ class ToolRecoveryPolicy:
         terminal: LLMStreamEvent | None,
         *,
         secrets: Sequence[str] = (),
+        continuation: bool = False,
     ) -> ToolRecoveryDecision:
         reasons: list[str] = []
         fatal: list[str] = []
@@ -352,6 +353,9 @@ class ToolRecoveryPolicy:
         if self._choice == "required" and not calls:
             reasons.append("required_tool_call_missing")
             provenance.append("sdk_tool_choice")
+        if continuation and self._choice == "auto" and not calls:
+            reasons.append("repair_tool_call_missing")
+            provenance.append("sdk_tool_choice")
         if self._choice == "specific" and (
             not names or any(name != self._specific_name for name in names)
         ):
@@ -367,7 +371,7 @@ class ToolRecoveryPolicy:
         ):
             reasons.append("tool_finish_without_calls")
             provenance.append("sdk_completed_tool_call")
-        if server_activity and reasons:
+        if server_activity and (reasons or continuation):
             fatal.append("server_side_tool_effects_possible")
         all_reasons = tuple(dict.fromkeys([*fatal, *reasons]))
         return ToolRecoveryDecision(
@@ -383,13 +387,16 @@ class ToolRecoveryPolicy:
         self,
         events: Sequence[LLMStreamEvent],
         decision: ToolRecoveryDecision,
+        *,
+        published_text: str | None = None,
     ) -> list[dict[str, str]]:
         """Produce SDK feedback, never executable or fabricated tool results.
 
         The rejected proposal is retained by the invocation owner for explicit
         inspection. It is not promoted to an assistant tool call, and none of
         its calls is said to have executed. Only fixed reason codes and the
-        trusted declared names are included in the feedback.
+        trusted declared names are included in the feedback. A committed
+        continuation carries its already public text as an assistant message.
         """
         if not self.enabled or not decision.recoverable or decision.server_activity:
             raise ValueError(
@@ -403,6 +410,7 @@ class ToolRecoveryPolicy:
             if self._choice == "specific"
             else "At least one declared tool call is required."
             if self._choice == "required"
+            or (published_text is not None and self._choice == "auto")
             else "Do not call any tool."
             if self._choice == "none"
             else "A normal response or valid declared tool calls are allowed."
@@ -417,10 +425,23 @@ class ToolRecoveryPolicy:
             f"Declared names: {json.dumps(self.declared_names, ensure_ascii=False)}. "
             f"Protocol failures: {json.dumps(decision.reasons)}. {required}"
         )
+        if published_text is not None:
+            continuation = (
+                "End this turn without a tool call."
+                if self._choice == "none"
+                else "Complete only the pending tool proposal."
+            )
+            feedback += (
+                " The preceding assistant text is already visible and remains in"
+                f" this turn. {continuation} Do not repeat, replace or append to"
+                " that text."
+            )
         return [
             {
                 "role": "assistant",
-                "content": "My preceding generated tool proposal was not accepted or executed.",
+                "content": published_text
+                if published_text is not None
+                else "My preceding generated tool proposal was not accepted or executed.",
             },
             {"role": "user", "content": feedback},
         ]

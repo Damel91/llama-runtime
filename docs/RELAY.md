@@ -95,10 +95,12 @@ text streams as it is generated, including when the request declares tools.
 The relay stages reasoning and tool fragments until it validates the proposal.
 Text starting with the native `<tool_call>` marker waits for validation as
 well. An accepted literal example is returned as text.
-Before any visible text, a recoverable rejection can trigger up to three
-corrections on the same route. After visible text, a rejected tool proposal
-ends the stream with a tool protocol error. The client keeps the partial text
-and receives no executable tool fragment from that proposal.
+A recoverable rejection can trigger up to three corrections on the same route.
+After visible text, the relay keeps that text and repairs the pending tool
+proposal in the same SSE response. The client receives validated tool calls
+and keeps its original text. Corrective prose and reasoning stay private. If
+repair cannot complete safely or the budget is exhausted, the stream ends with
+a tool protocol error and the client retains the visible text.
 
 The client executes validated tools, retains tool call IDs and submits results
 in subsequent messages. JSON responses and structured output with declared

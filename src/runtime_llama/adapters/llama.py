@@ -922,7 +922,7 @@ class LlamaCppAdapter(LLMAdapter):
                 and response_format.get("type") == "text"
             )
         )
-        text_published = False
+        published_chunks: List[str] = []
         leading_chunks: List[str] = []
         leading_marker = ""
         tool_markup = False
@@ -949,11 +949,11 @@ class LlamaCppAdapter(LLMAdapter):
             )
 
         def project_guarded(chunks, *, publish):
-            nonlocal text_published, leading_marker, tool_markup
+            nonlocal leading_marker, tool_markup
             for chunk in chunks:
                 if not publish or tool_markup:
                     continue
-                if not text_published:
+                if not published_chunks:
                     candidate = leading_marker + (
                         chunk if leading_marker else chunk.lstrip()
                     )
@@ -972,7 +972,7 @@ class LlamaCppAdapter(LLMAdapter):
                 if leading_chunks:
                     chunk = "".join(leading_chunks) + chunk
                     leading_chunks.clear()
-                text_published = True
+                published_chunks.append(chunk)
                 yield LLMStreamEvent(kind=_GUARDED_TOOL_TEXT, text=chunk)
 
         def snapshot(index, outcome, decision=None, diagnostic=None, error=None):
@@ -1009,6 +1009,8 @@ class LlamaCppAdapter(LLMAdapter):
         try:
             for index in range(4):
                 check_cancelled()
+                repairing_committed = bool(published_chunks)
+                publish_text = stream_text and not repairing_committed
                 staged.clear()
                 leading_chunks.clear()
                 leading_marker = ""
@@ -1038,7 +1040,7 @@ class LlamaCppAdapter(LLMAdapter):
                             if event.kind == "terminal":
                                 terminal = event
                             if (
-                                stream_text
+                                publish_text
                                 and event.kind == "tool_diagnostic"
                                 and event.data
                                 and event.data.get("strata_rejected_tool_calls", [])
@@ -1047,13 +1049,13 @@ class LlamaCppAdapter(LLMAdapter):
                                 native_rejected = True
                             yield from project_guarded(
                                 guard.consume(event),
-                                publish=stream_text and not native_rejected,
+                                publish=publish_text and not native_rejected,
                             )
                             if guard.visible_limit_reached:
                                 local_cap = True
                                 break
                         yield from project_guarded(
-                            guard.finish(), publish=stream_text and not native_rejected
+                            guard.finish(), publish=publish_text and not native_rejected
                         )
                         local_cap = local_cap or guard.visible_limit_reached
                     finally:
@@ -1075,7 +1077,10 @@ class LlamaCppAdapter(LLMAdapter):
 
                 check_cancelled()
                 decision = policy.classify(
-                    staged, terminal, secrets=self._diagnostic_secrets
+                    staged,
+                    None if repairing_committed and local_cap else terminal,
+                    secrets=self._diagnostic_secrets,
+                    continuation=repairing_committed,
                 )
                 incomplete = terminal is not None and terminal.terminal_reason in {
                     "length_cap",
@@ -1084,7 +1089,9 @@ class LlamaCppAdapter(LLMAdapter):
                 }
                 # A partial answer is useful unless the native stream already
                 # identified the proposal as rejected in progressive mode.
-                if (local_cap or incomplete) and not native_rejected:
+                if (local_cap or incomplete) and not (
+                    native_rejected or repairing_committed
+                ):
                     reason = (
                         "visible_output_cap" if local_cap else terminal.terminal_reason
                     )
@@ -1125,6 +1132,11 @@ class LlamaCppAdapter(LLMAdapter):
                     attempts.append(snapshot(index, "accepted", decision))
                     current_report = report()
                     for event in staged:
+                        if repairing_committed and event.kind in {
+                            "content",
+                            "reasoning",
+                        }:
+                            continue
                         check_cancelled()
                         yield replace(event, tool_recovery=current_report)
                     return
@@ -1135,7 +1147,7 @@ class LlamaCppAdapter(LLMAdapter):
                     thinking_diagnostics,
                     thinking_sink,
                 )
-                can_correct = decision.recoverable and not text_published
+                can_correct = decision.recoverable
                 attempts.append(
                     snapshot(
                         index,
@@ -1154,13 +1166,20 @@ class LlamaCppAdapter(LLMAdapter):
                         tool_recovery=current_report,
                         last_proposal=self._recovery_proposal(staged),
                         diagnostics=attempts[-1].transport,
-                        content_already_streamed=text_published,
+                        content_already_streamed=bool(published_chunks),
                     )
                     if diagnostic is not None:
                         error.thinking_diagnostic = diagnostic
                     raise error
                 check_cancelled()
-                history.extend(policy.correction_messages(staged, decision))
+                if published_chunks:
+                    # Each repair starts from the original conversation plus
+                    # the exact text the client already saw, once.
+                    history = body["messages"] + policy.correction_messages(
+                        staged, decision, published_text="".join(published_chunks)
+                    )
+                else:
+                    history.extend(policy.correction_messages(staged, decision))
                 staged.clear()
                 yield LLMStreamEvent(
                     kind="tool_recovery",
@@ -1184,6 +1203,7 @@ class LlamaCppAdapter(LLMAdapter):
             raise
         finally:
             staged.clear()
+            published_chunks.clear()
             leading_chunks.clear()
             history.clear()
 

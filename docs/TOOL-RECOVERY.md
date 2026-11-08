@@ -73,9 +73,11 @@ regenerated as a whole only because none of its proposed calls was released.
 
 The [HTTP relay](RELAY.md#http-contract) opts into progressive visible text
 for plain-text SSE. Tool fragments and reasoning still wait for validation.
-If validation fails after visible text was published, the relay reports a
-terminal error so the client can retain the partial text without a replacement
-generation in the same request.
+After a recoverable rejection, corrections use the already visible text as
+private assistant context and publish only validated tool calls. The original
+text is delivered once. The same correction budget and original tool choice
+apply. For automatic tool choice, a tool-free rewrite cannot complete a pending
+repair. An unsafe or exhausted repair ends the stream with a tool protocol error.
 
 Ordinary requests without declared tools retain progressive streaming. An
 explicit nonempty or malformed native rejection marker is an exception: it

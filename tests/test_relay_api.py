@@ -713,35 +713,51 @@ def test_sse_recovery_stages_rejected_reasoning_and_budget_resets(native_servers
         )
 
 
-@pytest.mark.parametrize("mode", ["json", "structured-sse", "text-sse"])
+def inspect_delta(identifier, arguments, *, index=0):
+    return {
+        "index": index,
+        "id": identifier,
+        "type": "function",
+        "function": {"name": "inspect", "arguments": arguments},
+    }
+
+
+@pytest.mark.parametrize(
+    "mode", ["json", "structured-sse", "text-sse", "text-sse-none"]
+)
 def test_tool_recovery_after_prose_depends_on_output_mode(native_servers, mode):
     structured = mode == "structured-sse"
+    progressive = mode.startswith("text-sse")
+    choice = "none" if mode == "text-sse-none" else "auto"
     committed = '{"answer":"unvalidated"}' if structured else "committed answer"
     corrected = '{"answer":"corrected"}' if structured else "corrected answer"
+    accepted = inspect_delta("accepted-call", '{"key":"ok"}')
 
     def responses(index, _request):
         if index:
-            return [_chunk(content=corrected), _chunk(finish="stop")]
+            if not progressive:
+                return [_chunk(content=corrected), _chunk(finish="stop")]
+            return [
+                _chunk(content=corrected),
+                _chunk(reasoning="PRIVATE-CORRECTION-REASONING"),
+                *([_chunk(tools=[accepted])] if choice == "auto" else []),
+                _chunk(finish="tool_calls" if choice == "auto" else "stop"),
+            ]
+        text = (
+            [_chunk(content="committed "), _chunk(content="answer")]
+            if progressive
+            else [_chunk(content=committed)]
+        )
         return [
-            _chunk(content=committed),
+            *text,
             _chunk(reasoning="PRIVATE-REJECTED-REASONING"),
             _chunk(
                 tools=[
-                    {
-                        "index": 0,
-                        "id": "private-rejected-call",
-                        "type": "function",
-                        "function": {"name": "wrong", "arguments": '{"key":"x"}'},
-                    }
+                    inspect_delta("private-rejected-call", '{"wrong_key":"x"}'),
+                    inspect_delta("private-mixed-call", '{"key":"y"}', index=1),
                 ]
             ),
             _chunk(finish="tool_calls"),
-            {
-                "choices": [],
-                "strata_rejected_tool_calls": [
-                    {"name": "wrong", "reason": "undeclared"}
-                ],
-            },
         ]
 
     url, state = native_servers(responses=responses)
@@ -749,6 +765,7 @@ def test_tool_recovery_after_prose_depends_on_output_mode(native_servers, mode):
         "model": "chat-model",
         "messages": [{"role": "user", "content": "fixture"}],
         "tools": TOOLS,
+        "tool_choice": choice,
         "stream": mode != "json",
     }
     if structured:
@@ -758,12 +775,15 @@ def test_tool_recovery_after_prose_depends_on_output_mode(native_servers, mode):
         assert response.status_code == 200, response.text
         assert "PRIVATE-REJECTED-REASONING" not in response.text
         assert "private-rejected-call" not in response.text
+        assert "private-mixed-call" not in response.text
         snapshot = app.state.relay_service.registry.snapshot()
         assert snapshot["active"] == []
         summary = snapshot["last_completed"]
-        if mode != "text-sse":
-            assert summary["corrections_used"] == 1
-            assert len(state["posts"]) == 2
+        assert summary["status"] == "completed"
+        assert summary["corrections_used"] == 1
+        assert "tool_arguments_schema_mismatch" in summary["reasons"]
+        assert len(state["posts"]) == 2
+        if not progressive:
             if structured:
                 frames = [
                     json.loads(line[6:])
@@ -785,23 +805,108 @@ def test_tool_recovery_after_prose_depends_on_output_mode(native_servers, mode):
                 assert committed not in response.text
             return
 
+        assert "PRIVATE-CORRECTION-REASONING" not in response.text
+        assert corrected not in response.text
+        assert response.text.endswith("data: [DONE]\n\n")
+        frames = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert (
+            len({(frame["id"], frame["created"], frame["model"]) for frame in frames})
+            == 1
+        )
+        chunks = [frame["choices"][0] for frame in frames]
+        assert [chunk["delta"] for chunk in chunks] == [
+            {"role": "assistant"},
+            {"content": "committed "},
+            {"content": "answer"},
+            *([{"tool_calls": [accepted]}] if choice == "auto" else []),
+            {},
+        ]
+        assert all(chunk["finish_reason"] is None for chunk in chunks[:-1])
+        assert chunks[-1]["finish_reason"] == (
+            "tool_calls" if choice == "auto" else "stop"
+        )
+        original, retry = [body for _, body, _ in state["posts"]]
+        assert original["messages"] == payload["messages"]
+        assert retry["messages"][: len(original["messages"])] == original["messages"]
+        assert retry["messages"].count({"role": "assistant", "content": committed}) == 1
+        assert all("tool_calls" not in message for message in retry["messages"])
+        assert {key: value for key, value in retry.items() if key != "messages"} == {
+            key: value for key, value in original.items() if key != "messages"
+        }
+
+
+@pytest.mark.parametrize(
+    ("failure", "posts"),
+    [("no-tool", 4), ("server-mcp", 1), ("repair-server-mcp", 2), ("incomplete", 2)],
+)
+def test_late_tool_recovery_failure_keeps_committed_prose(
+    native_servers, failure, posts
+):
+    committed = "committed answer"
+
+    def responses(index, _request):
+        if index:
+            if failure == "repair-server-mcp":
+                return [
+                    _chunk(tools=[inspect_delta("private-repair", '{"key":"ok"}')]),
+                    {"choices": [], "strata_mcp": {"event": "call"}},
+                    _chunk(finish="tool_calls"),
+                ]
+            return [
+                _chunk(content="PRIVATE-REPLACEMENT"),
+                _chunk(finish="length" if failure == "incomplete" else "stop"),
+            ]
+        return [
+            _chunk(content=committed),
+            _chunk(tools=[inspect_delta("private-rejected-call", '{"wrong_key":"x"}')]),
+            *(
+                [{"choices": [], "strata_mcp": {"event": "call"}}]
+                if failure == "server-mcp"
+                else []
+            ),
+            _chunk(finish="tool_calls"),
+        ]
+
+    url, state = native_servers(responses=responses)
+    payload = {
+        "model": "chat-model",
+        "messages": [{"role": "user", "content": "fixture"}],
+        "tools": TOOLS,
+        "stream": True,
+    }
+    with client(config_for((url, {}))) as (api, app):
+        response = api.post("/v1/chat/completions", json=payload)
+        assert response.status_code == 200
         assert "[DONE]" not in response.text
+        assert "PRIVATE-REPLACEMENT" not in response.text
+        assert "private-rejected-call" not in response.text
         frames = [
             json.loads(line[6:])
             for line in response.text.splitlines()
             if line.startswith("data: ")
         ]
-        assert frames[-1]["error"]["code"] == "tool_protocol_error"
+        assert len(frames) == 3
         assert frames[-1]["error"]["type"] == "invalid_request_error"
-        deltas = [frame["choices"][0] for frame in frames[:-1]]
-        assert [choice["delta"] for choice in deltas] == [
+        assert frames[-1]["error"]["code"] == "tool_protocol_error"
+        chunks = [frame["choices"][0] for frame in frames[:-1]]
+        assert [chunk["delta"] for chunk in chunks] == [
             {"role": "assistant"},
             {"content": committed},
         ]
-        assert all(choice["finish_reason"] is None for choice in deltas)
-        assert summary["status"] == "failed"
-        assert summary["error_code"] == "tool_protocol_error"
-        assert len(state["posts"]) == 1
+        assert all(chunk["finish_reason"] is None for chunk in chunks)
+        assert len(state["posts"]) == posts
+        for _, body, _ in state["posts"][1:]:
+            assert (
+                body["messages"].count({"role": "assistant", "content": committed}) == 1
+            )
+        snapshot = app.state.relay_service.registry.snapshot()
+        assert snapshot["active"] == []
+        assert snapshot["last_completed"]["status"] == "failed"
+        assert snapshot["last_completed"]["error_code"] == "tool_protocol_error"
 
 
 @pytest.mark.parametrize("rejected", [False, True], ids=["partial", "rejected"])
