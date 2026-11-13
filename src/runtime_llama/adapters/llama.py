@@ -15,7 +15,7 @@ import math
 import time
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence
 
-from runtime_llama.client import LlamaCppClient
+from runtime_llama.client import LlamaCppClient, _StreamConnectionReset
 from runtime_llama._proxy import assert_client_proxy, normalize_proxy_url, proxy_secrets
 from runtime_llama.configuration import (
     AdapterProfile,
@@ -119,6 +119,12 @@ class _ToolCallBuilder:
         }
 
 
+class _NativeChatStreamError(LLMBackendError):
+    def __init__(self, reason: str) -> None:
+        super().__init__("llama_server_error")
+        self.terminal_reason = reason
+
+
 class LlamaCppAdapter(LLMAdapter):
     """Use chat completions on a local, remote or VPN-accessible llama-server.
 
@@ -128,6 +134,7 @@ class LlamaCppAdapter(LLMAdapter):
     """
 
     _client_trust_env = True
+    _strata_tool_stream = False
 
     def __init__(
         self,
@@ -647,8 +654,6 @@ class LlamaCppAdapter(LLMAdapter):
                 event_kinds.append("chat_chunk")
                 if not isinstance(payload, Mapping):
                     raise LLMBackendError("llama_malformed_chat_chunk")
-                if payload.get("error") is not None:
-                    raise LLMBackendError("llama_server_error")
                 observed_diagnostics = {
                     key: deepcopy(payload[key])
                     for key in ("strata_rejected_tool_calls", "strata_mcp")
@@ -659,6 +664,17 @@ class LlamaCppAdapter(LLMAdapter):
                     yield LLMStreamEvent(
                         kind="tool_diagnostic", data=observed_diagnostics
                     )
+                if payload.get("error") is not None:
+                    native_error = payload["error"]
+                    if self._strata_tool_stream and isinstance(native_error, Mapping):
+                        if (
+                            native_error.get("type") == "rate_limit_error"
+                            and native_error.get("code") == "queue_wait_timeout"
+                        ):
+                            raise _NativeChatStreamError("queue_wait_timeout")
+                        if native_error.get("type") == "server_error":
+                            raise _NativeChatStreamError("upstream_server_error")
+                    raise LLMBackendError("llama_server_error")
                 choices = payload.get("choices", [] if observed_diagnostics else None)
                 if not isinstance(choices, list) or len(choices) > 1:
                     raise LLMBackendError("llama_malformed_chat_choices")
@@ -768,7 +784,15 @@ class LlamaCppAdapter(LLMAdapter):
             )
         except (LLMBackendError, LLMCancelledError, LLMTimeoutError) as exc:
             if exc.diagnostics is None:
-                exc.diagnostics = evidence(exc.terminal_reason)
+                reason = (
+                    "connection_reset"
+                    if self._strata_tool_stream
+                    and isinstance(exc, _StreamConnectionReset)
+                    else exc.terminal_reason
+                )
+                exc.diagnostics = evidence(reason)
+            if finish_reason is not None:
+                exc.native_finish_reason = finish_reason
             raise
         finally:
             close = getattr(stream, "close", None)
@@ -923,6 +947,7 @@ class LlamaCppAdapter(LLMAdapter):
             )
         )
         published_chunks: List[str] = []
+        native_mcp_active = body.get("strata_mcp") is True
         leading_chunks: List[str] = []
         leading_marker = ""
         tool_markup = False
@@ -1004,6 +1029,11 @@ class LlamaCppAdapter(LLMAdapter):
                 transport=transport,
                 server_timings=latest("server_timings"),
                 thinking_diagnostic=diagnostic,
+                native_finish_reason=(
+                    (terminal.data or {}).get("finish_reason")
+                    if terminal is not None
+                    else getattr(error, "native_finish_reason", None)
+                ),
             )
 
         try:
@@ -1037,6 +1067,11 @@ class LlamaCppAdapter(LLMAdapter):
                         for event in stream:
                             check_cancelled()
                             staged.append(event)
+                            if event.kind == "tool_diagnostic" and event.data:
+                                marker = event.data.get("strata_mcp")
+                                native_mcp_active |= (
+                                    marker is not None and marker is not False
+                                )
                             if event.kind == "terminal":
                                 terminal = event
                             if (
@@ -1063,14 +1098,44 @@ class LlamaCppAdapter(LLMAdapter):
                 except BaseException as error:
                     if isinstance(error, GeneratorExit):
                         raise
-                    reason = str(getattr(error, "terminal_reason", "invocation_error"))
+                    reason = (
+                        "connection_reset"
+                        if self._strata_tool_stream
+                        and isinstance(error, _StreamConnectionReset)
+                        else str(getattr(error, "terminal_reason", "invocation_error"))
+                    )
                     diagnostic = self._capture_rejected_thinking(
                         staged, reason, thinking_diagnostics, thinking_sink
                     )
                     attempts.append(
                         snapshot(index, reason, diagnostic=diagnostic, error=error)
                     )
-                    error.tool_recovery = report()
+                    transport = attempts[-1].transport
+                    interrupted_repair = (
+                        self._strata_tool_stream
+                        and stream_text
+                        and repairing_committed
+                        and not native_mcp_active
+                        and transport is not None
+                        and not transport.terminal_event_seen
+                        and (
+                            transport.terminal_reason == "early_eof"
+                            or isinstance(error, _StreamConnectionReset)
+                        )
+                    )
+                    error.tool_recovery = report(
+                        exhausted=interrupted_repair and index == 3
+                    )
+                    if interrupted_repair and index < 3:
+                        check_cancelled()
+                        # The stream has been drained. Retry the same private
+                        # history and discard all fragments from the lost attempt.
+                        yield LLMStreamEvent(
+                            kind="tool_recovery",
+                            data={"next_attempt": index + 1},
+                            tool_recovery=error.tool_recovery,
+                        )
+                        continue
                     if diagnostic is not None:
                         error.thinking_diagnostic = diagnostic
                     if repairing_committed and isinstance(
@@ -1095,6 +1160,7 @@ class LlamaCppAdapter(LLMAdapter):
                     None if repairing_committed and local_cap else terminal,
                     secrets=self._diagnostic_secrets,
                     continuation=repairing_committed,
+                    require_tool_finish=self._strata_tool_stream,
                 )
                 incomplete = terminal is not None and terminal.terminal_reason in {
                     "length_cap",

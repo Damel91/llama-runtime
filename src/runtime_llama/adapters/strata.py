@@ -27,6 +27,7 @@ class StrataAdapter(LlamaCppAdapter):
     """
 
     _client_trust_env = False
+    _strata_tool_stream = True
 
     def _json_response_format(self, schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if schema is None:

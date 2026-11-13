@@ -15,6 +15,7 @@ _vendor/llamatelemetry.LICENSE. Upstream source SHA-256:
 from __future__ import annotations
 
 import codecs
+from errno import ECONNRESET
 import json as json_module
 import math
 from queue import Empty, Full, Queue
@@ -118,6 +119,10 @@ class ClientHTTPError(LLMBackendError):
         self.error_type = error_type
 
 
+class _StreamConnectionReset(LLMBackendError):
+    """A stream failed with a positively identified connection reset."""
+
+
 def _cancelled(cancel: CancellationProbe | None) -> None:
     if cancel is None:
         return
@@ -154,11 +159,28 @@ def _is_timeout(exc: BaseException, depth: int = 0) -> bool:
     )
 
 
-def _safe_failure(exc: Exception) -> Exception:
+def _is_connection_reset(exc: BaseException, depth: int = 0) -> bool:
+    if isinstance(exc, ConnectionResetError) or (
+        isinstance(exc, OSError) and exc.errno == ECONNRESET
+    ):
+        return True
+    if depth >= 8:
+        return False
+    nested = (exc.__cause__, exc.__context__, *exc.args)
+    return any(
+        isinstance(item, BaseException) and _is_connection_reset(item, depth + 1)
+        for item in nested
+        if item is not exc
+    )
+
+
+def _safe_failure(exc: Exception, *, stream: bool = False) -> Exception:
     if isinstance(exc, (LLMBackendError, LLMTimeoutError, LLMCancelledError)):
         return exc
     if _is_timeout(exc):
         error = LLMTimeoutError("llama_server_transport_timeout")
+    elif stream and _is_connection_reset(exc):
+        error = _StreamConnectionReset("llama_server_transport_failure")
     else:
         error = LLMBackendError("llama_server_transport_failure")
     # Preserve the failure classification without exposing request URLs, bodies,
@@ -658,7 +680,7 @@ class _SSEStream(_HTTPCall, Iterator[dict[str, Any]]):
                 self._put(payload)
         except Exception as exc:
             if not self._stop.is_set():
-                self._put(_safe_failure(exc))
+                self._put(_safe_failure(exc, stream=True))
         finally:
             self._finish()
             self._put(_END)

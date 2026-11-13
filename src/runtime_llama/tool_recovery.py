@@ -212,6 +212,7 @@ class ToolRecoveryPolicy:
         *,
         secrets: Sequence[str] = (),
         continuation: bool = False,
+        require_tool_finish: bool = False,
     ) -> ToolRecoveryDecision:
         reasons: list[str] = []
         fatal: list[str] = []
@@ -296,6 +297,16 @@ class ToolRecoveryPolicy:
         if not isinstance(calls, (list, tuple)):
             fatal.append("malformed_completed_tool_calls")
             calls = []
+        if (
+            require_tool_finish
+            and calls
+            and terminal is not None
+            and (terminal.terminal_reason == "completed")
+        ):
+            # Strata emits a natural stop for an announced call that its
+            # parser never completed. Valid JSON alone cannot confirm it.
+            reasons.append("strata_tool_call_incomplete")
+            provenance.append("strata_native_finish")
         validators = {
             name: _schema_validator(json.loads(raw)) for name, raw in self._schemas
         }

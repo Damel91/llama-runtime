@@ -192,6 +192,7 @@ class LLMToolRecoveryAttempt:
     native_rejections: tuple[LLMToolRecoveryRejection, ...] = ()
     thinking_diagnostic: ThinkingDiagnostic | None = field(default=None, repr=False)
     provenance: tuple[str, ...] = ()
+    native_finish_reason: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.index) is not int or not 0 <= self.index <= 3:
@@ -274,6 +275,8 @@ class LLMToolRecoveryAttempt:
         }
         if include_thinking and self.thinking_diagnostic is not None:
             value["thinking_diagnostic"] = self.thinking_diagnostic.to_dict()
+        if self.native_finish_reason is not None:
+            value["native_finish_reason"] = self.native_finish_reason
         return value
 
 

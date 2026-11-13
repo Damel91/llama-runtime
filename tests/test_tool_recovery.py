@@ -17,7 +17,7 @@ from runtime_llama import AdapterProfile
 from runtime_llama.adapters.automatic import AutoRuntimeAdapter
 from runtime_llama.adapters.llama import LlamaCppAdapter
 from runtime_llama.adapters.strata import StrataAdapter
-from runtime_llama.client import LlamaCppClient
+from runtime_llama.client import LlamaCppClient, _StreamConnectionReset
 from runtime_llama.errors import (
     LLMBackendError,
     LLMCancelledError,
@@ -522,6 +522,54 @@ def test_cancel_at_recovery_boundary_prevents_another_post():
     with pytest.raises(LLMCancelledError):
         next(stream)
     assert len(client.calls) == client.streams_closed == 1
+
+
+@pytest.mark.parametrize("cancel_after_reset", [False, True])
+def test_strata_private_reset_restarts_only_while_consumer_is_active(
+    cancel_after_reset,
+):
+    stop = Event()
+    client = SequenceClient(
+        [
+            [_chunk(content="visible text"), *valid(arguments="{}")],
+            [*valid(call_id="unconfirmed")[:-1], _StreamConnectionReset("transport")],
+            valid(call_id="confirmed"),
+        ]
+    )
+    stream = StrataAdapter(model="shared", client=client).stream_with_metadata(
+        "write",
+        tools=TOOLS,
+        cancellation_probe=stop.is_set,
+        _progressive_tool_text=True,
+    )
+    events = []
+    for event in stream:
+        events.append(event)
+        if event.kind == "tool_recovery" and event.data == {"next_attempt": 2}:
+            break
+    assert events[-1].tool_recovery.attempts[-1].reasons == ("connection_reset",)
+    assert events[-1].tool_recovery.attempts[-1].transport.terminal_reason == (
+        "connection_reset"
+    )
+    assert len(client.calls) == client.streams_closed == 2
+    if cancel_after_reset:
+        stop.set()
+        with pytest.raises(LLMCancelledError):
+            next(stream)
+        assert len(client.calls) == client.streams_closed == 2
+        return
+    events.extend(stream)
+    assert len(client.calls) == client.streams_closed == 3
+    assert client.calls[1]["messages"] == client.calls[2]["messages"]
+    assert [event.text for event in events if event.kind == "content"] == [
+        "visible text"
+    ]
+    assert [
+        item["id"]
+        for event in events
+        if event.kind == "tool_call_delta"
+        for item in event.data["tool_calls"]
+    ] == ["confirmed"]
 
 
 def test_abandonment_at_recovery_boundary_prevents_another_post():

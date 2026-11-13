@@ -144,6 +144,8 @@ def native_servers():
                         )
                         if isinstance(frames, int):
                             self.reply({"error": "private native failure"}, frames)
+                        elif isinstance(frames, bytes):
+                            self.reply(frames, sse=True)
                         else:
                             wire = (
                                 b"".join(
@@ -839,6 +841,107 @@ def test_tool_recovery_after_prose_depends_on_output_mode(native_servers, mode):
         }
 
 
+def incomplete_native_sse(*frames):
+    return b"".join(
+        b"data: " + json.dumps(frame).encode() + b"\n\n" for frame in frames
+    )
+
+
+@pytest.mark.parametrize("interruption", ["unconfirmed-stop", "private-eof"])
+def test_strata_resumes_unpublished_tool_batch_in_same_sse(
+    native_servers, interruption
+):
+    committed = "committed answer"
+    eof = interruption == "private-eof"
+    accepted = inspect_delta("accepted-call", '{"key":"replacement"}')
+
+    def responses(index, _request):
+        if index == 0:
+            return [
+                _chunk(content=committed),
+                _chunk(
+                    tools=[
+                        inspect_delta(
+                            "unconfirmed-call",
+                            '{"wrong_key":"x"}' if eof else '{"key":"valid-json"}',
+                        ),
+                        inspect_delta("unconfirmed-sibling", '{"key":"y"}', index=1),
+                    ]
+                ),
+                _chunk(finish="tool_calls" if eof else "stop"),
+            ]
+        if eof and index == 1:
+            return incomplete_native_sse(
+                _chunk(content="PRIVATE-INTERRUPTED-CORRECTION"),
+                _chunk(tools=[inspect_delta("interrupted-call", '{"key":"partial"}')]),
+            )
+        return [
+            _chunk(content="PRIVATE-ACCEPTED-CORRECTION"),
+            _chunk(tools=[accepted]),
+            _chunk(finish="tool_calls"),
+        ]
+
+    url, state = native_servers(responses=responses)
+    payload = {
+        "model": "chat-model",
+        "messages": [{"role": "user", "content": "fixture"}],
+        "tools": TOOLS,
+        "stream": True,
+    }
+    with client(config_for((url, {}))) as (api, app):
+        response = api.post("/v1/chat/completions", json=payload)
+        assert response.status_code == 200
+        assert response.text.count("data: [DONE]\n\n") == 1
+        assert response.text.endswith("data: [DONE]\n\n")
+        frames = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert len({frame["id"] for frame in frames}) == 1
+        choices = [frame["choices"][0] for frame in frames]
+        assert [choice["delta"] for choice in choices] == [
+            {"role": "assistant"},
+            {"content": committed},
+            {"tool_calls": [accepted]},
+            {},
+        ]
+        assert [choice["finish_reason"] for choice in choices] == [
+            None,
+            None,
+            None,
+            "tool_calls",
+        ]
+        assert len(state["posts"]) == (3 if eof else 2)
+        original = state["posts"][0][1]
+        for _, retry, _ in state["posts"][1:]:
+            assert (
+                retry["messages"][: len(original["messages"])] == original["messages"]
+            )
+            assert (
+                retry["messages"].count({"role": "assistant", "content": committed})
+                == 1
+            )
+            assert all("tool_calls" not in message for message in retry["messages"])
+        if eof:
+            assert state["posts"][1][1] == state["posts"][2][1]
+        snapshot = app.state.relay_service.registry.snapshot()
+        assert snapshot["active"] == []
+        summary = snapshot["last_completed"]
+        assert summary["status"] == "completed"
+        assert summary["corrections_used"] == (2 if eof else 1)
+        attempts = summary["tool_recovery_attempts"]
+        assert attempts[0]["native_finish_reason"] == ("tool_calls" if eof else "stop")
+        initial_reason = (
+            "tool_arguments_schema_mismatch" if eof else "strata_tool_call_incomplete"
+        )
+        assert initial_reason in attempts[0]["reasons"]
+        if eof:
+            assert attempts[1]["terminal_reason"] == "early_eof"
+        assert attempts[-1]["native_finish_reason"] == "tool_calls"
+        assert attempts[-1]["outcome"] == "accepted"
+
+
 @pytest.mark.parametrize(
     ("failure", "posts"),
     [
@@ -846,18 +949,37 @@ def test_tool_recovery_after_prose_depends_on_output_mode(native_servers, mode):
         ("server-mcp", 1),
         ("repair-server-mcp", 2),
         ("incomplete", 2),
-        ("early-eof", 2),
+        ("early-eof", 4),
+        ("early-eof-with-mcp", 2),
+        ("native-server-error", 2),
     ],
 )
 def test_late_tool_recovery_failure_keeps_committed_prose(
-    native_servers, failure, posts
+    native_servers, failure, posts, caplog
 ):
     committed = "committed answer"
 
     def responses(index, _request):
         if index:
-            if failure == "early-eof":
-                return [_chunk(content="PRIVATE-REPLACEMENT")]
+            if failure in {"early-eof", "early-eof-with-mcp"}:
+                return incomplete_native_sse(
+                    _chunk(content="PRIVATE-REPLACEMENT"),
+                    *(
+                        [{"choices": [], "strata_mcp": {"event": "call"}}]
+                        if failure == "early-eof-with-mcp"
+                        else []
+                    ),
+                )
+            if failure == "native-server-error":
+                return [
+                    _chunk(content="PRIVATE-REPLACEMENT"),
+                    {
+                        "error": {
+                            "type": "server_error",
+                            "message": "PRIVATE-NATIVE-ERROR",
+                        }
+                    },
+                ]
             if failure == "repair-server-mcp":
                 return [
                     _chunk(tools=[inspect_delta("private-repair", '{"key":"ok"}')]),
@@ -891,6 +1013,7 @@ def test_late_tool_recovery_failure_keeps_committed_prose(
         assert response.status_code == 200
         assert "[DONE]" not in response.text
         assert "PRIVATE-REPLACEMENT" not in response.text
+        assert "PRIVATE-NATIVE-ERROR" not in response.text
         assert "private-rejected-call" not in response.text
         frames = [
             json.loads(line[6:])
@@ -913,8 +1036,29 @@ def test_late_tool_recovery_failure_keeps_committed_prose(
             )
         snapshot = app.state.relay_service.registry.snapshot()
         assert snapshot["active"] == []
-        assert snapshot["last_completed"]["status"] == "failed"
-        assert snapshot["last_completed"]["error_code"] == "tool_protocol_error"
+        summary = snapshot["last_completed"]
+        assert summary["status"] == "failed"
+        assert summary["error_code"] == "tool_protocol_error"
+        assert summary["corrections_used"] == posts - 1
+        attempts = summary["tool_recovery_attempts"]
+        assert len(attempts) == posts
+        assert attempts[0]["native_finish_reason"] == "tool_calls"
+        assert "tool_arguments_schema_mismatch" in attempts[0]["reasons"]
+        assert attempts[-1]["outcome"] != "accepted"
+        assert attempts[-1]["reasons"]
+        assert "PRIVATE-NATIVE-ERROR" not in json.dumps(summary)
+        assert "PRIVATE-REPLACEMENT" not in json.dumps(summary)
+        assert summary["request_id"] in caplog.text
+        assert f"corrections={posts - 1}" in caplog.text
+        assert "PRIVATE-NATIVE-ERROR" not in caplog.text
+        assert "PRIVATE-REPLACEMENT" not in caplog.text
+        if failure == "incomplete":
+            assert attempts[-1]["native_finish_reason"] == "length"
+            assert attempts[-1]["terminal_reason"] == "length_cap"
+        if failure in {"early-eof", "early-eof-with-mcp"}:
+            assert attempts[-1]["terminal_reason"] == "early_eof"
+        if failure == "native-server-error":
+            assert attempts[-1]["terminal_reason"] == "upstream_server_error"
 
 
 @pytest.mark.parametrize("rejected", [False, True], ids=["partial", "rejected"])

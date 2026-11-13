@@ -1,4 +1,4 @@
-# SDK tool-call recovery in 0.17.0
+# SDK tool-call recovery
 
 The LLM adapters can correct a recoverable tool proposal inside one public
 generation call. This applies to `LlamaCppAdapter`, `StrataAdapter` and
@@ -96,10 +96,11 @@ call performs its normal fresh discovery.
 | Evidence | SDK behavior |
 | --- | --- |
 | Explicit native `strata_rejected_tool_calls` entries with reason `undeclared` | Retains the observed evidence and can request a correction. |
+| Strata reports `stop` after streaming tool-call fragments | Classifies the proposal as `strata_tool_call_incomplete` and can request a complete replacement. |
 | Completed structured call with an undeclared name, invalid argument JSON or arguments that fail its declared schema | Classifies the completed proposal locally and can request a correction. |
 | Completed response violating `tool_choice`, or a completed tool-call finish without calls | Can request a correction under the same safety rules. |
 | XML-like text, quoted examples or code containing tool syntax | No rejection is inferred from the text alone. |
-| Malformed protocol evidence, incomplete responses or unresolvable schema contracts | Does not treat the problem as a safe corrective generation. |
+| Malformed protocol evidence, unresolvable schemas or incomplete responses outside the conditions below | Ends the invocation without publishing candidate calls. |
 
 Native diagnostics are optional. SDK validation evidence is recorded with its
 own provenance; it is not presented as a native server rejection. An HTTP 200
@@ -110,10 +111,22 @@ executable call. If effective `strata_mcp=True` or observed server-side MCP
 activity means tool effects may already have occurred, a rejected proposal is
 not replayed. The SDK cannot promise to undo server-side effects.
 
-Transport failures, early EOF, timeout, Stop, close and runaway detection are
-terminal for the invocation, without a generic generation retry. Output caps
-and native incomplete finishes retain existing partial-text behavior while
-suppressing candidate tool calls; they do not start a correction.
+For Strata, a qualified connection reset or end of stream before the native
+terminal can restart a private correction within the same public SSE request.
+This applies after text has been published and only while every candidate tool
+call is still private. The SDK closes the interrupted attempt, discards its
+fragments and uses the remaining correction budget with the same correction
+history and selected model. Evidence of native MCP activity anywhere in the
+invocation blocks this transport recovery. Stop, close, timeout, runaway
+detection and other transport or provider errors end the invocation. A
+structured Strata error such as `queue_wait_timeout` is diagnostic evidence.
+The relay records terminal tool-recovery failures in its log, with the request
+ID, attempt outcomes and correction count. The request registry also retains
+those fields for its latest completed request.
+
+Native output caps and the caller's limits continue to govern every attempt.
+An ordinary partial result suppresses candidate calls. A cap reached during a
+private correction can end recovery with a tool protocol error.
 
 ## Reports, usage and errors
 
@@ -129,7 +142,8 @@ LLMToolRecoveryAttempt(index: int, outcome: str, reasons: tuple[str, ...] = (),
     server_timings: LLMServerTimings | None = None,
     native_rejections: tuple[LLMToolRecoveryRejection, ...] = (),
     thinking_diagnostic: ThinkingDiagnostic | None = None,
-    provenance: tuple[str, ...] = ())
+    provenance: tuple[str, ...] = (),
+    native_finish_reason: str | None = None)
 LLMToolRecoveryReport(attempts: tuple[LLMToolRecoveryAttempt, ...] = (),
                       exhausted: bool = False, elapsed_ms: float = 0.0)
 LLMToolRecoveryError(message: str = "tool_recovery_exhausted", *,
@@ -150,7 +164,8 @@ optional next-attempt field, such as a partial-output terminal path.
 A report exposes `attempts`, `corrections_used`, `max_corrections`, `exhausted`
 and `elapsed_ms`. Each `LLMToolRecoveryAttempt` includes its `index`, `outcome`,
 `reasons`, `provenance`, optional `native_rejected_tool_calls` count and
-`native_rejections`, plus available usage, transport and server timings.
+`native_rejections`, plus available usage, transport, native finish reason and
+server timings.
 A missing native observation remains unknown, rather than becoming zero.
 
 Successful ordinary result usage describes the accepted generation. The report
@@ -177,6 +192,13 @@ executed as a fallback. It can contain model output and is omitted from the
 exception text, representation and `to_dict()` export. Report exports omit
 thinking diagnostics unless `to_dict(include_thinking=True)` is requested;
 actual capture still requires the ordinary thinking-diagnostics opt-in.
+
+The relay's `/api/admin/requests` exposes the recovery report for active work
+and the most recent completion, including a failed final attempt. The summary
+contains `corrections_used` and `tool_recovery_attempts`. Each attempt lists its
+outcome, reason codes, provenance, transport terminal reason and native finish
+reason when available. This projection excludes prompts, model text, tool
+arguments and raw provider errors.
 
 ## Cancellation and iterator ownership
 

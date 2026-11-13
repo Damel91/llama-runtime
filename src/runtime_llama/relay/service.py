@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
+import logging
 from threading import Event, RLock, Lock, get_ident
 import time
 
@@ -13,7 +14,11 @@ from runtime_llama import (
     build_adapter,
     build_embedding_adapter,
 )
-from runtime_llama.errors import LLMBackendError, LLMCancelledError
+from runtime_llama.errors import (
+    LLMBackendError,
+    LLMCancelledError,
+    LLMToolRecoveryError,
+)
 from runtime_llama.runtime_discovery import RuntimeEndpoint, discover_runtimes
 from runtime_llama.tailnet import TailnetConfig, TailnetHelper
 from runtime_llama.relay.config import RelayConfigStore
@@ -24,6 +29,10 @@ from runtime_llama.relay.state import (
     RelayRequestRegistry,
 )
 from runtime_llama.relay.protocol import RelayError, map_error, usage_payload
+from runtime_llama.usage import LLMToolRecoveryReport
+
+
+_LOG = logging.getLogger(__name__)
 
 
 class _Operation:
@@ -185,6 +194,20 @@ class RelayService:
             primary_failed = True
             status = "cancelled" if isinstance(error, LLMCancelledError) else "failed"
             error_code = map_error(error).code
+            report = getattr(error, "tool_recovery", None)
+            if isinstance(report, LLMToolRecoveryReport):
+                updates = self._tool_recovery_updates(report)
+                if terminal_reason := getattr(error, "terminal_reason", ""):
+                    updates["terminal_reason"] = terminal_reason
+                self.registry.update(operation.request.request_id, **updates)
+                if isinstance(error, LLMToolRecoveryError):
+                    _LOG.warning(
+                        "Tool recovery failed request_id=%s reason=%s corrections=%d attempts=%s",
+                        operation.request.request_id,
+                        error,
+                        report.corrections_used,
+                        updates["tool_recovery_attempts"],
+                    )
             raise
         finally:
             cleanup_error = None
@@ -471,6 +494,34 @@ class RelayService:
             self._retire(generation)
         return adapter
 
+    @staticmethod
+    def _tool_recovery_updates(report: LLMToolRecoveryReport) -> dict:
+        attempts = []
+        for attempt in report.attempts:
+            row = {
+                "outcome": attempt.outcome,
+                "reasons": list(attempt.reasons),
+                "provenance": list(attempt.provenance),
+                "terminal_reason": (
+                    attempt.transport.terminal_reason if attempt.transport else None
+                ),
+            }
+            if attempt.native_finish_reason is not None:
+                row["native_finish_reason"] = attempt.native_finish_reason
+            attempts.append(row)
+        return {
+            "corrections_used": report.corrections_used,
+            "reasons": [
+                reason for attempt in report.attempts for reason in attempt.reasons
+            ],
+            "tool_recovery_attempts": attempts,
+            "coordinator_elapsed_ms": report.elapsed_ms,
+            "observed_usage": usage_payload(report.observed_usage),
+            "total_usage": usage_payload(report.total_usage),
+            "usage_complete": report.usage_complete,
+            "unknown_usage_fields": list(report.unknown_usage_fields),
+        }
+
     def _record_event(self, operation, event):
         updates = {}
         if event.usage is not None:
@@ -478,18 +529,7 @@ class RelayService:
         if event.server_timings is not None:
             updates["server_timings"] = event.server_timings.to_dict()
         if event.tool_recovery is not None:
-            report = event.tool_recovery
-            updates.update(
-                corrections_used=report.corrections_used,
-                reasons=[
-                    reason for attempt in report.attempts for reason in attempt.reasons
-                ],
-                coordinator_elapsed_ms=report.elapsed_ms,
-                observed_usage=usage_payload(report.observed_usage),
-                total_usage=usage_payload(report.total_usage),
-                usage_complete=report.usage_complete,
-                unknown_usage_fields=list(report.unknown_usage_fields),
-            )
+            updates.update(self._tool_recovery_updates(event.tool_recovery))
         if getattr(event, "terminal_reason", ""):
             updates["terminal_reason"] = event.terminal_reason
         if updates:

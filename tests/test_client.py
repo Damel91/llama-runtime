@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from errno import ECONNREFUSED, ECONNRESET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import socket
@@ -9,10 +10,11 @@ import traceback
 
 import pytest
 import requests
+from urllib3.exceptions import ProtocolError
 from urllib3.util import connection as urllib3_connection
 
 from runtime_llama.adapters.llama import LlamaCppAdapter
-from runtime_llama.client import ClientHTTPError, LlamaCppClient
+from runtime_llama.client import ClientHTTPError, LlamaCppClient, _StreamConnectionReset
 from runtime_llama.errors import LLMBackendError, LLMCancelledError, LLMTimeoutError
 
 
@@ -234,6 +236,43 @@ def test_wrapped_connection_refusal_is_backend_failure_without_retry(stream):
         if stream:
             list(response)
     assert secret not in "".join(traceback.format_exception(caught.value))
+    assert len(session.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("fault", "expected"),
+    [
+        (ConnectionResetError("private payload"), _StreamConnectionReset),
+        (OSError(ECONNRESET, "private payload"), _StreamConnectionReset),
+        (OSError(ECONNREFUSED, "private payload"), LLMBackendError),
+        (OSError("ECONNRESET private payload"), LLMBackendError),
+    ],
+)
+def test_stream_connection_reset_requires_typed_transport_evidence(fault, expected):
+    class InterruptedResponse(Response):
+        def iter_content(self, chunk_size=1):
+            yield b'data: {"choices": []}\n\n'
+            raise requests.exceptions.ChunkedEncodingError(
+                ProtocolError("broken", fault)
+            )
+
+    response = InterruptedResponse()
+    api, session = client(response)
+    stream = api.complete("fixture", stream=True)
+    assert next(stream) == {"choices": []}
+    with pytest.raises(expected, match="transport_failure") as caught:
+        next(stream)
+    assert type(caught.value) is expected
+    assert "private payload" not in "".join(traceback.format_exception(caught.value))
+    assert response.closed.is_set()
+    assert len(session.calls) == 1
+
+
+def test_json_connection_reset_keeps_existing_transport_error_type():
+    api, session = client(error=requests.ConnectionError(ConnectionResetError()))
+    with pytest.raises(LLMBackendError, match="transport_failure") as caught:
+        api.complete("fixture")
+    assert type(caught.value) is LLMBackendError
     assert len(session.calls) == 1
 
 

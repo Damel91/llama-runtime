@@ -29,6 +29,7 @@ _SUMMARY_FIELDS = frozenset(
         "error_code",
         "corrections_used",
         "reasons",
+        "tool_recovery_attempts",
         "usage",
         "observed_usage",
         "total_usage",
