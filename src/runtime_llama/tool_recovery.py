@@ -11,10 +11,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 import json
 import re
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from runtime_llama.errors import sanitize_diagnostic
 from runtime_llama.usage import LLMStreamEvent, LLMToolRecoveryRejection
+
+if TYPE_CHECKING:
+    from jsonschema.exceptions import ValidationError
 
 
 _NATIVE_MARKER = "strata_rejected_tool_calls"
@@ -97,6 +100,22 @@ def _schema_validator(schema: Any):
     return selected(schema, registry=registry)
 
 
+def _schema_repair_hint(
+    name: str, arguments: Mapping[str, Any], error: ValidationError
+) -> str | None:
+    """Describe a clear schema obligation using only declared names and types."""
+    path = tuple(error.absolute_schema_path)
+    tool = json.dumps(name, ensure_ascii=False)
+    if error.validator == "required" and path == ("required",):
+        missing = [key for key in error.validator_value if key not in arguments]
+        return f"Tool {tool}: Missing required fields {json.dumps(missing)}."
+    if error.validator == "type" and len(path) == 3 and path[0] == "properties":
+        field_name = json.dumps(path[1])
+        expected = json.dumps(error.validator_value)
+        return f"Tool {tool}: Field {field_name} must have JSON type {expected}."
+    return None
+
+
 @dataclass(frozen=True)
 class ToolRecoveryDecision:
     """Content-free classification, not an executable proposal."""
@@ -107,6 +126,9 @@ class ToolRecoveryDecision:
     server_activity: bool = False
     native_rejections: tuple[LLMToolRecoveryRejection, ...] = ()
     provenance: tuple[str, ...] = ()
+    _schema_repair_hints: tuple[str, ...] = field(
+        default=(), repr=False, compare=False, kw_only=True
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "reasons", tuple(self.reasons))
@@ -312,6 +334,7 @@ class ToolRecoveryPolicy:
         }
         names: list[str] = []
         identities: set[str] = set()
+        schema_repair_hints: list[str] = []
         for call in calls:
             if not isinstance(call, Mapping):
                 fatal.append("malformed_completed_tool_call")
@@ -361,6 +384,9 @@ class ToolRecoveryPolicy:
                 continue
             if invalid is not None:
                 reasons.append("tool_arguments_schema_mismatch")
+                hint = _schema_repair_hint(name, value, invalid)
+                if hint is not None:
+                    schema_repair_hints.append(hint)
         if self._choice == "required" and not calls:
             reasons.append("required_tool_call_missing")
             provenance.append("sdk_tool_choice")
@@ -392,6 +418,7 @@ class ToolRecoveryPolicy:
             server_activity,
             tuple(rejected),
             tuple(dict.fromkeys(provenance)),
+            _schema_repair_hints=tuple(dict.fromkeys(schema_repair_hints)),
         )
 
     def correction_messages(
@@ -405,9 +432,9 @@ class ToolRecoveryPolicy:
 
         The rejected proposal is retained by the invocation owner for explicit
         inspection. It is not promoted to an assistant tool call, and none of
-        its calls is said to have executed. Only fixed reason codes and the
-        trusted declared names are included in the feedback. A committed
-        continuation carries its already public text as an assistant message.
+        its calls is said to have executed. The feedback uses reason codes and
+        declared schema details. A committed continuation carries its already
+        public text as an assistant message.
         """
         if not self.enabled or not decision.recoverable or decision.server_activity:
             raise ValueError(
@@ -436,6 +463,8 @@ class ToolRecoveryPolicy:
             f"Declared names: {json.dumps(self.declared_names, ensure_ascii=False)}. "
             f"Protocol failures: {json.dumps(decision.reasons)}. {required}"
         )
+        if decision._schema_repair_hints:
+            feedback += " " + " ".join(decision._schema_repair_hints)
         if published_text is not None:
             continuation = (
                 "End this turn without a tool call."
