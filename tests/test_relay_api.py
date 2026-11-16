@@ -943,9 +943,159 @@ def test_strata_resumes_unpublished_tool_batch_in_same_sse(
 
 
 @pytest.mark.parametrize(
+    ("arguments", "expected_hint"),
+    [
+        ('{"ignored_key":"REJECTED-VALUE"}', 'Missing required fields ["key"]'),
+        ('{"key":["REJECTED-VALUE"]}', 'Field "key" must have JSON type "string"'),
+    ],
+    ids=["missing-required", "wrong-type"],
+)
+def test_late_tool_recovery_uses_private_schema_feedback(
+    native_servers, arguments, expected_hint
+):
+    committed = "Visible status."
+    accepted = inspect_delta("accepted-call", '{"key":"valid"}')
+
+    def responses(attempt, body):
+        corrected = attempt > 0 and expected_hint in body["messages"][-1]["content"]
+        if corrected:
+            return [_chunk(tools=[accepted]), _chunk(finish="tool_calls")]
+        initial_delta = inspect_delta("rejected-call", arguments[:8])
+        rest = {"index": 0, "function": {"arguments": arguments[8:]}}
+        return [
+            _chunk(content=committed if attempt == 0 else "private correction text"),
+            _chunk(tools=[initial_delta]),
+            _chunk(tools=[rest]),
+            _chunk(finish="tool_calls"),
+        ]
+
+    url, state = native_servers(responses=responses)
+    payload = {
+        "model": "chat-model",
+        "messages": [{"role": "user", "content": "fixture"}],
+        "tools": TOOLS,
+        "tool_choice": "auto",
+        "temperature": 0.3,
+        "stream": True,
+    }
+    with client(config_for((url, {}))) as (api, app):
+        response = api.post("/v1/chat/completions", json=payload)
+        assert response.status_code == 200
+        assert response.text.count("data: [DONE]\n\n") == 1
+        assert expected_hint not in response.text
+        frames = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        assert len({frame["id"] for frame in frames}) == 1
+        choices = [frame["choices"][0] for frame in frames]
+        assert [choice["delta"] for choice in choices] == [
+            {"role": "assistant"},
+            {"content": committed},
+            {"tool_calls": [accepted]},
+            {},
+        ]
+        assert choices[-1]["finish_reason"] == "tool_calls"
+        summary = app.state.relay_service.registry.snapshot()["last_completed"]
+        assert summary["corrections_used"] == 1
+        assert (
+            "tool_arguments_schema_mismatch"
+            in summary["tool_recovery_attempts"][0]["reasons"]
+        )
+        assert expected_hint not in json.dumps(summary)
+
+    original, correction = [body for _, body, _ in state["posts"]]
+    assert original["messages"] == payload["messages"]
+    assert original["tools"] == TOOLS
+    assert correction["messages"][:-1] == [
+        *original["messages"],
+        {"role": "assistant", "content": committed},
+    ]
+    assert correction["messages"][-1]["role"] == "user"
+    assert correction["messages"][-1]["content"].count(expected_hint) == 1
+    assert "REJECTED-VALUE" not in correction["messages"][-1]["content"]
+    assert "ignored_key" not in correction["messages"][-1]["content"]
+    assert {key: value for key, value in correction.items() if key != "messages"} == {
+        key: value for key, value in original.items() if key != "messages"
+    }
+
+
+def test_private_schema_feedback_omits_overlong_notes_and_legacy_subschemas(
+    native_servers,
+):
+    long_name = "long_" + "x" * 300
+    schemas = {
+        "many": {"required": [f"declared_{i}" for i in range(50)]},
+        long_name: {"required": ["key"]},
+        "legacy": {
+            "$schema": "http://json-schema.org/draft-03/schema#",
+            "properties": {
+                "key": {
+                    "type": [
+                        "string",
+                        {"type": "integer", "description": "PRIVATE-SCHEMA-TEXT"},
+                    ]
+                }
+            },
+        },
+        "union": {"properties": {"key": {"type": ["string", "integer"]}}},
+        **{f"tool{i}": {"required": [f"field{i}"]} for i in range(6)},
+    }
+    tools, deltas = [], []
+    for index, (name, schema) in enumerate(schemas.items()):
+        tools.append(
+            {"type": "function", "function": {"name": name, "parameters": schema}}
+        )
+        args = '{"key":false}' if name in {"legacy", "union"} else "{}"
+        delta = inspect_delta(f"rejected-{index}", args, index=index)
+        delta["function"]["name"] = name
+        deltas.append(delta)
+
+    accepted = inspect_delta("accepted-call", '{"key":"valid"}')
+    accepted["function"]["name"] = "union"
+
+    def responses(attempt, _body):
+        if attempt:
+            return [_chunk(tools=[accepted]), _chunk(finish="tool_calls")]
+        return [
+            _chunk(content="Visible status."),
+            _chunk(tools=deltas),
+            _chunk(finish="tool_calls"),
+        ]
+
+    url, state = native_servers(responses=responses)
+    with client(config_for((url, {}))) as (api, _app):
+        response = api.post(
+            "/v1/chat/completions",
+            json={
+                "model": "chat-model",
+                "messages": [{"role": "user", "content": "fixture"}],
+                "tools": tools,
+                "stream": True,
+            },
+        )
+        assert response.status_code == 200
+        assert response.text.count('"id":"accepted-call"') == 1
+        assert response.text.count("data: [DONE]\n\n") == 1
+
+    assert len(state["posts"]) == 2
+    feedback = state["posts"][1][1]["messages"][-1]["content"]
+    assert "tool_arguments_schema_mismatch" in feedback
+    assert "PRIVATE-SCHEMA-TEXT" not in feedback
+    assert "declared_0" not in feedback
+    assert f'Tool "{long_name}":' not in feedback
+    assert feedback.count("must have JSON type") == 1
+    assert '["string", "integer"]' in feedback
+    assert feedback.count("Missing required fields") == 3
+    assert "field2" in feedback and "field3" not in feedback
+
+
+@pytest.mark.parametrize(
     ("failure", "posts"),
     [
         ("no-tool", 4),
+        ("schema-mismatch", 4),
         ("server-mcp", 1),
         ("repair-server-mcp", 2),
         ("incomplete", 2),
@@ -984,6 +1134,14 @@ def test_late_tool_recovery_failure_keeps_committed_prose(
                 return [
                     _chunk(tools=[inspect_delta("private-repair", '{"key":"ok"}')]),
                     {"choices": [], "strata_mcp": {"event": "call"}},
+                    _chunk(finish="tool_calls"),
+                ]
+            if failure == "schema-mismatch":
+                return [
+                    _chunk(content="PRIVATE-REPLACEMENT"),
+                    _chunk(
+                        tools=[inspect_delta("private-repair", '{"wrong_key":"x"}')]
+                    ),
                     _chunk(finish="tool_calls"),
                 ]
             return [
@@ -1059,6 +1217,22 @@ def test_late_tool_recovery_failure_keeps_committed_prose(
             assert attempts[-1]["terminal_reason"] == "early_eof"
         if failure == "native-server-error":
             assert attempts[-1]["terminal_reason"] == "upstream_server_error"
+        if failure == "schema-mismatch":
+            assert all(
+                attempt["reasons"] == ["tool_arguments_schema_mismatch"]
+                and attempt["native_finish_reason"] == "tool_calls"
+                for attempt in attempts
+            )
+            assert (
+                len(
+                    {
+                        body["messages"][-1]["content"]
+                        for _, body, _ in state["posts"][1:]
+                    }
+                )
+                == 1
+            )
+            assert "Missing required fields" not in caplog.text
 
 
 @pytest.mark.parametrize("rejected", [False, True], ids=["partial", "rejected"])
