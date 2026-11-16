@@ -21,6 +21,11 @@ if TYPE_CHECKING:
 
 
 _NATIVE_MARKER = "strata_rejected_tool_calls"
+_MAX_SCHEMA_REPAIR_HINTS = 4
+_MAX_SCHEMA_REPAIR_HINT_CHARS = 240
+_JSON_SCHEMA_TYPES = frozenset(
+    {"array", "boolean", "integer", "null", "number", "object", "string"}
+)
 _CREDENTIAL = re.compile(
     r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+"
     r"|\b(?:api[_-]?key|access[_-]?token|password)\b[\"']?\s*[:=]\s*"
@@ -105,14 +110,49 @@ def _schema_repair_hint(
 ) -> str | None:
     """Describe a clear schema obligation using only declared names and types."""
     path = tuple(error.absolute_schema_path)
-    tool = json.dumps(name, ensure_ascii=False)
-    if error.validator == "required" and path == ("required",):
-        missing = [key for key in error.validator_value if key not in arguments]
-        return f"Tool {tool}: Missing required fields {json.dumps(missing)}."
-    if error.validator == "type" and len(path) == 3 and path[0] == "properties":
+    if len(name) > _MAX_SCHEMA_REPAIR_HINT_CHARS:
+        return None
+    tool = json.dumps(name)
+    if (
+        error.validator == "required"
+        and path == ("required",)
+        and isinstance(error.validator_value, list)
+    ):
+        prefix = f"Tool {tool}: Missing required fields ["
+        suffix = "]."
+        remaining = _MAX_SCHEMA_REPAIR_HINT_CHARS - len(prefix) - len(suffix)
+        missing: list[str] = []
+        for key in error.validator_value:
+            if key in arguments:
+                continue
+            if missing:
+                remaining -= 2  # ", "
+            if len(key) > remaining:
+                return None
+            encoded = json.dumps(key)
+            remaining -= len(encoded)
+            if remaining < 0:
+                return None
+            missing.append(encoded)
+        if missing:
+            return prefix + ", ".join(missing) + suffix
+    if (
+        error.validator == "type"
+        and len(path) == 3
+        and path[0] == "properties"
+        and len(path[1]) <= _MAX_SCHEMA_REPAIR_HINT_CHARS
+    ):
         field_name = json.dumps(path[1])
-        expected = json.dumps(error.validator_value)
-        return f"Tool {tool}: Field {field_name} must have JSON type {expected}."
+        expected = error.validator_value
+        types = expected if isinstance(expected, list) else [expected]
+        # Draft 3 permits subschemas inside `type`; only primitive types may
+        # appear in repair feedback.
+        if 0 < len(types) <= _MAX_SCHEMA_REPAIR_HINT_CHARS and all(
+            isinstance(kind, str) and kind in _JSON_SCHEMA_TYPES for kind in types
+        ):
+            hint = f"Tool {tool}: Field {field_name} must have JSON type {json.dumps(expected)}."
+            if len(hint) <= _MAX_SCHEMA_REPAIR_HINT_CHARS:
+                return hint
     return None
 
 
@@ -334,7 +374,7 @@ class ToolRecoveryPolicy:
         }
         names: list[str] = []
         identities: set[str] = set()
-        schema_repair_hints: list[str] = []
+        schema_repair_hints: dict[str, None] = {}
         for call in calls:
             if not isinstance(call, Mapping):
                 fatal.append("malformed_completed_tool_call")
@@ -384,9 +424,10 @@ class ToolRecoveryPolicy:
                 continue
             if invalid is not None:
                 reasons.append("tool_arguments_schema_mismatch")
-                hint = _schema_repair_hint(name, value, invalid)
-                if hint is not None:
-                    schema_repair_hints.append(hint)
+                if len(schema_repair_hints) < _MAX_SCHEMA_REPAIR_HINTS:
+                    hint = _schema_repair_hint(name, value, invalid)
+                    if hint is not None:
+                        schema_repair_hints[hint] = None
         if self._choice == "required" and not calls:
             reasons.append("required_tool_call_missing")
             provenance.append("sdk_tool_choice")
@@ -418,7 +459,7 @@ class ToolRecoveryPolicy:
             server_activity,
             tuple(rejected),
             tuple(dict.fromkeys(provenance)),
-            _schema_repair_hints=tuple(dict.fromkeys(schema_repair_hints)),
+            _schema_repair_hints=tuple(schema_repair_hints),
         )
 
     def correction_messages(
