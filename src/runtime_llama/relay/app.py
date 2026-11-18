@@ -4,21 +4,27 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import replace
 import hmac
 from importlib.resources import files
 from ipaddress import ip_address
+import json
 import os
 import secrets
+import sqlite3
 import time
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 from starlette.applications import Starlette
+from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware import Middleware
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from runtime_llama.relay.admin_contract import ADMIN_API_VERSION, ADMIN_TOKEN_HEADER
+from runtime_llama.relay.audit import AuditContext, RelaySecurityAudit, declared_id
 from runtime_llama.relay.bridge import ThreadBridge
 from runtime_llama.relay.config import (
     RelayConfigConflict,
@@ -39,6 +45,26 @@ from runtime_llama.relay.service import RelayService
 
 
 _SSE_KEEPALIVE_SECONDS = 15.0
+_AUDIT_FILTERS = frozenset(
+    {
+        "from",
+        "to",
+        "session_id",
+        "model",
+        "tool_name",
+        "phase",
+        "outcome",
+        "destination",
+    }
+)
+
+
+def _tool_ids(calls):
+    return [
+        call["id"]
+        for call in (calls or ())
+        if isinstance(call, dict) and isinstance(call.get("id"), str) and call["id"]
+    ]
 
 
 class _SafeErrors:
@@ -75,7 +101,7 @@ class _SafeErrors:
 class _RelayStream(Response):
     media_type = "text/event-stream"
 
-    def __init__(self, bridge, projection, cleanup):
+    def __init__(self, bridge, projection, cleanup, audit_context=None):
         super().__init__(
             status_code=200,
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -88,6 +114,7 @@ class _RelayStream(Response):
             if name != b"content-length"
         ]
         self.bridge, self.projection, self.cleanup = bridge, projection, cleanup
+        self.audit_context = audit_context
 
     async def __call__(self, scope, receive, send):
         async def send_chunk(chunk):
@@ -114,6 +141,7 @@ class _RelayStream(Response):
             return pending.result()
 
         async def stream():
+            tools_sent = set()
             await send(
                 {
                     "type": "http.response.start",
@@ -130,6 +158,16 @@ class _RelayStream(Response):
                         break
                     for chunk in self.projection.consume(event):
                         await send_chunk(chunk)
+                    if self.audit_context is not None:
+                        calls = (event.data or {}).get("tool_calls")
+                        if event.kind == "tool_call_delta":
+                            tools_sent.update(_tool_ids(calls))
+                        elif event.kind == "terminal":
+                            forwarded = [i for i in _tool_ids(calls) if i in tools_sent]
+                            if forwarded:
+                                await run_in_threadpool(
+                                    self.audit_context.forwarded, forwarded
+                                )
                 if not self.projection.finished:
                     raise RelayError(502, "relay_stream_ended_without_terminal")
             except Exception as error:
@@ -175,6 +213,7 @@ def create_app(config_path=None, initial_config=None, service=None):
     )
     admin_token = secrets.token_urlsafe(32)
     bridges = {}
+    audit = RelaySecurityAudit(service.config_store.path)
 
     def cancel_active():
         # Nonblocking hook for a server's first shutdown signal. ASGI servers
@@ -194,8 +233,13 @@ def create_app(config_path=None, initial_config=None, service=None):
             for bridge in active:
                 await bridge.aclose()
             bridges.clear()
-            async with ThreadBridge(lambda _emit, _cancel: service.close()) as worker:
-                await worker.result()
+            try:
+                async with ThreadBridge(
+                    lambda _emit, _cancel: service.close()
+                ) as worker:
+                    await worker.result()
+            finally:
+                await run_in_threadpool(audit.close)
 
     def authority(request):
         header = request.headers.get("host", "")
@@ -298,6 +342,15 @@ def create_app(config_path=None, initial_config=None, service=None):
         inference_access(request)
         parsed = parse_chat(await body(request))
         request_id, created = uuid4().hex, int(time.time())
+        context = AuditContext(
+            audit,
+            request_id,
+            session_id=declared_id(request.headers.get("X-Relay-Audit-Session")),
+            correlation_id=declared_id(
+                request.headers.get("X-Relay-Audit-Correlation")
+            ),
+        )
+        parsed = replace(parsed, audit_context=context)
         if not parsed.stream:
             result = await blocking(
                 request,
@@ -306,10 +359,14 @@ def create_app(config_path=None, initial_config=None, service=None):
                 ),
                 request_id=request_id,
             )
+            identifiers = _tool_ids(result.tool_calls)
             return JSONResponse(
                 chat_payload(
                     result, request_id=request_id, created=created, model=parsed.model
-                )
+                ),
+                background=BackgroundTask(context.forwarded, identifiers)
+                if identifiers
+                else None,
             )
         bridge = ThreadBridge(
             lambda emit, cancel: service.chat(
@@ -326,6 +383,7 @@ def create_app(config_path=None, initial_config=None, service=None):
                 include_usage=parsed.include_usage,
             ),
             lambda: bridges.pop(request_id, None),
+            audit_context=context,
         )
 
     async def embeddings(request):
@@ -354,6 +412,43 @@ def create_app(config_path=None, initial_config=None, service=None):
             headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
         )
 
+    async def audit_view(request, *, export):
+        fields = _AUDIT_FILTERS if export else _AUDIT_FILTERS | {"before"}
+        filters = dict(request.query_params)
+        if set(filters) - fields or len(filters) != len(
+            request.query_params.multi_items()
+        ):
+            raise RelayError(400, "relay_audit_filter_invalid")
+        try:
+            before = filters.pop("before", None)
+            before = int(before) if before is not None else None
+            if export:
+                if audit.store is None:
+                    raise RelayError(503, "relay_audit_storage_unavailable")
+                rows = await run_in_threadpool(audit.store.export_rows, filters)
+                return Response(
+                    "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+                    media_type="application/x-ndjson",
+                    headers={
+                        "Cache-Control": "no-store",
+                        "X-Content-Type-Options": "nosniff",
+                        "Content-Disposition": 'attachment; filename="relay-security-audit.jsonl"',
+                    },
+                )
+            if audit.store is None:
+                rows, cursor = [], None
+            else:
+                rows, cursor = await run_in_threadpool(
+                    audit.store.query, filters, before=before
+                )
+        except (ValueError, OverflowError):
+            raise RelayError(400, "relay_audit_filter_invalid") from None
+        except (OSError, sqlite3.Error):
+            raise RelayError(503, "relay_audit_storage_unavailable") from None
+        return admin_json(
+            {**audit.observation(), "events": rows, "next_before": cursor}
+        )
+
     async def admin(request):
         path = request.url.path
         admin_access(request, session=path == "/api/admin/session")
@@ -380,6 +475,10 @@ def create_app(config_path=None, initial_config=None, service=None):
             )
         if path == "/api/admin/status":
             return admin_json(service.status())
+        if path == "/api/admin/telemetry":
+            return admin_json(service.telemetry())
+        if path in {"/api/admin/audit", "/api/admin/audit/export"}:
+            return await audit_view(request, export=path.endswith("/export"))
         if path == "/api/admin/catalog":
             return admin_json(service.catalog_snapshot())
         if path == "/api/admin/catalog/refresh":
@@ -391,11 +490,7 @@ def create_app(config_path=None, initial_config=None, service=None):
             return admin_json(service.registry.snapshot())
         if path.endswith("/cancel"):
             identifier = request.path_params["request_id"]
-            cancelled = service.cancel_request(identifier)
-            bridge = bridges.get(identifier)
-            if bridge is not None:
-                bridge.cancel()
-            if not cancelled:
+            if not service.cancel_request(identifier):
                 raise RelayError(404, "relay_request_not_active")
             return admin_json({"request_id": identifier, "cancelled": True})
         if path in {"/api/admin/tailnet/start", "/api/admin/tailnet/stop"}:
@@ -504,5 +599,6 @@ def create_app(config_path=None, initial_config=None, service=None):
         },
     )
     app.state.relay_service, app.state.relay_bridges = service, bridges
+    app.state.relay_audit = audit
     app.state.relay_cancel_all = cancel_active
     return app

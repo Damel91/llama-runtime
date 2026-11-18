@@ -10,7 +10,7 @@
   <script defer src="/static/app.js"></script>
 </head>
 <body>
-  <a class="skip-link" href="#workspace">Skip to workspace</a>
+  <a class="skip-link" id="skip-workspace" href="#workspace">Skip to workspace</a>
   <div class="app-shell">
     <aside class="sidebar" aria-label="Relay navigation">
       <a class="brand" href="#models" aria-label="llama-runtime models">
@@ -21,6 +21,7 @@
         <a href="#models" data-view="models" class="nav-link" aria-current="page"><span class="nav-symbol" aria-hidden="true">◈</span>Models</a>
         <a href="#connections" data-view="connections" class="nav-link"><span class="nav-symbol" aria-hidden="true">⇄</span>Connections</a>
         <a href="#requests" data-view="requests" class="nav-link"><span class="nav-symbol" aria-hidden="true">≋</span>Requests<span id="active-nav-count" class="nav-count" hidden></span></a>
+        <a href="#telemetry" data-view="telemetry" class="nav-link"><span class="nav-symbol" aria-hidden="true">⌁</span>Telemetry</a>
         <a href="#settings" data-view="settings" class="nav-link"><span class="nav-symbol" aria-hidden="true">⚙</span>Settings</a>
       </nav>
       <div class="sidebar-bottom">
@@ -35,6 +36,7 @@
         <div><h1 id="view-title">Models</h1><p id="view-description">The models your configured runtimes actually report.</p></div>
         <div class="header-actions">
           <span id="dirty-label" class="dirty-label" hidden>Unsaved changes</span>
+          <span id="config-progress" class="section-note" role="status" hidden></span>
           <div class="theme-picker">
             <label for="relay-theme">Theme</label>
             <select id="relay-theme"><option value="light">Light</option><option value="dark">Dark</option></select>
@@ -65,9 +67,143 @@
       </section>
 
       <section id="view-requests" class="view" aria-labelledby="requests-heading" hidden>
-        <div class="section-heading"><div><h2 id="requests-heading">Active requests</h2><p>Metadata for work currently owned by this relay. Prompts and tool arguments are not shown.</p></div><button type="button" class="button secondary" id="refresh-requests">Refresh requests</button></div>
+        <div class="section-heading"><div><h2 id="requests-heading">Active requests</h2><p id="requests-observed">Waiting for the first snapshot.</p></div><button type="button" class="button secondary" id="refresh-requests">Refresh requests</button></div>
         <div id="active-requests" class="request-list"></div><div id="requests-empty" class="empty-state compact"><h3>No active requests</h3><p>Requests appear here when a consumer uses the relay API.</p></div>
         <div class="section-heading secondary-heading"><div><h2>Last completed request</h2><p>This is one completion summary, not a request history.</p></div><button type="button" class="button secondary" id="clear-last" disabled>Clear summary</button></div><div id="last-request"></div><p id="last-empty" class="section-note">No completion summary is retained.</p>
+      </section>
+
+      <section id="view-telemetry" class="view" aria-labelledby="telemetry-heading" hidden>
+        <div class="section-heading">
+          <div>
+            <h2 id="telemetry-heading">Relay activity</h2>
+            <p id="telemetry-observed">Waiting for the first snapshot.</p>
+          </div>
+          <div class="inline-actions">
+            <button type="button" class="text-button" id="open-audit" aria-controls="security-audit">Security audit</button>
+            <button type="button" class="button secondary" id="refresh-telemetry">Refresh telemetry</button>
+          </div>
+        </div>
+        <dl class="telemetry-counters" aria-label="Inference request counts for this relay process">
+          <div><dt>Active</dt><dd id="telemetry-active">Unknown</dd><dd id="telemetry-active-types" class="telemetry-counter-note"></dd></div>
+          <div><dt>Completed</dt><dd id="telemetry-completed">Unknown</dd></div>
+          <div><dt>Failed</dt><dd id="telemetry-failed">Unknown</dd></div>
+          <div><dt>Cancelled</dt><dd id="telemetry-cancelled">Unknown</dd></div>
+        </dl>
+        <div class="telemetry-scope">
+          <p id="telemetry-range">Relay process start unavailable.</p>
+          <p id="telemetry-catalog">No catalog observation yet.</p>
+        </div>
+
+        <section class="telemetry-section" aria-labelledby="telemetry-model-heading">
+          <h3 id="telemetry-model-heading">Models and connections</h3>
+          <p>Outcomes and mean relay elapsed time use the retained requests below.</p>
+          <p class="section-note" id="telemetry-model-empty">No model activity observed yet.</p>
+          <div class="table-wrap telemetry-table" id="telemetry-model-table" role="region" aria-labelledby="telemetry-model-heading" tabindex="0" hidden>
+            <table>
+              <thead><tr><th scope="col">Model</th><th scope="col">Runtime</th><th scope="col">Connection</th><th scope="col">Kind</th><th scope="col">Active</th><th scope="col">Completed</th><th scope="col">Failed</th><th scope="col">Cancelled</th><th scope="col">Mean elapsed</th><th scope="col">Samples</th></tr></thead>
+              <tbody id="telemetry-model-rows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="telemetry-section" aria-labelledby="telemetry-active-heading">
+          <div class="section-heading">
+            <h3 id="telemetry-active-heading">Active requests</h3>
+            <a href="#requests" class="text-button">Open request controls</a>
+          </div>
+          <p class="section-note" id="telemetry-active-empty">No active inference requests.</p>
+          <div id="telemetry-active-rows" class="telemetry-request-list"></div>
+        </section>
+
+        <section class="telemetry-section" aria-labelledby="telemetry-http-heading">
+          <h3 id="telemetry-http-heading">Native embedding traffic</h3>
+          <p>One count per HTTP call observed by the embedding adapters. Calls can serve several relay requests.</p>
+          <div class="table-wrap telemetry-table" role="region" aria-labelledby="telemetry-http-heading" tabindex="0">
+            <table>
+              <thead><tr><th scope="col">Call type</th><th scope="col">Started</th><th scope="col">Failed</th><th scope="col">Active</th><th scope="col">Peak concurrent</th></tr></thead>
+              <tbody id="telemetry-http-rows"></tbody>
+            </table>
+          </div>
+          <h4 id="telemetry-replica-heading">Observed embedding replicas</h4>
+          <p id="telemetry-active-replicas">Replica activity unavailable.</p>
+          <p class="section-note" id="telemetry-replica-empty">No embedding POST has reached a tracked replica yet.</p>
+          <div class="table-wrap telemetry-table" id="telemetry-replica-table" role="region" aria-labelledby="telemetry-replica-heading" tabindex="0" hidden>
+            <table>
+              <thead><tr><th scope="col">Replica model</th><th scope="col">Connection</th><th scope="col">Started</th><th scope="col">Failed</th><th scope="col">Active</th><th scope="col">Peak concurrent</th></tr></thead>
+              <tbody id="telemetry-replica-rows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="telemetry-section" aria-labelledby="telemetry-recent-heading">
+          <h3 id="telemetry-recent-heading">Recent requests</h3>
+          <p>Open a request to see its timing, token usage, and recovery details.</p>
+          <p class="section-note" id="telemetry-recent-empty">No finished inference requests observed yet.</p>
+          <div id="telemetry-recent-rows" class="telemetry-request-list"></div>
+        </section>
+
+        <section id="security-audit" class="telemetry-section audit-section" aria-labelledby="audit-heading">
+          <div class="section-heading">
+            <div>
+              <h3 id="audit-heading" tabindex="-1">Security audit</h3>
+              <p id="audit-observed">Apply filters or refresh to read the audit.</p>
+            </div>
+            <div class="inline-actions audit-actions">
+              <button type="button" class="button secondary" id="audit-refresh">Refresh audit</button>
+              <button type="button" class="button secondary" id="audit-export" disabled>Export JSONL</button>
+            </div>
+          </div>
+          <div class="telemetry-scope audit-scope">
+            <p id="audit-storage">Storage status unknown.</p>
+            <p id="audit-retention"></p>
+            <p id="audit-dropped"></p>
+          </div>
+          <dl id="audit-coverage" class="audit-coverage" aria-label="Audit coverage" hidden></dl>
+          <form id="audit-filter">
+            <div class="form-grid audit-filter-grid">
+              <label>From (UTC)<input name="from" type="datetime-local" step="1"></label>
+              <label>To (UTC)<input name="to" type="datetime-local" step="1"></label>
+              <label>Session ID<input name="session_id" type="search" autocomplete="off" spellcheck="false"></label>
+              <label>Model<input name="model" type="search" autocomplete="off" spellcheck="false"></label>
+              <label>Tool name<input name="tool_name" type="search" autocomplete="off" spellcheck="false"></label>
+              <label>Phase
+                <select name="phase">
+                  <option value="">All phases</option>
+                  <option value="model_proposal">Model proposal</option>
+                  <option value="model_output">Model output</option>
+                  <option value="relay_decision">Relay decision</option>
+                  <option value="executor_dispatch">Executor dispatch</option>
+                  <option value="executor_outcome">Executor outcome</option>
+                  <option value="network_connection">Outbound connection</option>
+                </select>
+              </label>
+              <label>Outcome<input name="outcome" type="search" list="audit-outcomes" autocomplete="off" spellcheck="false"></label>
+              <label>Destination<input name="destination" type="search" autocomplete="off" spellcheck="false" placeholder="Hostname or IP, optional port"></label>
+            </div>
+            <datalist id="audit-outcomes">
+              <option value="proposed"></option><option value="literal_markup"></option><option value="approved"></option>
+              <option value="blocked"></option><option value="withheld"></option><option value="forwarded"></option>
+              <option value="dispatched"></option><option value="completed"></option><option value="succeeded"></option>
+              <option value="failed"></option><option value="cancelled"></option><option value="unknown"></option>
+              <option value="denied"></option><option value="observed"></option><option value="connected"></option>
+            </datalist>
+            <div class="inline-actions settings-actions">
+              <button type="submit" class="button primary" id="audit-apply">Apply filters</button>
+              <p class="section-note" id="audit-draft" hidden>Apply the edited filters to update the results and export.</p>
+              <p class="section-note" id="audit-progress" role="status" hidden></p>
+            </div>
+          </form>
+          <div class="notice error" id="audit-error" role="alert" hidden></div>
+          <p class="section-note" id="audit-empty" hidden></p>
+          <div id="audit-event-list" class="telemetry-request-list"></div>
+          <div class="audit-pagination">
+            <p class="section-note" id="audit-page"></p>
+            <div class="inline-actions audit-actions">
+              <button type="button" class="button secondary" id="audit-previous" disabled>Previous page</button>
+              <button type="button" class="button secondary" id="audit-next" disabled>Next page</button>
+            </div>
+          </div>
+        </section>
       </section>
 
       <section id="view-settings" class="view" aria-labelledby="settings-heading" hidden>

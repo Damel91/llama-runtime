@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 import hashlib
 import json
@@ -274,6 +274,7 @@ class AutomaticEmbeddingService:
         self.config = config
         self._client = client
         self._http_metrics = EmbeddingHTTPMetrics()
+        self._http_observer = None
         self._owns_client = client is None
         self._adapter = None
         self._identity = self._prefixes = None
@@ -346,9 +347,16 @@ class AutomaticEmbeddingService:
             else {}
         )
 
+    def _set_http_observer(self, observer):
+        self._http_observer = observer
+
     def _http_call(self, client, method, *args, **kwargs):
         kind = {"models": "catalog"}.get(method, method)
-        with self._http_metrics.measure(kind, "admission"):
+        observer = self._http_observer
+        with (
+            self._http_metrics.measure(kind, "admission"),
+            observer(kind, kwargs.get("model")) if observer else nullcontext(),
+        ):
             return getattr(client, method)(*args, **kwargs)
 
     def diagnostics(self):
@@ -502,6 +510,8 @@ class AutomaticEmbeddingService:
         with self._condition:
             operation.check()
             adapter = LlamaCppEmbeddingAdapter(profile, client=client)
+            if self._http_observer is not None:
+                adapter._set_http_observer(self._http_observer)
             # The selector can denote weights loaded with multiple embedding
             # semantics. Carry the already verified selected group into its
             # first admission rather than resolving the weight digest again.
@@ -753,8 +763,9 @@ class AutomaticEmbeddingService:
     ) -> AutomaticEmbeddingStatus:
         """Explicitly calibrate/load a character recommendation for the consumer.
 
-        All 10,000 native counts are collected once per verified task/prefix/
-        tokenizer binding. All categories reuse those completed statistics.
+        Native counts for the 2,500 corpus texts (500 per category) are
+        collected once per verified task, prefix and tokenizer binding.
+        All categories reuse those completed statistics.
         Consumers own persistence and source splitting. Ordinary embedding does
         not call this method, require its cache, or enforce its recommendation.
         """

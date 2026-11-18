@@ -51,7 +51,7 @@ from runtime_llama.usage import (
     LLMToolRecoveryAttempt,
     LLMToolRecoveryReport,
 )
-from runtime_llama.tool_recovery import ToolRecoveryPolicy
+from runtime_llama.tool_recovery import ToolRecoveryPolicy, _ToolAuditAttempt
 
 
 _RESERVED_REQUEST_FIELDS = {
@@ -97,6 +97,17 @@ _MESSAGE_FIELDS = (
 )
 _GUARDED_TOOL_TEXT = "_guarded_tool_text"
 _TOOL_CALL_OPEN = "<tool_call>"
+_NATIVE_TOOL_ERRORS = frozenset(
+    {
+        "llama_malformed_tool_call_delta",
+        "llama_missing_tool_call_index",
+        "llama_conflicting_tool_call_identity",
+        "llama_malformed_tool_call_function",
+        "llama_missing_tool_call_identity",
+        "llama_malformed_completed_tool_call",
+        "llama_duplicate_tool_call_identity",
+    }
+)
 
 
 @dataclass
@@ -221,6 +232,7 @@ class LlamaCppAdapter(LLMAdapter):
         self._observed_context_length: Optional[int] = None
         self._last_usage: Optional[LLMUsageStats] = None
         self._adapter_closed = False
+        self._tool_audit_observer = None
         token = self._generation_config.api_key or (
             os.environ.get(self._generation_config.api_key_env)
             if self._generation_config.api_key_env
@@ -576,6 +588,37 @@ class LlamaCppAdapter(LLMAdapter):
             raise LLMBackendError("llama_duplicate_tool_call_identity")
         return calls
 
+    def _set_tool_audit_observer(self, observer):
+        """Attach the relay's observer to this invocation-owned adapter."""
+        self._tool_audit_observer = observer
+
+    def _tool_audit_attempt(self, index):
+        observer = self._tool_audit_observer
+        if observer is not None:
+            return _ToolAuditAttempt(observer, index, self._diagnostic_secrets)
+        return None
+
+    @staticmethod
+    def _finish_failed_tool_audit(audit, error):
+        if audit is None:
+            return
+        code = str(error) if isinstance(error, LLMBackendError) else None
+        if code in _NATIVE_TOOL_ERRORS:
+            audit.decide("blocked", code)
+        else:
+            transport = getattr(error, "diagnostics", None)
+            reason = getattr(transport, "terminal_reason", None)
+            if reason not in {
+                "cancelled",
+                "connection_reset",
+                "early_eof",
+                "idle_timeout",
+                "upstream_server_error",
+                "queue_wait_timeout",
+            }:
+                reason = "native_attempt_interrupted"
+            audit.decide("withheld", reason)
+
     def _iter_stream_events_with_ctx(
         self,
         messages: Any,
@@ -586,6 +629,7 @@ class LlamaCppAdapter(LLMAdapter):
         timeout: Optional[float] = None,
         cancellation_probe: Optional[CancellationProbe] = None,
         request_options: Optional[Mapping[str, Any]] = None,
+        tool_audit: Optional[_ToolAuditAttempt] = None,
     ) -> Iterator[LLMStreamEvent]:
         idle = self._stream_idle(timeout)
         self._raise_if_cancelled(cancellation_probe, timeout=idle)
@@ -597,7 +641,10 @@ class LlamaCppAdapter(LLMAdapter):
             request_options=request_options,
         )
         yield from self._iter_chat_attempt(
-            body, idle=idle, cancellation_probe=cancellation_probe
+            body,
+            idle=idle,
+            cancellation_probe=cancellation_probe,
+            **({"tool_audit": tool_audit} if tool_audit is not None else {}),
         )
 
     def _iter_chat_attempt(
@@ -607,6 +654,7 @@ class LlamaCppAdapter(LLMAdapter):
         idle: float | None,
         cancellation_probe: Optional[CancellationProbe],
         tool_policy_enabled: bool = False,
+        tool_audit: Optional[_ToolAuditAttempt] = None,
     ) -> Iterator[LLMStreamEvent]:
         """Perform exactly one native POST against a frozen effective body."""
         body = deepcopy(dict(body))
@@ -661,6 +709,13 @@ class LlamaCppAdapter(LLMAdapter):
                 }
                 if observed_diagnostics:
                     native_tool_diagnostics.update(observed_diagnostics)
+                    if (
+                        tool_audit is not None
+                        and "strata_rejected_tool_calls" in observed_diagnostics
+                    ):
+                        tool_audit.observe_marker(
+                            observed_diagnostics["strata_rejected_tool_calls"]
+                        )
                     yield LLMStreamEvent(
                         kind="tool_diagnostic", data=observed_diagnostics
                     )
@@ -690,6 +745,8 @@ class LlamaCppAdapter(LLMAdapter):
                     delta = choice.get("delta")
                     if not isinstance(delta, Mapping):
                         raise LLMBackendError("llama_malformed_chat_delta")
+                    if tool_audit is not None and "tool_calls" in delta:
+                        tool_audit.observe_envelope(delta["tool_calls"])
                 observed_usage = self._usage_from_payload(
                     payload,
                     has_tool_calls=bool(tool_calls)
@@ -795,9 +852,18 @@ class LlamaCppAdapter(LLMAdapter):
                 exc.native_finish_reason = finish_reason
             raise
         finally:
-            close = getattr(stream, "close", None)
-            if callable(close):
-                close()
+            try:
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    close()
+            finally:
+                if tool_audit is not None:
+                    tool_audit.finish_native(
+                        {
+                            index: (call.metadata.get("id"), "".join(call.name_parts))
+                            for index, call in tool_calls.items()
+                        }
+                    )
 
     def _capture_rejected_thinking(
         self,
@@ -875,6 +941,7 @@ class LlamaCppAdapter(LLMAdapter):
         if not policy.enabled:
             # Keep the legacy native seam observable to third-party adapters
             # and test transports when no tool recovery is applicable.
+            audit = self._tool_audit_attempt(0)
             events = self._iter_stream_events_with_ctx(
                 messages,
                 num_ctx=num_ctx,
@@ -883,10 +950,12 @@ class LlamaCppAdapter(LLMAdapter):
                 timeout=timeout,
                 cancellation_probe=cancellation_probe,
                 request_options=request_options,
+                **({"tool_audit": audit} if audit is not None else {}),
             )
             started = time.perf_counter()
             usage = None
             server_timings = None
+            error = None
             try:
                 for event in events:
                     usage = event.usage if event.usage is not None else usage
@@ -905,6 +974,8 @@ class LlamaCppAdapter(LLMAdapter):
                             close = getattr(events, "close", None)
                             if callable(close):
                                 close()
+                            if audit is not None:
+                                audit.decide("blocked", decision.reasons[0])
                             attempt = LLMToolRecoveryAttempt(
                                 index=0,
                                 outcome="unsafe",
@@ -926,10 +997,18 @@ class LlamaCppAdapter(LLMAdapter):
                                 diagnostics=event.transport,
                             )
                     yield event
+                if audit is not None:
+                    audit.decide("approved", "native_tool_protocol_accepted")
+            except BaseException as failure:
+                error = failure
+                raise
             finally:
-                close = getattr(events, "close", None)
-                if callable(close):
-                    close()
+                try:
+                    close = getattr(events, "close", None)
+                    if callable(close):
+                        close()
+                finally:
+                    self._finish_failed_tool_audit(audit, error)
             return
 
         # Everything below belongs to this external invocation, never the
@@ -951,6 +1030,7 @@ class LlamaCppAdapter(LLMAdapter):
         leading_chunks: List[str] = []
         leading_marker = ""
         tool_markup = False
+        audit = None
 
         def native_cancelled() -> bool:
             # The native request owns its interruption even with a borrowed
@@ -1039,6 +1119,7 @@ class LlamaCppAdapter(LLMAdapter):
         try:
             for index in range(4):
                 check_cancelled()
+                audit = self._tool_audit_attempt(index)
                 repairing_committed = bool(published_chunks)
                 publish_text = stream_text and not repairing_committed
                 staged.clear()
@@ -1061,6 +1142,7 @@ class LlamaCppAdapter(LLMAdapter):
                     idle=idle,
                     cancellation_probe=native_cancelled,
                     tool_policy_enabled=True,
+                    **({"tool_audit": audit} if audit is not None else {}),
                 )
                 try:
                     try:
@@ -1096,6 +1178,7 @@ class LlamaCppAdapter(LLMAdapter):
                     finally:
                         stream.close()
                 except BaseException as error:
+                    self._finish_failed_tool_audit(audit, error)
                     if isinstance(error, GeneratorExit):
                         raise
                     reason = (
@@ -1175,6 +1258,8 @@ class LlamaCppAdapter(LLMAdapter):
                     reason = (
                         "visible_output_cap" if local_cap else terminal.terminal_reason
                     )
+                    if audit is not None:
+                        audit.decide("withheld", reason)
                     attempts.append(snapshot(index, reason, decision))
                     current_report = report()
                     # Existing partial-text behavior remains, but no candidate
@@ -1209,6 +1294,10 @@ class LlamaCppAdapter(LLMAdapter):
                     return
 
                 if decision.accepted:
+                    if audit is not None:
+                        if tool_markup:
+                            audit.literal_markup()
+                        audit.decide("approved", "tool_policy_accepted")
                     attempts.append(snapshot(index, "accepted", decision))
                     current_report = report()
                     for event in staged:
@@ -1227,6 +1316,8 @@ class LlamaCppAdapter(LLMAdapter):
                     thinking_diagnostics,
                     thinking_sink,
                 )
+                if audit is not None:
+                    audit.decide("blocked", decision.reasons[0])
                 can_correct = decision.recoverable
                 attempts.append(
                     snapshot(
@@ -1282,6 +1373,8 @@ class LlamaCppAdapter(LLMAdapter):
                 error.thinking_diagnostic = attempts[-1].thinking_diagnostic
             raise
         finally:
+            if audit is not None:
+                audit.decide("withheld", "native_attempt_interrupted")
             staged.clear()
             published_chunks.clear()
             leading_chunks.clear()

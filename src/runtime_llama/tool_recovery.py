@@ -31,9 +31,11 @@ _CREDENTIAL = re.compile(
     r"|\b(?:api[_-]?key|access[_-]?token|password)\b[\"']?\s*[:=]\s*"
     r"(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)"
 )
+_AUDIT_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+_TOOL_AUDIT_POLICY_VERSION = "native-tool-recovery-v1"
 
 
-def _safe_name(value: str, secrets: Sequence[str]) -> str:
+def _safe_name(value: str, secrets: Sequence[str], *, limit: int = 80) -> str:
     # Strata truncates names to80 characters before transmitting this field.
     # Redact a registered secret split at that boundary before our own export.
     native_boundary = len(value) >= 80
@@ -45,8 +47,112 @@ def _safe_name(value: str, secrets: Sequence[str]) -> str:
                     value = value[:-size] + "<credential_redacted>"
                     break
     return sanitize_diagnostic(
-        _CREDENTIAL.sub("<credential_redacted>", value), limit=80
+        _CREDENTIAL.sub("<credential_redacted>", value), limit=limit
     )
+
+
+def _valid_native_rejections(marker: Any) -> bool:
+    return isinstance(marker, list) and all(
+        isinstance(item, Mapping)
+        and set(item) == {"name", "reason"}
+        and isinstance(item.get("name"), str)
+        and item.get("reason") == "undeclared"
+        for item in marker
+    )
+
+
+class _ToolAuditAttempt:
+    """One native generation's content-free proposals and local disposition."""
+
+    def __init__(self, observer, index, secrets):
+        self._observer = observer
+        self._index = index
+        self._secrets = secrets
+        self._pending = {}
+        self._markers = set()
+        self._proposals = []
+        self._decided = False
+
+    def _identifier(self, value):
+        if (
+            isinstance(value, str)
+            and _AUDIT_IDENTIFIER.fullmatch(value)
+            and _safe_name(value, self._secrets, limit=128) == value
+        ):
+            return value
+        return None
+
+    def _record(self, phase, outcome, source, reason, proposal=None):
+        self._observer(
+            phase,
+            outcome,
+            source=source,
+            tool_call_id=proposal[1] if proposal else None,
+            tool_name=proposal[2] if proposal else None,
+            reason=reason,
+            policy_version=_TOOL_AUDIT_POLICY_VERSION,
+            attempt_index=self._index,
+            proposal_index=proposal[0] if proposal else None,
+        )
+
+    def _propose(self, identifier, name, reason=None):
+        proposal = (len(self._proposals), identifier, name)
+        self._proposals.append(proposal)
+        self._record("model_proposal", "proposed", "relay_native", reason, proposal)
+
+    def observe_marker(self, marker):
+        if not _valid_native_rejections(marker):
+            marker_key = None
+            if marker_key not in self._markers:
+                self._propose(None, None, "malformed_native_tool_rejection")
+        else:
+            marker_key = tuple(self._identifier(item["name"]) for item in marker)
+            if marker_key not in self._markers:
+                for name in marker_key:
+                    self._propose(None, name, "native_rejected_tool_call")
+        self._markers.add(marker_key)
+
+    def observe_envelope(self, deltas):
+        if not isinstance(deltas, list):
+            self._propose(None, None, "malformed_native_tool_delta")
+            return
+        for delta in deltas:
+            row = delta if isinstance(delta, Mapping) else {}
+            function = row.get("function")
+            name = self._identifier(
+                function.get("name") if isinstance(function, Mapping) else None
+            )
+            identifier = self._identifier(row.get("id"))
+            index = row.get("index")
+            if type(index) is int and index >= 0:
+                self._pending.setdefault(index, (identifier, name))
+            else:
+                self._propose(identifier, name, "malformed_native_tool_delta")
+
+    def finish_native(self, identities):
+        for index, (identifier, name) in self._pending.items():
+            if index in identities:
+                observed_id, observed_name = identities[index]
+                if observed_id is not None:
+                    identifier = self._identifier(observed_id)
+                if observed_name:
+                    name = self._identifier(observed_name)
+            self._propose(identifier, name)
+        self._pending.clear()
+
+    def decide(self, outcome, reason):
+        if not self._decided:
+            self._decided = True
+            for proposal in self._proposals:
+                self._record(
+                    "relay_decision", outcome, "relay_policy", reason, proposal
+                )
+
+    def literal_markup(self):
+        if not self._proposals:
+            self._record(
+                "model_output", "literal_markup", "relay_native", "literal_tool_markup"
+            )
 
 
 def _json_snapshot(value: Any) -> str:
@@ -301,13 +407,7 @@ class ToolRecoveryPolicy:
             if _NATIVE_MARKER not in data:
                 continue
             marker = data[_NATIVE_MARKER]
-            if not isinstance(marker, list) or any(
-                not isinstance(item, Mapping)
-                or set(item) != {"name", "reason"}
-                or not isinstance(item.get("name"), str)
-                or item.get("reason") != "undeclared"
-                for item in marker
-            ):
+            if not _valid_native_rejections(marker):
                 fatal.append("malformed_native_tool_rejection")
                 provenance.append("sdk_protocol")
                 continue

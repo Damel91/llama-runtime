@@ -14,6 +14,7 @@ from runtime_llama import (
     build_adapter,
     build_embedding_adapter,
 )
+from runtime_llama.embedding_halving import EmbeddingChunkSplitRequiredError
 from runtime_llama.errors import (
     LLMBackendError,
     LLMCancelledError,
@@ -29,6 +30,7 @@ from runtime_llama.relay.state import (
     RelayRequestRegistry,
 )
 from runtime_llama.relay.protocol import RelayError, map_error, usage_payload
+from runtime_llama.relay.telemetry import RelayEmbeddingTelemetry
 from runtime_llama.usage import LLMToolRecoveryReport
 
 
@@ -39,6 +41,8 @@ class _Operation:
     def __init__(self, service, kind, model, external_cancel, request_id):
         self.service = service
         self.model = model
+        self.started = time.monotonic()
+        self.first_text_recorded = False
         self.lease = service.generations.acquire()
         self.snapshot = self.lease.snapshot
         try:
@@ -130,6 +134,9 @@ class RelayService:
         self._helper_epoch = 0
         self._tailnet_state = "stopped"
         self._tailnet_error = None
+        self._discovery_serial = self._published_discovery = 0
+        self._loaded_model_identities = set()
+        self._embedding_telemetry = RelayEmbeddingTelemetry()
         self._catalog = {
             "revision": self.config_store.snapshot().revision,
             "observed_at": None,
@@ -185,6 +192,7 @@ class RelayService:
                 raise RelayError(503, "relay_service_closed")
             operation = _Operation(self, kind, model, cancel_event, request_id)
             self._operations[operation.request.request_id] = operation
+            self.registry.update(operation.request.request_id, phase="routing")
         status, error_code, primary_failed = "completed", None, False
         try:
             operation.check()
@@ -211,7 +219,9 @@ class RelayService:
             raise
         finally:
             cleanup_error = None
+            final = None
             try:
+                self.registry.update(operation.request.request_id, phase="draining")
                 for lease in (
                     operation.resource_lease,
                     operation.helper_lease,
@@ -233,16 +243,28 @@ class RelayService:
                 if cleanup_error is not None and status == "completed":
                     status, error_code = "failed", map_error(cleanup_error).code
             finally:
-                self.registry.finish(
-                    operation.request.request_id,
-                    status=status,
-                    **({"error_code": error_code} if error_code else {}),
-                )
                 with self._lock:
+                    # Commit the terminal classification and remove the operation
+                    # under the same lock as an administrative Stop. Forward a
+                    # downstream disconnect to the registry's cancellation event.
+                    if status == "completed" and operation.cancelled():
+                        operation.request.cancel_event.set()
+                    details = {"error_code": error_code} if error_code else {}
+                    if status == "cancelled":
+                        details["terminal_reason"] = "cancelled"
+                    final = self.registry.finish(
+                        operation.request.request_id, status=status, **details
+                    )
                     self._operations.pop(operation.request.request_id, None)
                 operation.done.set()
             if cleanup_error is not None and not primary_failed:
                 raise cleanup_error
+            if (
+                status == "completed"
+                and final is not None
+                and final["status"] == "cancelled"
+            ):
+                raise LLMCancelledError()
 
     def _endpoints(self, operation):
         snapshot = operation.snapshot
@@ -280,6 +302,9 @@ class RelayService:
 
     def _discover_for(self, operation):
         endpoints, unavailable, helper_lease, helper_epoch = self._endpoints(operation)
+        with self._lock:
+            self._discovery_serial += 1
+            serial = self._discovery_serial
         try:
             catalog = self._discovery(
                 endpoints,
@@ -288,15 +313,20 @@ class RelayService:
                 ),
                 cancellation_probe=operation.cancelled,
             )
+            self.registry.update(
+                operation.request.request_id,
+                discovery_ms=catalog.elapsed_seconds * 1000.0,
+                discovery_http_requests=catalog.http_requests,
+            )
             operation.check()
             rendered = self._render_catalog(operation.snapshot, catalog, unavailable)
             retired = []
             with self._lock:
                 if (
                     self.config_store.snapshot().revision == operation.snapshot.revision
+                    and serial > self._published_discovery
                     and not self._closed
                 ):
-                    self._catalog = rendered
                     loaded = {
                         (
                             runtime.endpoint.name,
@@ -308,6 +338,9 @@ class RelayService:
                         if runtime.available and runtime.catalog is not None
                         for item in runtime.catalog.loaded_models
                     }
+                    self._catalog = rendered
+                    self._published_discovery = serial
+                    self._loaded_model_identities = loaded
                     stale = [
                         key
                         for key in self._cached
@@ -452,6 +485,7 @@ class RelayService:
                     operation.helper_lease, helper_lease = helper_lease, None
             self.registry.update(
                 operation.request.request_id,
+                phase="inference",
                 backend=selection.backend,
                 endpoint=endpoint.name,
                 selected_model=selection.model.id,
@@ -524,6 +558,13 @@ class RelayService:
 
     def _record_event(self, operation, event):
         updates = {}
+        if (
+            not operation.first_text_recorded
+            and getattr(event, "kind", None) == "content"
+            and event.text
+        ):
+            operation.first_text_recorded = True
+            updates["first_text_ms"] = (time.monotonic() - operation.started) * 1000.0
         if event.usage is not None:
             updates["usage"] = usage_payload(event.usage)
         if event.server_timings is not None:
@@ -542,6 +583,12 @@ class RelayService:
         ) as operation:
             selection = self._select(operation, request.model, "llm")
             adapter = self._per_call_adapter(operation, request, selection)
+            audit = getattr(request, "audit_context", None)
+            if audit is not None:
+                audit.route(selection.model.id, selection.backend)
+                set_observer = getattr(adapter, "_set_tool_audit_observer", None)
+                if callable(set_observer):
+                    set_observer(audit.record)
             options = {
                 "request_options": request.options,
                 "cancellation_probe": operation.cancelled,
@@ -591,10 +638,14 @@ class RelayService:
         with self._lock:
             if self._closed:
                 raise LLMCancelledError()
+            cacheable = (
+                self._catalog["revision"] == key[0]
+                and (key[1], key[2], key[4], key[5]) in self._loaded_model_identities
+            )
             generation = self._cached.get(key)
             if generation is None:
                 generation = self._new_generation(operation.snapshot)
-                if self.config_store.snapshot().revision == operation.snapshot.revision:
+                if cacheable:
                     self._cached[key] = generation
                 if operation.helper_epoch is not None:
                     self._helper_resources[generation] = operation.helper_epoch
@@ -603,7 +654,7 @@ class RelayService:
             stale = [
                 old_key
                 for old_key in self._cached
-                if old_key[:3] == key[:3] and old_key != key
+                if cacheable and old_key[:3] == key[:3] and old_key != key
             ]
             retired = [self._cached.pop(old_key) for old_key in stale]
         for old in retired:
@@ -619,39 +670,59 @@ class RelayService:
                 "http_connection_policy": endpoint.http_connection_policy,
             }
             if verified:
-                return self._automatic_embedding_factory({**settings, **common})
-            renamed = {
-                "request_parallelism": "embedding_request_parallelism",
-                "queue_size": "embedding_queue_size",
-            }
-            direct = {
-                renamed.get(name, name): value for name, value in settings.items()
-            }
-            return self._embedding_factory(
-                {**direct, **common, "embedding_replica_discovery": False}
-            )
+                adapter = self._automatic_embedding_factory({**settings, **common})
+            else:
+                renamed = {
+                    "request_parallelism": "embedding_request_parallelism",
+                    "queue_size": "embedding_queue_size",
+                }
+                direct = {
+                    renamed.get(name, name): value for name, value in settings.items()
+                }
+                adapter = self._embedding_factory(
+                    {**direct, **common, "embedding_replica_discovery": False}
+                )
+            if callable(set_observer := getattr(adapter, "_set_http_observer", None)):
+                set_observer(self._embedding_telemetry.for_endpoint(endpoint.name))
+            return adapter
 
-        adapter = operation.resource_lease.resource("embedding", build)
-        with self._lock:
-            still_cached = self._cached.get(key) is generation
-        if not still_cached:
-            self._retire(generation)
+        try:
+            adapter = operation.resource_lease.resource("embedding", build)
+        finally:
+            with self._lock:
+                still_cached = self._cached.get(key) is generation
+            if not still_cached:
+                self._retire(generation)
         return adapter, verified, input_type
 
     def embed(self, request, *, cancel_event=None, request_id=None):
         with self._operation(
             "embedding", request.model, cancel_event, request_id
         ) as operation:
+            self.registry.update(
+                operation.request.request_id, embedding_inputs=len(request.inputs)
+            )
             selection = self._select(operation, request.model, "embedding")
             adapter, verified, default_task = self._embedding(
                 operation, request.model, selection
             )
             method = adapter.embed_texts if verified else adapter.embed_texts_direct
-            return method(
-                request.inputs,
-                input_type=request.input_type or default_task,
-                cancel=operation.cancelled,
+            try:
+                vectors = method(
+                    request.inputs,
+                    input_type=request.input_type or default_task,
+                    cancel=operation.cancelled,
+                )
+            except EmbeddingChunkSplitRequiredError as error:
+                self.registry.update(
+                    operation.request.request_id,
+                    embedding_outputs=len(error.completed),
+                )
+                raise
+            self.registry.update(
+                operation.request.request_id, embedding_outputs=len(vectors)
             )
+            return vectors
 
     def replace_config(self, expected_revision, config):
         with self._lock:
@@ -662,6 +733,7 @@ class RelayService:
             self.generations.replace(snapshot)
             retired = list(self._cached.values())
             self._cached.clear()
+            self._loaded_model_identities.clear()
             helper = None
             if old.config["tailnet"] != snapshot.config["tailnet"]:
                 helper, self._helper = self._helper, None
@@ -702,6 +774,13 @@ class RelayService:
                 },
                 "requests": self.registry.snapshot(),
             }
+
+    def telemetry(self):
+        data = self.registry.telemetry_snapshot()
+        with self._lock:
+            data["catalog_observed_at"] = self._catalog["observed_at"]
+        data["embedding_http"] = self._embedding_telemetry.snapshot()
+        return data
 
     def start_tailnet(self):
         with self._tailnet_transition:

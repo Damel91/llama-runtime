@@ -55,6 +55,60 @@ The console shows when the configured listener differs from the running address.
 Use **Theme** in the header to switch between **Light** and **Dark**. The
 browser remembers your choice for this relay.
 
+## Telemetry
+
+Open **Telemetry** to see active chat and embedding requests, recent outcomes,
+and the time of the last catalog observation. Filter active and recent requests
+by runtime, model and operation. Process totals count admitted inference since
+the relay started. Per-model summaries use the active requests and retained
+completions. The relay keeps the latest 128 inference completions in memory.
+
+For chat, **First text at relay** is measured from admission to the first
+nonempty visible-text event of a stream. Native prefill, decode and generation
+speed appear when reported by the server. The relay's own elapsed time includes
+discovery and cleanup. Token counts for the accepted response and recovery
+attempts may have different coverage.
+
+For embedding, the request summary counts input texts and produced vectors.
+The embedding HTTP panel counts adapter attempts by operation and shows current
+and peak overlap by replica. Several relay requests can share a native POST.
+These HTTP counters are relay-wide and reflect observed transport work.
+
+The console reads `GET /api/admin/telemetry` with its existing admin session.
+Reading a snapshot uses only local observations. Recent summaries contain
+operational metadata such as model ID and outcome codes. Request content and
+credentials stay outside the telemetry records.
+
+### Security audit
+
+Open **Security audit** within **Telemetry** to trace native tool proposals,
+relay validation decisions and tool handoffs. The timeline also identifies
+literal tool markup when the relay distinguishes it as text. A handoff records
+that the relay sent the tool proposal through its HTTP response. Dispatch and
+results require evidence from the executor. Connections by tools or child
+processes require a trusted network observation. The console shows **Not
+observed** where these sources are unavailable.
+
+The relay keeps a local SQLite database next to the configuration file, named
+`<config-name>.audit.sqlite3`. It retains up to 20,000 events from the last 30
+days, with pruning on open, read and write. A relay embedded without a file-backed
+configuration has a temporary in-memory audit. The console reports storage
+availability and dropped events. The database holds typed metadata, including
+UTC timestamps, request and correlation IDs and eligible tool identifiers. An
+optional `X-Relay-Audit-Session` or `X-Relay-Audit-Correlation` value supplies an
+opaque client-declared label. It carries no authority. The default correlation
+ID is the relay request ID. Only an observed trusted network event supplies a
+destination host, port and known address class.
+
+Use the audit filters to narrow the time range, session, model, tool, phase,
+outcome or destination. `GET /api/admin/audit` reads the timeline and returns
+the `next_before` cursor for older matching events. `GET /api/admin/audit/export`
+downloads the same filtered retained records in JSONL. Both use the existing
+admin session. There is currently no public ingestion interface for executor or
+network observations.
+
+## Console access
+
 The console uses its own local administration session. A relay inference key
 protects `/v1` and is separate from upstream server keys. Prefer environment
 references where available. Literal secrets belong in the private configuration

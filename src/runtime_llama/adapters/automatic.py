@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import os
-from threading import Event, Lock, get_ident
+from threading import Event, Lock, get_ident, local
 from typing import Any, Iterator, Mapping, Optional
 
 from runtime_llama._proxy import proxy_secrets
@@ -26,9 +26,15 @@ from runtime_llama.usage import LLMStreamEvent
 @dataclass(eq=False)
 class _Operation:
     owner_thread: int
+    revision: int
     stop: Event = field(default_factory=Event)
     discovery_done: Event = field(default_factory=Event)
     client: LlamaCppClient | None = None
+
+
+class _DiscoveryCallbackCloseError(LLMBackendError):
+    def __init__(self) -> None:
+        super().__init__("runtime_adapter_close_from_discovery_callback")
 
 
 class AutoRuntimeAdapter(LlamaCppAdapter):
@@ -37,8 +43,10 @@ class AutoRuntimeAdapter(LlamaCppAdapter):
     Endpoint configuration belongs to deployment. A new read-only probe selects
     the backend for each generation; that selection is fixed for the entire
     request and included in its normalized result/events. Concurrent requests
-    never change one another's route. Catalog/selection properties describe the
-    latest observation, not a future readiness guarantee or an active lease.
+    never change one another's route. Catalog and selection properties retain
+    the latest completed discovery while a refresh is pending. After a newer
+    discovery publishes, an older operation cannot replace it. The snapshot
+    provides observational metadata only.
     """
 
     def __init__(self, profile: AdapterProfile) -> None:
@@ -58,6 +66,9 @@ class AutoRuntimeAdapter(LlamaCppAdapter):
         self._runtime_lock = Lock()
         self._runtime_closed = False
         self._runtime_operations: set[_Operation] = set()
+        self._operation_revision = 0
+        self._catalog_revision = 0
+        self._discovery_callback = local()
         self._current_catalog: RuntimeCatalog | None = None
         self._selected_runtime: RuntimeModelSelection | None = None
         super().__init__(
@@ -109,13 +120,12 @@ class AutoRuntimeAdapter(LlamaCppAdapter):
 
     def _begin(self, cancel: CancellationProbe | None) -> _Operation:
         _cancelled(cancel)
-        operation = _Operation(get_ident())
         with self._runtime_lock:
             if self._runtime_closed:
                 raise LLMBackendError("runtime_adapter_closed")
+            self._operation_revision += 1
+            operation = _Operation(get_ident(), self._operation_revision)
             self._runtime_operations.add(operation)
-            self._current_catalog = None
-            self._selected_runtime = None
         return operation
 
     @staticmethod
@@ -157,6 +167,23 @@ class AutoRuntimeAdapter(LlamaCppAdapter):
         cancel: CancellationProbe | None,
         timeout: float | None = None,
     ) -> RuntimeCatalog:
+        cancel_operation = self._cancel(operation, cancel)
+        rejected_close = Event()
+
+        def guarded_cancel() -> bool:
+            if rejected_close.is_set():
+                return True
+            active = getattr(self._discovery_callback, "active", False)
+            self._discovery_callback.active = True
+            try:
+                return cancel_operation()
+            except _DiscoveryCallbackCloseError:
+                rejected_close.set()
+                return True
+            finally:
+                self._discovery_callback.active = active
+
+        probe = cancel_operation if cancel is None else guarded_cancel
         try:
             catalog = discover_runtimes(
                 self._runtime_endpoints,
@@ -165,17 +192,35 @@ class AutoRuntimeAdapter(LlamaCppAdapter):
                     if timeout is None
                     else timeout
                 ),
-                cancellation_probe=self._cancel(operation, cancel),
+                cancellation_probe=probe,
             )
-            _cancelled(self._cancel(operation, cancel))
+            _cancelled(probe)
             with self._runtime_lock:
                 if self._runtime_closed:
                     raise LLMCancelledError()
-                self._current_catalog = catalog
-                self._selected_runtime = None
+                if operation.revision > self._catalog_revision:
+                    self._catalog_revision = operation.revision
+                    self._current_catalog = catalog
+                    self._publish_selection_locked(operation, None)
             return catalog
+        except LLMCancelledError:
+            if rejected_close.is_set():
+                raise _DiscoveryCallbackCloseError() from None
+            raise
         finally:
             operation.discovery_done.set()
+
+    def _publish_selection_locked(
+        self, operation: _Operation, selection: RuntimeModelSelection | None
+    ) -> None:
+        # A selection belongs to the discovery that produced it. An older
+        # operation still owns its route, but cannot overwrite a newer snapshot.
+        if operation.revision == self._catalog_revision:
+            self._selected_runtime = selection
+            observed = selection.model.loaded_context if selection is not None else None
+            self._observed_context_length = (
+                observed.value if observed is not None else None
+            )
 
     def discover_models(
         self,
@@ -184,7 +229,7 @@ class AutoRuntimeAdapter(LlamaCppAdapter):
         cancellation_probe: CancellationProbe | None = None,
     ) -> RuntimeCatalog:
         """Probe every configured endpoint and list each observed model catalog."""
-        operation = self._begin(cancellation_probe)
+        operation = self._begin(None)
         try:
             return self._discover(operation, cancellation_probe, timeout)
         finally:
@@ -295,8 +340,7 @@ class AutoRuntimeAdapter(LlamaCppAdapter):
                 closed = self._runtime_closed or operation.stop.is_set()
                 if not closed:
                     operation.client = client
-                    self._current_catalog = catalog
-                    self._selected_runtime = selection
+                    self._publish_selection_locked(operation, selection)
             if closed:
                 client.close()
                 raise LLMCancelledError()
@@ -362,9 +406,7 @@ class AutoRuntimeAdapter(LlamaCppAdapter):
             with self._runtime_lock:
                 if self._runtime_closed or operation.stop.is_set():
                     raise LLMCancelledError()
-                self._current_catalog = catalog
-                self._selected_runtime = selection
-                self._observed_context_length = context
+                self._publish_selection_locked(operation, selection)
             ready = selection is not None
             healthy = any(item.available for item in catalog.runtimes)
             available = any(
@@ -394,7 +436,13 @@ class AutoRuntimeAdapter(LlamaCppAdapter):
             self._finish(operation)
 
     def close(self) -> None:
-        """Stop discovery and drain active HTTP even for a paused generator."""
+        """Stop discovery and drain active HTTP even for a paused generator.
+
+        Discovery callbacks must signal cancellation by returning true.
+        A callback attempting to drain its own discovery raises LLMBackendError.
+        """
+        if getattr(self._discovery_callback, "active", False):
+            raise _DiscoveryCallbackCloseError()
         with self._runtime_lock:
             self._runtime_closed = True
             operations = tuple(self._runtime_operations)
@@ -414,6 +462,7 @@ class AutoRuntimeAdapter(LlamaCppAdapter):
             self._runtime_operations.difference_update(operations)
             self._selected_runtime = None
             self._current_catalog = None
+            self._observed_context_length = None
 
 
 __all__ = ["AutoRuntimeAdapter"]

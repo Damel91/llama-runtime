@@ -7,10 +7,32 @@ const RelayConsole = (() => {
   const THEME_KEY = "llama-runtime.relay.theme";
   const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
   const clone = (value) => JSON.parse(JSON.stringify(value));
+  const requestCards = new WeakMap();
+  const auditPhases = {
+    model_proposal: "Model proposal",
+    model_output: "Model output",
+    relay_decision: "Relay decision",
+    executor_dispatch: "Executor dispatch",
+    executor_outcome: "Executor outcome",
+    network_connection: "Outbound connection",
+  };
+  const auditSources = {
+    relay_native: "Native runtime",
+    relay: "Relay",
+    relay_policy: "Relay policy",
+    relay_transport: "Relay transport",
+    executor: "Executor",
+    network_monitor: "Network monitor",
+  };
   const state = {
-    token: null, revision: null, config: null, secretFields: [], endpointSecrets: new Map(),
+    token: null, sessionPending: null, pageActive: true, pageEpoch: 0,
+    revision: null, config: null, configAction: null, secretFields: [], endpointSecrets: new Map(),
     catalog: {revision: null, observed_at: null, runtimes: []}, status: null,
     requests: {active: [], last_completed: null}, view: "models", settingsTab: "generation",
+    connection: "connecting", observations: 0, connectionObservation: 0,
+    requestsObserved: null, requestsStale: false, localRefresh: null,
+    telemetry: null, telemetryStale: false, telemetryRefresh: null,
+    audit: {data: null, filters: {}, cursors: [null], checkedAt: null, dirty: false, edit: 0, operation: null, stale: false},
     dirty: false, errors: new Map(), rawFields: new Map(), selectedRow: null,
     selectedModels: new Set(), endpointIndex: null, exportDraft: null, exportValue: null, exportApplying: false, poll: null, tailnetDraft: null,
   };
@@ -133,7 +155,15 @@ const RelayConsole = (() => {
   }
   function updateSaveState() {
     $("dirty-label").hidden = !state.dirty;
-    $("save-config").disabled = !state.config || !state.dirty || state.errors.size > 0;
+    const updating = state.configAction !== null;
+    $("save-config").disabled = updating || !state.config || !state.dirty || state.errors.size > 0;
+    $("reload-config").disabled = updating;
+    $("resolve-conflict").disabled = updating;
+    $("config-progress").hidden = !updating;
+    $("config-progress").textContent = state.configAction === "save" ? "Saving settings…" : updating ? "Reloading settings…" : "";
+    for (const id of ["view-connections", "view-settings", "endpoint-dialog"]) {
+      $(id).inert = updating;
+    }
   }
   function button(label, handler, variant = "secondary", small = false) {
     const value = node("button", `button ${variant}${small ? " small" : ""}`, label);
@@ -153,14 +183,15 @@ const RelayConsole = (() => {
       $("clear-last").disabled = !state.requests.last_completed;
     }
   }
-  async function api(path, {method = "GET", body, token = true} = {}) {
-    const headers = {Accept: "application/json"};
-    if (token && state.token) headers[TOKEN_HEADER] = state.token;
+  async function adminRequest(path, {method = "GET", body, format = "json"} = {}, token) {
+    const headers = {Accept: format === "jsonl" ? "application/x-ndjson" : "application/json"};
+    if (token) headers[TOKEN_HEADER] = token;
     if (body !== undefined) headers["Content-Type"] = "application/json";
     const response = await fetch(PREFIX + path, {
       method, headers, credentials: "same-origin", cache: "no-store", redirect: "error",
       ...(body !== undefined ? {body: JSON.stringify(body)} : {}),
     });
+    if (response.ok && format === "jsonl") return response.blob();
     let value;
     try { value = await response.json(); }
     catch (_) { throw new Error("The relay returned an unreadable response. Reload the console to reconnect."); }
@@ -171,6 +202,29 @@ const RelayConsole = (() => {
       throw error;
     }
     return value;
+  }
+  function adminSession() {
+    if (state.token) return Promise.resolve(state.token);
+    if (!state.pageActive) return Promise.reject(new Error("The console is inactive."));
+    if (state.sessionPending) return state.sessionPending;
+    const epoch = state.pageEpoch;
+    const attempt = adminRequest("/session").then((session) => {
+      if (epoch !== state.pageEpoch) throw new Error("The console session changed.");
+      if (session.api_version !== 1 || !session.admin_token) throw new Error("This console requires admin API version 1.");
+      state.token = session.admin_token;
+      return state.token;
+    }).finally(() => { if (state.sessionPending === attempt) state.sessionPending = null; });
+    state.sessionPending = attempt;
+    return attempt;
+  }
+  async function api(path, options) {
+    const token = await adminSession();
+    try { return await adminRequest(path, options, token); }
+    catch (error) {
+      if (error.status !== 401 || error.code !== "relay_admin_token_required") throw error;
+      if (state.token === token) state.token = null;
+      return adminRequest(path, options, await adminSession());
+    }
   }
   function loadConfig(value) {
     state.revision = value.revision;
@@ -193,22 +247,18 @@ const RelayConsole = (() => {
   }
   async function reloadConfig(discard = true) {
     if (discard && state.dirty && !window.confirm("Discard unsaved changes and reload the saved relay settings?")) return;
-    const session = await api("/session", {token: false});
-    if (session.api_version !== 1 || !session.admin_token) throw new Error("This console requires admin API version 1.");
-    state.token = session.admin_token;
     loadConfig(await api("/config"));
-    await refreshLocalState();
     notice("Saved settings loaded.");
+    await refreshLocalState({afterPending: true}).catch(() => {});
   }
   async function saveConfig() {
-    document.activeElement?.blur();
     if (state.errors.size) throw new Error("Correct the highlighted fields before saving.");
     try {
       const value = await api("/config", {method: "PUT", body: savePayload(state.revision, state.config)});
       loadConfig(value);
       $("restart-notice").hidden = value.restart_required !== true;
       notice("Settings saved. New requests use the new configuration; active requests keep their original settings.");
-      await refreshLocalState();
+      await refreshLocalState({afterPending: true}).catch(() => {});
     } catch (error) {
       if (error.status === 409) {
         $("conflict-notice").hidden = false;
@@ -216,19 +266,69 @@ const RelayConsole = (() => {
       } else throw error;
     }
   }
-  async function refreshLocalState() {
-    const results = await Promise.allSettled([api("/status"), api("/requests")]);
-    if (results[0].status === "fulfilled") { state.status = results[0].value; renderStatus(); }
-    if (results[1].status === "fulfilled") { state.requests = results[1].value; renderRequests(); }
-    const failed = results.find((result) => result.status === "rejected");
-    if (failed) throw failed.reason;
+  async function changeConfig(action, run) {
+    if (state.configAction) return;
+    state.configAction = action;
+    updateSaveState();
+    try { await run(); }
+    catch (error) { notice(error.message, true); }
+    finally { state.configAction = null; updateSaveState(); }
+  }
+  function refreshSnapshot(key, path, update, stale) {
+    if (state[key]) return state[key];
+    const epoch = state.pageEpoch;
+    const observation = ++state.observations;
+    const recordConnection = (connection) => {
+      if (observation < state.connectionObservation) return;
+      state.connectionObservation = observation;
+      state.connection = connection;
+      renderStatus();
+    };
+    const refresh = api(path).then((value) => {
+      if (epoch !== state.pageEpoch) return;
+      update(value);
+      recordConnection("connected");
+    }).catch((error) => {
+      if (epoch !== state.pageEpoch) return;
+      stale();
+      recordConnection("unavailable");
+      throw error;
+    }).finally(() => { if (state[key] === refresh) state[key] = null; });
+    state[key] = refresh;
+    return refresh;
+  }
+  function refreshLocalState({afterPending = false} = {}) {
+    if (afterPending && state.localRefresh) return state.localRefresh.catch(() => {}).then(() => refreshLocalState());
+    return refreshSnapshot("localRefresh", "/status", (value) => {
+      state.status = value;
+      state.requests = value.requests;
+      state.requestsObserved = new Date().toISOString();
+      state.requestsStale = false;
+      renderRequests();
+      renderRequestObservation();
+    }, () => { state.requestsStale = true; renderRequestObservation(); });
+  }
+  function refreshTelemetry() {
+    return refreshSnapshot("telemetryRefresh", "/telemetry", (value) => {
+      state.telemetry = value;
+      state.telemetryStale = false;
+      renderTelemetry();
+    }, () => { state.telemetryStale = true; renderTelemetryObservation(); });
+  }
+  function renderRequestObservation() {
+    $("requests-observed").textContent = state.requestsStale
+      ? state.requestsObserved ? `Update failed. Showing the snapshot from ${formatDate(state.requestsObserved)}.` : "Requests are unavailable. Try refreshing."
+      : state.requestsObserved ? `Updated ${formatDate(state.requestsObserved)}.` : "Waiting for the first snapshot.";
   }
   function renderStatus() {
-    if (!state.status) return;
-    $("service-state").textContent = "Connected";
-    $("service-state").className = "status-tag ready";
+    const available = state.connection === "connected";
+    $("service-state").textContent = available ? "Connected" : state.connection === "connecting" ? "Connecting" : "Connection unavailable";
+    $("service-state").className = `status-tag${available ? " ready" : state.connection === "unavailable" ? " error" : ""}`;
     $("api-url").textContent = `${window.location.origin}/v1`;
-    $("footer-state").textContent = `Local relay connected. Saved configuration revision ${state.status.revision ?? state.revision}.`;
+    $("footer-state").textContent = available
+      ? `Local relay connected. Saved configuration revision ${state.status?.revision ?? state.revision}.`
+      : state.connection === "connecting" ? "Connecting to the local relay." : "The local administration connection is unavailable.";
+    if (!state.status) return;
     $("restart-notice").hidden = state.status.restart_required !== true;
     const helper = state.status.tailnet || {};
     const helperState = helper.state || helper.status || (helper.running === true ? "Running" : helper.running === false ? "Stopped" : "Unknown");
@@ -237,11 +337,16 @@ const RelayConsole = (() => {
     $("start-tailnet").disabled = !state.config?.tailnet || ["running", "ready", "starting"].includes(String(helperState).toLowerCase());
     $("stop-tailnet").disabled = ["stopped", "not_configured", "disabled"].includes(String(helperState).toLowerCase());
   }
-  function navigate(view, focus = false) {
+  function watchView() { return state.view === "requests" || state.view === "telemetry"; }
+  function refreshVisibleView() {
+    return state.view === "telemetry" ? refreshTelemetry() : refreshLocalState();
+  }
+  function navigate(view) {
     const descriptions = {
       models: ["Models", "The models your configured runtimes actually report."],
       connections: ["Connections", "Connect native runtimes without moving their models or processes."],
       requests: ["Requests", "Inspect the work owned by this relay and its latest completion."],
+      telemetry: ["Telemetry", "Observe latency, tool recovery, and embedding traffic through this relay."],
       settings: ["Settings", "Configure the local relay while active requests keep their own settings."],
     };
     state.view = own(descriptions, view) ? view : "models";
@@ -252,17 +357,16 @@ const RelayConsole = (() => {
     }
     $("view-title").textContent = descriptions[state.view][0];
     $("view-description").textContent = descriptions[state.view][1];
-    if (state.view === "requests" && state.token) refreshLocalState().catch((error) => notice(error.message, true));
-    if (focus) $("workspace").focus({preventScroll: true});
+    if (watchView() && state.config && !document.hidden) refreshVisibleView().catch(() => {});
     schedulePoll();
   }
   function schedulePoll() {
     if (state.poll !== null) window.clearTimeout(state.poll);
     state.poll = null;
-    if (state.view !== "requests" || document.hidden || !state.token) return;
+    if (!watchView() || document.hidden || !state.pageActive || !state.config) return;
     state.poll = window.setTimeout(async () => {
-      try { await refreshLocalState(); }
-      catch (error) { notice(error.message, true); }
+      try { await refreshVisibleView(); }
+      catch { /* The last snapshot remains visible with its update status. */ }
       finally { schedulePoll(); }
     }, 2000);
   }
@@ -341,7 +445,10 @@ const RelayConsole = (() => {
     const rail = $("runtime-rail"); rail.replaceChildren();
     for (const runtime of state.catalog.runtimes || []) {
       const item = node("div", `runtime-node ${runtime.available === true ? "available" : runtime.available === false ? "unavailable" : ""}`);
-      item.append(node("span", "node-status"), node("strong", "", runtime.name || runtime.endpoint?.name || "Unnamed endpoint"), node("span", "", runtime.backend || "Unknown runtime"));
+      const marker = node("span", "node-status");
+      marker.setAttribute("aria-hidden", "true");
+      const availability = runtime.available === true ? "Available" : runtime.available === false ? "Unavailable" : "Availability unknown";
+      item.append(marker, node("strong", "", runtime.name || runtime.endpoint?.name || "Unnamed endpoint"), node("span", "", runtime.backend || "Unknown runtime"), node("span", "runtime-availability", availability));
       item.title = [runtime.endpoint?.base_url, ...(runtime.diagnostics || [])].filter(Boolean).join("\n");
       rail.append(item);
     }
@@ -641,7 +748,7 @@ const RelayConsole = (() => {
     const card = node("article", "request-summary"); const header = node("div", "request-summary-header"); const identity = node("div");
     identity.append(node("h3", "", summary.selected_model || summary.model || "Model not reported"), node("p", "technical-value", `${summary.kind || "Request"} · ${summary.request_id || "ID not reported"}`));
     header.append(identity);
-    if (active) { const cancel = button(summary.status === "cancelling" ? "Stopping" : "Stop request", () => busy(cancel, async () => { await api(`/requests/${encodeURIComponent(summary.request_id)}/cancel`, {method: "POST"}); await refreshLocalState(); notice("Cancellation requested for this invocation."); }), "danger", true); cancel.disabled = summary.status === "cancelling"; header.append(cancel); }
+    if (active) { const cancel = button(summary.status === "cancelling" ? "Stopping" : "Stop request", () => busy(cancel, async () => { await api(`/requests/${encodeURIComponent(summary.request_id)}/cancel`, {method: "POST"}); notice("Cancellation requested for this invocation."); await refreshLocalState({afterPending: true}).catch(() => {}); }), "danger", true); cancel.disabled = summary.status === "cancelling"; header.append(cancel); }
     else header.append(node("span", `state-pill${["completed", "tool_calls"].includes(summary.status) ? " ready" : ["failed", "error"].includes(summary.status) ? " error" : ""}`, summary.status || "Unknown outcome"));
     card.append(header); const grid = node("dl", "detail-grid");
     for (const [label, value] of [
@@ -653,13 +760,285 @@ const RelayConsole = (() => {
     const details = node("details", "request-detail"); details.append(node("summary", "", "Recorded diagnostics"), node("pre", "", JSON.stringify(summary, null, 2))); card.append(details);
     return card;
   }
+  function renderRequestCards(container, summaries, makeCard, id = "request_id") {
+    const cards = new Map(Array.from(container.children, (card) => [card.dataset.requestId, card]));
+    const wanted = new Set(summaries.map((summary) => String(summary[id])));
+    for (const [key, card] of cards) if (!wanted.has(key)) card.remove();
+    summaries.forEach((summary, index) => {
+      const key = String(summary[id]);
+      const previous = cards.get(key);
+      const signature = JSON.stringify(summary);
+      if (previous && requestCards.get(previous) === signature) return;
+      const card = makeCard(summary);
+      card.dataset.requestId = key;
+      requestCards.set(card, signature);
+      if (!previous) { container.insertBefore(card, container.children[index] ?? null); return; }
+      const focused = document.activeElement;
+      const previousDetails = previous.querySelector("details");
+      const details = card.querySelector("details");
+      details.open = previousDetails.open;
+      const focusInDetails = previousDetails.contains(focused);
+      const focusOnAction = previous.contains(focused) && !focusInDetails;
+      previous.replaceWith(card);
+      if (focusInDetails) details.querySelector("summary").focus({preventScroll: true});
+      if (focusOnAction) (card.querySelector("button:not(:disabled)") || details.querySelector("summary")).focus({preventScroll: true});
+    });
+  }
   function renderRequests() {
-    const active = state.requests.active || []; const list = $("active-requests"); list.replaceChildren();
-    for (const summary of active) list.append(requestCard(summary, true));
-    $("requests-empty").hidden = active.length > 0; $("active-nav-count").hidden = active.length === 0; $("active-nav-count").textContent = String(active.length);
-    $("last-request").replaceChildren();
-    if (state.requests.last_completed) $("last-request").append(requestCard(state.requests.last_completed, false));
+    const active = state.requests.active || [];
+    renderRequestCards($("active-requests"), active, (summary) => requestCard(summary, true));
+    $("requests-empty").hidden = active.length > 0;
+    if (state.view !== "telemetry" || !state.telemetry) renderActiveCount(active.length);
+    renderRequestCards($("last-request"), state.requests.last_completed ? [state.requests.last_completed] : [], (summary) => requestCard(summary, false));
     $("last-empty").hidden = Boolean(state.requests.last_completed); $("clear-last").disabled = !state.requests.last_completed;
+  }
+  function renderActiveCount(count) {
+    $("active-nav-count").hidden = count === 0;
+    $("active-nav-count").textContent = String(count);
+  }
+  function renderTelemetryObservation() {
+    const snapshot = state.telemetry;
+    $("telemetry-observed").textContent = state.telemetryStale
+      ? snapshot ? `Update failed. Showing the snapshot from ${formatDate(snapshot.observed_at)}.` : "Telemetry is unavailable. Try refreshing."
+      : snapshot ? `Observed ${formatDate(snapshot.observed_at)}.` : "Waiting for the first snapshot.";
+  }
+  function inferenceKind(kind) {
+    return kind === "chat" ? "Chat" : kind === "embedding" ? "Embedding" : unknown(kind);
+  }
+  function telemetryDuration(value) {
+    return typeof value === "number" && value >= 1000 ? `${(value / 1000).toLocaleString(undefined, {maximumFractionDigits: 2})} s` : formatMs(value);
+  }
+  function tokensPerSecond(value) {
+    return typeof value === "number" && Number.isFinite(value)
+      ? `${value.toLocaleString(undefined, {maximumFractionDigits: 1})} tok/s`
+      : "Unknown";
+  }
+  function renderTelemetryRows(id, rows) {
+    const fragment = document.createDocumentFragment();
+    for (const values of rows) {
+      const row = node("tr");
+      values.forEach((value, index) => {
+        const cell = node(index === 0 ? "th" : "td", "", value);
+        if (index === 0) cell.scope = "row";
+        row.append(cell);
+      });
+      fragment.append(row);
+    }
+    $(id).replaceChildren(fragment);
+  }
+  function telemetryRequestCard(summary) {
+    const card = node("article", "telemetry-request");
+    const timing = summary.server_timings;
+    const identity = node("strong", "", summary.selected_model || summary.model || "Model not reported");
+    const title = node("summary");
+    title.append(
+      identity,
+      node("span", "cell-secondary", `${inferenceKind(summary.kind)} · ${summary.endpoint || "Connection not selected"}`),
+      node("span", `state-pill${summary.status === "failed" ? " error" : summary.status === "completed" ? " ready" : ""}`, unknown(summary.status)),
+      node("span", "telemetry-request-time", telemetryDuration(summary.elapsed_ms)),
+    );
+    const facts = node("dl", "detail-grid");
+    const values = [
+      ["Runtime", unknown(summary.backend)], ["Phase", unknown(summary.phase)],
+      ["Started", formatDate(summary.started_at)], ["Finished", formatDate(summary.finished_at)],
+      ["Relay elapsed", telemetryDuration(summary.elapsed_ms)], ["Discovery elapsed", telemetryDuration(summary.discovery_ms)],
+      ["Discovery HTTP calls", formatNumber(summary.discovery_http_requests)],
+    ];
+    if (summary.kind === "chat") {
+      values.push(
+        ["First visible text at relay", telemetryDuration(summary.first_text_ms)],
+        ["Prompt tokens", formatNumber(summary.usage?.prompt_tokens)],
+        ["Output tokens", formatNumber(summary.usage?.completion_tokens)],
+        ["Accepted tokens", formatNumber(summary.usage?.total_tokens)],
+        ["Observed attempt tokens", formatNumber(summary.observed_usage?.total_tokens)],
+        ["All-attempt tokens", formatNumber(summary.total_usage?.total_tokens)],
+        ["Attempt token coverage", summary.usage_complete === true ? "Complete" : summary.usage_complete === false ? "Partial" : "Unknown"],
+        ["Tool corrections", formatNumber(summary.corrections_used)],
+        ["Native prefill", telemetryDuration(timing?.prompt_ms)],
+        ["Native prefill rate", tokensPerSecond(timing?.prompt_per_second)],
+        ["Native decode", telemetryDuration(timing?.predicted_ms)],
+        ["Native decode rate", tokensPerSecond(timing?.predicted_per_second)],
+        ["Native cached tokens", formatNumber(timing?.cache_n)],
+      );
+    } else if (summary.kind === "embedding") {
+      values.push(["Input texts", formatNumber(summary.embedding_inputs)], ["Output vectors", formatNumber(summary.embedding_outputs)]);
+    }
+    if (summary.terminal_reason) values.push(["Terminal reason", summary.terminal_reason]);
+    if (summary.error_code) values.push(["Error code", summary.error_code]);
+    if (summary.reasons?.length) values.push(["Recovery reasons", [...new Set(summary.reasons)].join(", ")]);
+    for (const [label, value] of values) detailPair(facts, label, value);
+    const detail = node("details"); detail.append(title, facts);
+    card.append(detail);
+    return card;
+  }
+  function renderTelemetry() {
+    const snapshot = state.telemetry;
+    const {active, counters, models, recent, embedding_http: embedding} = snapshot;
+    renderTelemetryObservation();
+    $("telemetry-range").textContent = `Relay process started ${formatDate(snapshot.started_at)}.`;
+    $("telemetry-catalog").textContent = snapshot.catalog_observed_at ? `Catalog observed ${formatDate(snapshot.catalog_observed_at)}.` : "No catalog observation yet.";
+    $("telemetry-active").textContent = formatNumber(active.total);
+    $("telemetry-active-types").textContent = `${formatNumber(active.chat)} chat · ${formatNumber(active.embedding)} embedding`;
+    for (const outcome of ["completed", "failed", "cancelled"]) $(`telemetry-${outcome}`).textContent = formatNumber(counters[outcome]);
+    if (state.view === "telemetry") renderActiveCount(active.total);
+    renderTelemetryRows("telemetry-model-rows", models.map((row) => [
+      row.model, unknown(row.backend), unknown(row.endpoint), inferenceKind(row.kind),
+      formatNumber(row.active), formatNumber(row.counters.completed), formatNumber(row.counters.failed), formatNumber(row.counters.cancelled),
+      telemetryDuration(row.average_elapsed_ms), formatNumber(row.samples),
+    ]));
+    $("telemetry-model-empty").hidden = models.length > 0;
+    $("telemetry-model-table").hidden = models.length === 0;
+    renderRequestCards($("telemetry-active-rows"), active.requests, telemetryRequestCard);
+    renderRequestCards($("telemetry-recent-rows"), recent, telemetryRequestCard);
+    $("telemetry-active-empty").hidden = active.requests.length > 0;
+    $("telemetry-recent-empty").hidden = recent.length > 0;
+    $("telemetry-active-replicas").textContent = `${formatNumber(embedding.active_replicas)} active replicas · peak ${formatNumber(embedding.peak_active_replicas)}.`;
+    const httpLabels = {health: "Health", catalog: "Catalog", props: "Properties", tokenize: "Tokenization", embedding: "Embedding POST"};
+    const httpCounts = (row) => [row.count, row.failed, row.active, row.peak].map(formatNumber);
+    renderTelemetryRows("telemetry-http-rows", Object.entries(embedding.by_kind).map(([kind, counts]) => [httpLabels[kind] || kind, ...httpCounts(counts)]));
+    renderTelemetryRows("telemetry-replica-rows", embedding.replicas.map((row) => [row.model, row.endpoint, ...httpCounts(row)]));
+    $("telemetry-replica-empty").hidden = embedding.replicas.length > 0;
+    $("telemetry-replica-table").hidden = embedding.replicas.length === 0;
+  }
+  function auditTime(value) {
+    return value ? value.replace("T", " ").replace(/(?:Z|\+00:00)$/, " UTC") : "Unknown";
+  }
+  function auditPath(path, filters, before = null) {
+    const query = new URLSearchParams(filters);
+    if (before !== null) query.set("before", String(before));
+    return query.size ? `${path}?${query}` : path;
+  }
+  function auditFilters() {
+    const filters = {};
+    for (const [name, value] of new FormData($("audit-filter"))) {
+      const text = value.trim();
+      if (!text) continue;
+      filters[name] = name === "from" || name === "to" ? new Date(`${text}Z`).toISOString() : text;
+    }
+    if (filters.from && filters.to && filters.from > filters.to) throw new Error("From must be at or before To.");
+    return filters;
+  }
+  function auditEventCard(event) {
+    const card = node("article", "telemetry-request audit-event");
+    const detail = node("details");
+    const heading = node("summary");
+    const time = node("time", "audit-timestamp", auditTime(event.timestamp));
+    time.dateTime = event.timestamp;
+    const outcome = event.outcome.replaceAll("_", " ");
+    const negative = ["blocked", "denied", "failed"].includes(event.outcome);
+    heading.append(
+      node("strong", "", auditPhases[event.phase] || event.phase),
+      node("span", "cell-secondary", [event.tool_name, event.model].filter(Boolean).join(" · ") || "No tool or model recorded"),
+      node("span", `state-pill${negative ? " error" : ""}`, outcome),
+      time,
+    );
+    const facts = node("dl", "detail-grid");
+    const host = event.destination_host;
+    const destination = host && (event.destination_port ? `${host.includes(":") ? `[${host}]` : host}:${event.destination_port}` : host);
+    const sessionSource = {client_declared: "Declared by client", trusted_executor: "Trusted executor"};
+    for (const [label, value] of [
+      ["Source", auditSources[event.source] || event.source], ["Runtime", event.runtime], ["Reason", event.reason],
+      ["Event ID", event.id], ["Request ID", event.request_id], ["Correlation ID", event.correlation_id],
+      ["Session ID", event.session_id], ["Session source", sessionSource[event.session_source]], ["Tool call ID", event.tool_call_id],
+      ["Policy version", event.policy_version], ["Verified scope", event.verified_scope],
+      ["Attempt index", event.attempt_index], ["Proposal index", event.proposal_index],
+      ["Destination", destination], ["Destination class", event.destination_class], ["Connector", event.connector_id],
+    ]) if (value !== undefined && value !== null) detailPair(facts, label, value);
+    detail.append(heading, facts);
+    card.append(detail);
+    return card;
+  }
+  function renderAuditControls() {
+    const {data, stale, checkedAt, dirty, operation, cursors} = state.audit;
+    $("audit-apply").disabled = operation !== null;
+    $("audit-refresh").disabled = dirty || operation !== null;
+    $("audit-export").disabled = dirty || operation !== null || !data || data.storage === "unavailable";
+    $("audit-previous").disabled = dirty || operation !== null || cursors.length < 2;
+    $("audit-next").disabled = dirty || operation !== null || data?.next_before == null;
+    $("audit-progress").hidden = operation === null;
+    $("audit-progress").textContent = operation === "read" ? "Reading audit…" : operation === "export" ? "Preparing JSONL…" : "";
+    $("audit-draft").hidden = !dirty;
+    $("audit-observed").textContent = stale
+      ? checkedAt ? `Update failed. Showing the page read at ${auditTime(checkedAt)}.` : "Update failed. Audit is unavailable."
+      : checkedAt ? `Read at ${auditTime(checkedAt)}.` : "Apply filters or refresh to read the audit.";
+  }
+  function renderAudit() {
+    renderAuditControls();
+    const {data, cursors} = state.audit;
+    if (!data) return;
+    const storageLabels = {persistent: "Persistent storage", memory: "In memory", unavailable: "Audit storage unavailable"};
+    $("audit-storage").textContent = storageLabels[data.storage] || "Storage unknown";
+    $("audit-retention").textContent = `Retention up to ${formatNumber(data.retention_days)} days and ${formatNumber(data.retention_events)} events.`;
+    $("audit-dropped").textContent = `${formatNumber(data.dropped_events)} events dropped.`;
+    $("audit-coverage").hidden = false;
+    const coverage = document.createDocumentFragment();
+    for (const [phase, label] of Object.entries(auditPhases)) {
+      const item = node("div");
+      const source = data.coverage[phase];
+      detailPair(item, label, source ? auditSources[source] || source : "Unobserved");
+      coverage.append(item);
+    }
+    $("audit-coverage").replaceChildren(coverage);
+    $("audit-empty").textContent = data.storage === "unavailable" ? "No audit page is available." : "No retained events match these filters.";
+    $("audit-empty").hidden = data.events.length > 0;
+    $("audit-page").textContent = `Page ${cursors.length} · ${formatNumber(data.events.length)} events`;
+    renderRequestCards($("audit-event-list"), data.events, auditEventCard, "id");
+  }
+  function auditError(error) {
+    const message = error.code === "relay_audit_filter_invalid" ? "Check the filters. Use a hostname or IP and an optional port for Destination."
+      : error.code === "relay_audit_storage_unavailable" ? "Audit storage is unavailable."
+      : error.message || "The audit request failed.";
+    $("audit-error").textContent = message;
+    $("audit-error").hidden = false;
+  }
+  async function readAudit(filters = state.audit.filters, cursors = state.audit.cursors) {
+    const audit = state.audit;
+    if (audit.operation) return;
+    const epoch = state.pageEpoch;
+    const edit = audit.edit;
+    audit.operation = "read";
+    $("audit-error").hidden = true;
+    renderAuditControls();
+    try {
+      const page = await api(auditPath("/audit", filters, cursors.at(-1)));
+      if (epoch !== state.pageEpoch) return;
+      audit.data = page;
+      audit.filters = filters;
+      audit.cursors = cursors;
+      audit.checkedAt = new Date().toISOString();
+      audit.dirty = edit !== audit.edit;
+      audit.stale = false;
+    } catch (error) {
+      if (epoch !== state.pageEpoch) return;
+      audit.stale = true;
+      auditError(error);
+    } finally {
+      if (epoch === state.pageEpoch) { audit.operation = null; renderAudit(); }
+    }
+  }
+  async function exportAudit() {
+    const audit = state.audit;
+    if (audit.operation || audit.dirty || !audit.data || audit.data.storage === "unavailable") return;
+    const epoch = state.pageEpoch;
+    audit.operation = "export";
+    $("audit-error").hidden = true;
+    renderAuditControls();
+    try {
+      const blob = await api(auditPath("/audit/export", audit.filters), {format: "jsonl"});
+      if (epoch !== state.pageEpoch) return;
+      const url = URL.createObjectURL(blob);
+      const link = node("a");
+      link.href = url;
+      link.download = "relay-security-audit.jsonl";
+      document.body.append(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch (error) {
+      if (epoch === state.pageEpoch) auditError(error);
+    } finally {
+      if (epoch === state.pageEpoch) { audit.operation = null; renderAuditControls(); }
+    }
   }
   async function copyText(value) {
     if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(value);
@@ -828,15 +1207,66 @@ const RelayConsole = (() => {
     const url = URL.createObjectURL(new Blob([JSON.stringify(state.exportValue.config, null, 2) + "\n"], {type: "application/json"}));
     const link = node("a"); link.href = url; link.download = state.exportValue.filename.replace(/[\\/]/g, "_"); document.body.append(link); link.click(); link.remove(); window.setTimeout(() => URL.revokeObjectURL(url), 0);
   }
+  function bindAudit() {
+    const audit = state.audit;
+    $("open-audit").addEventListener("click", () => $("audit-heading").focus());
+    $("audit-filter").addEventListener("input", () => {
+      audit.edit += 1;
+      audit.dirty = true;
+      renderAuditControls();
+    });
+    $("audit-filter").addEventListener("submit", (event) => {
+      event.preventDefault();
+      try { void readAudit(auditFilters(), [null]); }
+      catch (error) { auditError(error); }
+    });
+    $("audit-refresh").addEventListener("click", () => void readAudit());
+    $("audit-export").addEventListener("click", () => void exportAudit());
+    $("audit-previous").addEventListener("click", () => void readAudit(audit.filters, audit.cursors.slice(0, -1)));
+    $("audit-next").addEventListener("click", () => void readAudit(audit.filters, [...audit.cursors, audit.data.next_before]));
+    renderAudit();
+  }
   function bind() {
-    for (const link of document.querySelectorAll("[data-view]")) link.addEventListener("click", () => navigate(link.dataset.view, true));
-    for (const control of document.querySelectorAll("[data-navigate]")) control.addEventListener("click", () => { window.location.hash = control.dataset.navigate; navigate(control.dataset.navigate, true); });
-    window.addEventListener("hashchange", () => navigate(window.location.hash.slice(1)));
-    document.addEventListener("visibilitychange", schedulePoll);
-    window.addEventListener("pagehide", () => { if (state.poll !== null) window.clearTimeout(state.poll); state.token = null; });
+    bindAudit();
+    function focusWorkspace() { $("workspace").focus({preventScroll: true}); }
+    for (const link of document.querySelectorAll("[data-view]")) link.addEventListener("click", (event) => {
+      if (!event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) focusWorkspace();
+    });
+    for (const control of document.querySelectorAll("[data-navigate]")) control.addEventListener("click", () => {
+      window.location.hash = control.dataset.navigate;
+      focusWorkspace();
+    });
+    $("skip-workspace").addEventListener("click", (event) => {
+      event.preventDefault();
+      $("workspace").focus();
+    });
+    window.addEventListener("hashchange", () => { if (window.location.hash !== "#workspace") navigate(window.location.hash.slice(1)); });
+    function restoreVisibleState() {
+      if (!document.hidden && watchView()) refreshVisibleView().catch(() => {});
+      schedulePoll();
+    }
+    document.addEventListener("visibilitychange", restoreVisibleState);
+    window.addEventListener("pagehide", () => {
+      state.pageEpoch += 1;
+      state.pageActive = false;
+      state.token = null;
+      state.sessionPending = null;
+      state.localRefresh = null;
+      state.telemetryRefresh = null;
+      state.audit.operation = null;
+      schedulePoll();
+    });
+    window.addEventListener("pageshow", (event) => {
+      if (event.persisted) {
+        state.pageActive = true;
+        renderAudit();
+        if (watchView()) restoreVisibleState();
+        else refreshLocalState().catch(() => {});
+      }
+    });
     window.addEventListener("beforeunload", (event) => { if (state.dirty) { event.preventDefault(); event.returnValue = ""; } });
-    $("save-config").addEventListener("click", () => busy($("save-config"), saveConfig));
-    for (const id of ["reload-config", "resolve-conflict"]) $(id).addEventListener("click", () => busy($(id), () => reloadConfig(true)));
+    $("save-config").addEventListener("click", () => changeConfig("save", saveConfig));
+    for (const id of ["reload-config", "resolve-conflict"]) $(id).addEventListener("click", () => changeConfig("reload", reloadConfig));
     $("copy-api").addEventListener("click", () => busy($("copy-api"), async () => { await copyText(`${window.location.origin}/v1`); notice("Local API URL copied."); }));
     for (const id of ["model-search", "model-kind", "model-availability"]) $(id).addEventListener(id === "model-search" ? "input" : "change", renderModels);
     $("select-visible-models").addEventListener("change", () => { const selected = $("select-visible-models").checked; for (const row of visibleRows()) if (row.model.opencode_chat === true) selected ? state.selectedModels.add(row.model.id) : state.selectedModels.delete(row.model.id); renderModels(); });
@@ -848,7 +1278,8 @@ const RelayConsole = (() => {
     $("endpoint-dialog").addEventListener("close", () => { $("endpoint-key").value = ""; $("endpoint-proxy").value = ""; });
     for (const control of document.querySelectorAll("[data-close-dialog]")) control.addEventListener("click", () => $(control.dataset.closeDialog).close());
     $("refresh-requests").addEventListener("click", () => busy($("refresh-requests"), refreshLocalState));
-    $("clear-last").addEventListener("click", () => busy($("clear-last"), async () => { await api("/requests/last-completed", {method: "DELETE"}); await refreshLocalState(); notice("Last-completed summary cleared."); }));
+    $("refresh-telemetry").addEventListener("click", () => busy($("refresh-telemetry"), refreshTelemetry));
+    $("clear-last").addEventListener("click", () => busy($("clear-last"), async () => { await api("/requests/last-completed", {method: "DELETE"}); notice("Last-completed summary cleared."); await refreshLocalState({afterPending: true}).catch(() => {}); }));
     for (const tab of document.querySelectorAll("[data-settings-tab]")) {
       tab.addEventListener("click", () => openSettingsTab(tab.dataset.settingsTab));
       tab.addEventListener("keydown", (event) => { if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return; event.preventDefault(); const tabs = [...document.querySelectorAll("[data-settings-tab]")]; let index = tabs.indexOf(tab); index = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length; openSettingsTab(tabs[index].dataset.settingsTab); tabs[index].focus(); });
@@ -874,17 +1305,14 @@ const RelayConsole = (() => {
     setupTheme();
     bind(); navigate(window.location.hash.slice(1));
     try {
-      const session = await api("/session", {token: false});
-      if (session.api_version !== 1 || !session.admin_token) throw new Error("This console requires admin API version 1.");
-      state.token = session.admin_token;
       loadConfig(await api("/config"));
-      const results = await Promise.allSettled([api("/catalog"), refreshLocalState()]);
+      const results = await Promise.allSettled([api("/catalog"), refreshVisibleView()]);
       if (results[0].status === "fulfilled") { state.catalog = results[0].value; renderModels(); renderConnections(); }
       for (const result of results) if (result.status === "rejected") notice(result.reason.message, true);
       schedulePoll();
     } catch (error) {
-      $("service-state").textContent = "Not connected"; $("service-state").className = "status-tag error";
-      $("footer-state").textContent = "The local administration connection is unavailable.";
+      state.connection = "unavailable";
+      renderStatus();
       notice(error.message || "Could not connect to the local relay. Reload settings to reconnect.", true);
     }
   }

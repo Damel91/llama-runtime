@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import CancelledError
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from functools import wraps
 import math
@@ -463,6 +464,7 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
         )
         self._owns_client = client is None
         self._http_metrics = EmbeddingHTTPMetrics()
+        self._http_observer = None
         self._client = (
             client
             if client is not None
@@ -578,9 +580,16 @@ class LlamaCppEmbeddingAdapter(EmbeddingAdapter):
             pinned=self._pinned_identity,
         )
 
+    def _set_http_observer(self, observer):
+        self._http_observer = observer
+
     def _http_call(self, method, *args, phase="preflight", **kwargs):
         kind = {"models": "catalog", "embeddings": "embedding"}.get(method, method)
-        with self._http_metrics.measure(kind, phase):
+        observer = self._http_observer
+        with (
+            self._http_metrics.measure(kind, phase),
+            observer(kind, kwargs.get("model")) if observer else nullcontext(),
+        ):
             return getattr(self._client, method)(*args, **kwargs)
 
     def _join_pool(

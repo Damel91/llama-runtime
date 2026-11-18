@@ -16,7 +16,7 @@ import re
 import secrets
 import signal
 import subprocess
-from threading import Event, Lock, Thread, current_thread
+from threading import Event, Lock, Thread, current_thread, local
 import time
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -56,6 +56,11 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 class TailnetError(LLMBackendError):
     """Sanitized helper lifecycle failure, independent of provider messages."""
+
+
+class _CallbackCloseError(TailnetError):
+    def __init__(self) -> None:
+        super().__init__("tailnet_helper_close_from_cancel_callback")
 
 
 def _positive(value: Any, name: str) -> float:
@@ -198,6 +203,7 @@ class TailnetHelper:
             raise TypeError("config must be TailnetConfig")
         self.config = config
         self._lock = Lock()
+        self._cancel_callback = local()
         self._failure_lock = Lock()
         self._closing = Event()
         self._shutdown = Event()
@@ -317,12 +323,21 @@ class TailnetHelper:
             except (OSError, ValueError):
                 pass
 
-    @staticmethod
-    def _check_cancel(probe: Callable[[], bool] | None) -> None:
+    def _invoke_cancel(self, probe: Callable[[], bool]) -> bool:
+        active = getattr(self._cancel_callback, "active", False)
+        self._cancel_callback.active = True
+        try:
+            return bool(probe())
+        finally:
+            self._cancel_callback.active = active
+
+    def _check_cancel(self, probe: Callable[[], bool] | None) -> None:
         if probe is None:
             return
         try:
-            requested = bool(probe())
+            requested = self._invoke_cancel(probe)
+        except _CallbackCloseError:
+            raise
         except Exception:
             raise TailnetError("tailnet_cancellation_probe_failed") from None
         if requested:
@@ -494,10 +509,16 @@ class TailnetHelper:
             proxy_url = self._proxy_url
             self._discovery_calls.add(done)
 
+        rejected_close = Event()
+
         def cancelled() -> bool:
-            return self._closing.is_set() or (
-                caller_probe is not None and bool(caller_probe())
-            )
+            if self._closing.is_set():
+                return True
+            try:
+                return caller_probe is not None and self._invoke_cancel(caller_probe)
+            except _CallbackCloseError:
+                rejected_close.set()
+                return True
 
         try:
             return discover_models(
@@ -506,6 +527,10 @@ class TailnetHelper:
                 cancellation_probe=cancelled,
                 **kwargs,
             )
+        except LLMCancelledError:
+            if rejected_close.is_set():
+                raise _CallbackCloseError() from None
+            raise
         finally:
             done.set()
             with self._lock:
@@ -574,6 +599,9 @@ class TailnetHelper:
             raise TailnetError("tailnet_helper_shutdown_failed")
 
     def close(self) -> None:
+        """Stop the helper and drain its clients outside a cancellation callback."""
+        if getattr(self._cancel_callback, "active", False):
+            raise _CallbackCloseError()
         self._closing.set()
         with self._lock:
             self._close_locked()

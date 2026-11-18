@@ -137,6 +137,9 @@ def test_relay_calls_actual_sdk_recovery_once_and_hides_rejected_attempt():
     assert b"pi_write" in wire and b"data: [DONE]" in wire
     last = service.registry.snapshot()["last_completed"]
     assert last["corrections_used"] == 1 and last["status"] == "completed"
+    assert last["backend"] == "strata"
+    assert last["discovery_http_requests"] == 3
+    assert last["discovery_ms"] == 1.0
     assert service.registry.snapshot()["active"] == []
     service.close()
 
@@ -233,6 +236,9 @@ def test_bare_embeddings_use_new_public_direct_method_without_tokenization():
         for _alias, batch in client.embedding_calls
         for text in batch
     )
+    recent = service.registry.snapshot()["last_completed"]
+    assert recent["embedding_inputs"] == recent["embedding_outputs"] == 3
+    assert "usage" not in recent
     assert len(adapters) == 1
     service.embed(request)
     assert len(adapters) == 1
@@ -272,6 +278,65 @@ def test_verified_embeddings_share_one_service_and_catalog_change_retires_it():
     assert created[0].closed
     assert not service._cached
     service.close()
+
+
+def test_late_observation_cannot_replace_the_newer_catalog_or_embedding_adapter():
+    first_observed, release_first = Event(), Event()
+    discover = Discovery(embedding=True, verified=True)
+    created = []
+
+    def reordered(endpoints, **options):
+        first = not discover.calls
+        result = discover(endpoints, **options)
+        if not first:
+            return result
+        (runtime,) = result.runtimes
+        (model,) = runtime.catalog.models
+        old_model = replace(
+            model, identity=replace(model.identity, content_sha256="f" * 64)
+        )
+        first_observed.set()
+        assert release_first.wait(2)
+        return replace(
+            result,
+            runtimes=(
+                replace(runtime, catalog=replace(runtime.catalog, models=(old_model,))),
+            ),
+        )
+
+    class Embeddings:
+        def __init__(self, _profile):
+            self.closed = False
+            created.append(self)
+
+        def embed_texts(self, texts, **_options):
+            return [[1.0] for _ in texts]
+
+        def close(self):
+            self.closed = True
+
+    service = RelayService(
+        RelayConfigStore(initial_config=config()),
+        discovery=reordered,
+        automatic_embedding_factory=Embeddings,
+    )
+    request = parse_embedding({"model": "embed_0", "input": ["x"]})
+    try:
+        with ThreadPoolExecutor(1) as pool:
+            old = pool.submit(service.embed, request)
+            try:
+                assert first_observed.wait(2)
+                assert service.embed(request) == [[1.0]]
+                current_catalog = service.catalog_snapshot()
+            finally:
+                release_first.set()
+            assert old.result(2) == [[1.0]]
+        assert service.catalog_snapshot() == current_catalog
+        assert len(created) == 2 and not created[0].closed and created[1].closed
+        assert service.embed(request) == [[1.0]]
+        assert len(created) == 2
+    finally:
+        service.close()
 
 
 def test_catalog_reads_are_explicit_and_config_replacement_does_not_mutate_old_call():
@@ -618,6 +683,89 @@ def test_successful_stream_terminal_observes_actual_adapter_drain():
     service.chat(request, emit=emit)
     assert len(observed) == 1
     service.close()
+
+
+@pytest.mark.parametrize("bulk", [False, True], ids=["stop", "shutdown"])
+def test_cancellation_before_terminal_commit_suppresses_success(monkeypatch, bulk):
+    cancelling_boundary, release = Event(), Event()
+
+    def wait_for_cancellation():
+        cancelling_boundary.set()
+        assert release.wait(2)
+
+    class Adapter:
+        def __init__(self, _profile):
+            pass
+
+        def stream_with_metadata(self, *_args, **_kwargs):
+            yield LLMStreamEvent(kind="reasoning", text="private fixture")
+            yield LLMStreamEvent(kind="content", text="")
+            yield LLMStreamEvent(kind="content", text="visible")
+            yield LLMStreamEvent(kind="terminal", terminal_reason="completed")
+
+        def close(self):
+            if not bulk:
+                wait_for_cancellation()
+
+    service = RelayService(
+        RelayConfigStore(initial_config=config()),
+        discovery=Discovery(),
+        adapter_factory=Adapter,
+    )
+    if bulk:
+        finish = service.registry.finish
+
+        def pause_before_registry_commit(*args, **kwargs):
+            wait_for_cancellation()
+            return finish(*args, **kwargs)
+
+        monkeypatch.setattr(service.registry, "finish", pause_before_registry_commit)
+
+    events = []
+    first_text_values = []
+    request_id = "cancel-during-cleanup"
+    request = parse_chat(
+        {
+            "model": "direct-chat",
+            "messages": [{"role": "user", "content": "fixture"}],
+            "stream": True,
+        }
+    )
+
+    def emit(event):
+        events.append(event.kind)
+        (active,) = service.registry.snapshot()["active"]
+        first_text_values.append(active.get("first_text_ms"))
+
+    try:
+        with ThreadPoolExecutor(1) as pool:
+            future = pool.submit(
+                service.chat, request, emit=emit, request_id=request_id
+            )
+            try:
+                assert cancelling_boundary.wait(2)
+                if bulk:
+                    assert service.registry.cancel_all() == 1
+                else:
+                    assert service.cancel_request(request_id)
+                (active,) = service.registry.snapshot()["active"]
+                assert active["status"] == "cancelling"
+                assert active["phase"] == "draining"
+            finally:
+                release.set()
+            with pytest.raises(LLMCancelledError):
+                future.result(2)
+        assert events == ["reasoning", "content", "content"]
+        assert first_text_values[:2] == [None, None]
+        assert first_text_values[2] >= 0
+        assert not service.cancel_request(request_id)
+        snapshot = service.registry.snapshot()
+        assert not snapshot["active"]
+        assert snapshot["last_completed"]["status"] == "cancelled"
+        assert snapshot["last_completed"]["terminal_reason"] == "cancelled"
+        assert snapshot["last_completed"]["error_code"] == "relay_request_cancelled"
+    finally:
+        service.close()
 
 
 def test_failed_helper_stop_retains_ownership_and_close_retries_pending_node(tmp_path):

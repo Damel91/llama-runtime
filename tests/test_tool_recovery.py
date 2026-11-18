@@ -121,6 +121,100 @@ class SequenceClient(_Client):
         return events()
 
 
+def audit_events(adapter):
+    records = []
+
+    def record(phase, outcome, **fields):
+        records.append(dict(phase=phase, outcome=outcome, **fields))
+
+    adapter._set_tool_audit_observer(record)
+    return records
+
+
+def test_audit_records_rejected_and_approved_native_calls_without_payloads():
+    client = SequenceClient(
+        [
+            valid(
+                call_id="call_rejected",
+                arguments='{"unexpected":"private-argument"}',
+                reasoning="private-reasoning",
+            ),
+            valid(call_id="call_recovered"),
+        ]
+    )
+    adapter = StrataAdapter(model="shared", client=client)
+    records = audit_events(adapter)
+    result = adapter.generate_with_metadata("private-prompt", tools=TOOLS)
+    assert [call["id"] for call in result.tool_calls] == ["call_recovered"]
+    assert [
+        (row["phase"], row["outcome"], row["attempt_index"], row["tool_call_id"])
+        for row in records
+    ] == [
+        ("model_proposal", "proposed", 0, "call_rejected"),
+        ("relay_decision", "blocked", 0, "call_rejected"),
+        ("model_proposal", "proposed", 1, "call_recovered"),
+        ("relay_decision", "approved", 1, "call_recovered"),
+    ]
+    assert records[1]["reason"] == "tool_arguments_schema_mismatch"
+    assert all(row["tool_name"] == "pi_write" for row in records)
+    assert all(row["proposal_index"] == 0 for row in records)
+    assert all(row["policy_version"] == "native-tool-recovery-v1" for row in records)
+    assert "private-" not in json.dumps(records)
+
+
+def test_audit_distinguishes_invalid_native_envelope_from_literal_markup():
+    malformed = valid(arguments='{"path":"private-argument"}')[0]
+    del malformed["choices"][0]["delta"]["tool_calls"][0]["index"]
+    literal = "<tool_call>private-literal</tool_call>"
+    client = SequenceClient(
+        [[malformed], [_chunk(content=literal), _chunk(finish="stop")]]
+    )
+    adapter = LlamaCppAdapter(model="shared", client=client)
+    records = audit_events(adapter)
+    with pytest.raises(LLMBackendError, match="llama_missing_tool_call_index"):
+        adapter.generate_with_metadata("first", tools=TOOLS)
+    events = list(
+        adapter.stream_with_metadata("second", tools=TOOLS, _progressive_tool_text=True)
+    )
+    assert "".join(event.text for event in events if event.kind == "content") == literal
+    assert [(row["phase"], row["outcome"], row["reason"]) for row in records] == [
+        ("model_proposal", "proposed", "malformed_native_tool_delta"),
+        ("relay_decision", "blocked", "llama_missing_tool_call_index"),
+        ("model_output", "literal_markup", "literal_tool_markup"),
+    ]
+    assert records[-1]["tool_name"] is None
+    assert "private-" not in json.dumps(records)
+
+
+def test_audit_never_persists_configured_credentials_disguised_as_tool_metadata():
+    api_key = "private-configured-credential"
+    client = SequenceClient([valid(name=api_key, call_id=api_key), valid()])
+    adapter = StrataAdapter(model="shared", client=client, api_key=api_key)
+    records = audit_events(adapter)
+    adapter.generate_with_metadata("fixture", tools=TOOLS)
+    assert [row["outcome"] for row in records] == [
+        "proposed",
+        "blocked",
+        "proposed",
+        "approved",
+    ]
+    assert records[0]["tool_name"] is records[0]["tool_call_id"] is None
+    assert api_key not in json.dumps(records)
+
+
+def test_audit_keeps_only_metadata_for_a_native_stream_closed_before_terminal():
+    client = SequenceClient([valid(arguments='{"path":"private-argument"}')])
+    adapter = LlamaCppAdapter(model="shared", client=client)
+    records = audit_events(adapter)
+    events = adapter.stream_with_metadata("fixture")
+    assert next(events).kind == "tool_call_delta"
+    events.close()
+    assert [row["outcome"] for row in records] == ["proposed", "withheld"]
+    assert records[-1]["reason"] == "native_attempt_interrupted"
+    assert records[0]["tool_call_id"] == "call_valid"
+    assert "private-argument" not in json.dumps(records)
+
+
 @pytest.mark.parametrize("adapter_type", [LlamaCppAdapter, StrataAdapter])
 def test_native_rejection_corrects_without_host_and_preserves_evidence(adapter_type):
     client = SequenceClient([rejected(), valid()])
@@ -221,6 +315,7 @@ def test_malformed_native_marker_fails_without_regeneration(marker):
 def test_explicit_native_rejection_without_declared_tools_is_not_success(marker):
     client = SequenceClient([rejected(marker=marker), valid()])
     adapter = LlamaCppAdapter(model="shared", client=client)
+    records = audit_events(adapter)
     with pytest.raises(LLMToolRecoveryError) as caught:
         adapter.generate_with_metadata("write")
     assert caught.value.terminal_reason == "tool_protocol_error"
@@ -230,6 +325,9 @@ def test_explicit_native_rejection_without_declared_tools_is_not_success(marker)
     )
     assert not caught.value.tool_recovery.exhausted
     assert len(client.calls) == client.streams_closed == 1
+    assert [row["outcome"] for row in records] == ["proposed", "blocked"]
+    assert records[0]["tool_name"] == ("write" if isinstance(marker, list) else None)
+    assert records[1]["reason"] == "no_declared_tool_authority"
 
 
 def test_no_tools_empty_native_marker_keeps_progressive_streaming():
@@ -473,13 +571,15 @@ def test_native_incomplete_terminal_does_not_release_or_retry_candidate_tools(
             valid(),
         ]
     )
-    result = LlamaCppAdapter(model="shared", client=client).generate_with_metadata(
-        "write", tools=TOOLS
-    )
+    adapter = LlamaCppAdapter(model="shared", client=client)
+    records = audit_events(adapter)
+    result = adapter.generate_with_metadata("write", tools=TOOLS)
     assert result.text == "partial text" and result.terminal_reason == reason
     assert result.tool_calls == ()
     assert result.tool_recovery.corrections_used == 0
     assert len(client.calls) == client.streams_closed == 1
+    assert [row["outcome"] for row in records] == ["proposed", "withheld"]
+    assert records[-1]["reason"] == reason
 
 
 def test_reentrant_sink_invocation_has_its_own_budget_and_history():

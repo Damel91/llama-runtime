@@ -370,8 +370,9 @@ def test_healthy_runtime_without_requested_model_reports_health_separately(runti
     api.close()
 
 
-def test_concurrent_route_publication_keeps_catalog_and_selection_coherent(
-    runtime, monkeypatch
+@pytest.mark.parametrize("older_operation", ["generation", "health"])
+def test_concurrent_route_publication_keeps_the_latest_observation(
+    runtime, monkeypatch, older_operation
 ):
     first, a = runtime("strata")
     second, b = runtime("llamacpp", loaded=False)
@@ -388,17 +389,47 @@ def test_concurrent_route_publication_keeps_catalog_and_selection_coherent(
 
     monkeypatch.setattr(api, "_discover", discover)
     with ThreadPoolExecutor(2) as workers:
-        pending = workers.submit(api.generate_with_metadata, "first")
+        pending = (
+            workers.submit(api.generate_with_metadata, "first")
+            if older_operation == "generation"
+            else workers.submit(api.health_status)
+        )
         assert observed.wait(1)
         a["loaded"], b["loaded"] = False, True
         second_result = workers.submit(api.generate_with_metadata, "second").result(1)
         assert second_result.runtime_selection.backend == "llamacpp"
         release.set()
         first_result = pending.result(1)
-    assert first_result.runtime_selection.backend == "strata"
-    assert api.selected_runtime == first_result.runtime_selection
+    first_selection = (
+        first_result.runtime_selection
+        if older_operation == "generation"
+        else first_result["runtime_selection"]
+    )
+    assert first_selection.backend == "strata"
+    assert api.selected_runtime == second_result.runtime_selection
     assert api.selected_runtime.runtime in api.current_catalog.runtimes
-    assert api.current_catalog.select("shared").backend == "strata"
+    assert api.current_catalog.select("shared").backend == "llamacpp"
+    api.close()
+
+
+def test_pending_or_cancelled_discovery_leaves_last_complete_observation(runtime):
+    endpoint, state = runtime()
+    api = adapter([endpoint])
+    api.health_status()
+    previous = api.current_catalog, api.selected_runtime
+    state["get_started"].clear()
+    state["hold_get"] = True
+    cancel = Event()
+    with ThreadPoolExecutor(1) as workers:
+        pending = workers.submit(api.discover_models, cancellation_probe=cancel.is_set)
+        try:
+            assert state["get_started"].wait(1)
+            assert (api.current_catalog, api.selected_runtime) == previous
+        finally:
+            cancel.set()
+        with pytest.raises(LLMCancelledError):
+            pending.result(1)
+    assert (api.current_catalog, api.selected_runtime) == previous
     api.close()
 
 

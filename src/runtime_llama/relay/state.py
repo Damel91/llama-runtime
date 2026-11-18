@@ -1,12 +1,13 @@
 """Owned generation leases and content-free request state for the relay.
 
-There is no admission, model-count or memory quota here. The registry retains
-active requests and one explicitly labelled latest completion, not a history.
+There is no admission quota. The registry owns active requests, the latest
+completion and a short, content-free observation history for the console.
 Adapters, iterators, request bodies and exceptions never belong to summaries.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ from typing import Any
 from uuid import uuid4
 
 from runtime_llama.relay.config import RelayConfigSnapshot
+from runtime_llama.relay.telemetry import INFERENCE_KINDS, OUTCOMES, model_activity
 
 
 _SUMMARY_FIELDS = frozenset(
@@ -37,6 +39,12 @@ _SUMMARY_FIELDS = frozenset(
         "unknown_usage_fields",
         "coordinator_elapsed_ms",
         "server_timings",
+        "phase",
+        "discovery_ms",
+        "discovery_http_requests",
+        "first_text_ms",
+        "embedding_inputs",
+        "embedding_outputs",
     }
 )
 _PRIVATE_FIELDS = frozenset(
@@ -313,12 +321,15 @@ class RelayRequest:
 
 
 class RelayRequestRegistry:
-    """Active state plus one content-free latest completion, explicitly no history."""
+    """Active state, a compatibility summary and recent inference observations."""
 
     def __init__(self) -> None:
         self._lock = Lock()
         self._active: dict[str, tuple[RelayRequest, dict, float]] = {}
         self._last_completed: dict | None = None
+        self._started_at = datetime.now(timezone.utc).isoformat()
+        self._recent: deque[dict] = deque(maxlen=128)
+        self._outcomes = dict.fromkeys(OUTCOMES, 0)
         self._closed = False
 
     def start(
@@ -370,13 +381,23 @@ class RelayRequestRegistry:
             record = self._active.pop(request_id, None)
             if record is None:
                 return None
-            _request, summary, started = record
+            request, summary, started = record
+            if status == "completed" and request.cancelled():
+                status = "cancelled"
+                fields.update(
+                    status=status,
+                    error_code="relay_request_cancelled",
+                    terminal_reason="cancelled",
+                )
             summary.update(fields)
             summary.update(
                 finished_at=datetime.now(timezone.utc).isoformat(),
                 elapsed_ms=max(0.0, (time.monotonic() - started) * 1000.0),
             )
-            self._last_completed = deepcopy(summary)
+            self._last_completed = summary
+            if summary["kind"] in INFERENCE_KINDS and status in self._outcomes:
+                self._outcomes[status] += 1
+                self._recent.append(summary)
             return deepcopy(summary)
 
     def cancel(self, request_id: str) -> bool:
@@ -406,6 +427,30 @@ class RelayRequestRegistry:
                 "active": [deepcopy(item[1]) for item in self._active.values()],
                 "last_completed": deepcopy(self._last_completed),
             }
+
+    def telemetry_snapshot(self) -> dict:
+        with self._lock:
+            observed_at = datetime.now(timezone.utc).isoformat()
+            active = [
+                deepcopy(summary)
+                for _, summary, _ in self._active.values()
+                if summary["kind"] in INFERENCE_KINDS
+            ]
+            recent = deepcopy(list(reversed(self._recent)))
+            outcomes = dict(self._outcomes)
+        return {
+            "started_at": self._started_at,
+            "observed_at": observed_at,
+            "active": {
+                "total": len(active),
+                "chat": sum(row["kind"] == "chat" for row in active),
+                "embedding": sum(row["kind"] == "embedding" for row in active),
+                "requests": active,
+            },
+            "counters": outcomes,
+            "models": model_activity(active, recent),
+            "recent": recent,
+        }
 
     def clear_last_completed(self) -> None:
         with self._lock:

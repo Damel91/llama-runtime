@@ -1387,6 +1387,212 @@ def test_embedding_direct_http_order_prefix_and_no_tokenizer(native_servers):
         ] == ["query: same", "query: 日本語", "query: same"]
 
 
+def test_telemetry_shows_local_observations_without_probing_or_leaking_content(
+    native_servers,
+):
+    chat_url, chat_upstream = native_servers(key="private-chat-key")
+    embed_url, embed_upstream = native_servers("llamacpp", key="private-embed-key")
+    settings = config_for(
+        (chat_url, {"api_key": "private-chat-key"}),
+        (embed_url, {"api_key": "private-embed-key"}),
+    )
+    with client(settings) as (api, _):
+        headers = token(api)
+        path = "/api/admin/telemetry"
+        assert api.get(path).status_code == 401
+        empty = api.get(path, headers=headers)
+        assert empty.headers["cache-control"] == "no-store"
+        assert empty.json()["recent"] == []
+        assert empty.json()["catalog_observed_at"] is None
+        assert not chat_upstream["gets"] and not embed_upstream["gets"]
+
+        chat = api.post(
+            "/v1/chat/completions",
+            json={
+                "model": "chat-model",
+                "messages": [{"role": "user", "content": "private-input"}],
+                "stream": True,
+            },
+        )
+        assert chat.status_code == 200 and "native-answer" in chat.text
+        response = api.post(
+            "/v1/embeddings",
+            json={"model": "embedding-model", "input": ["private-embedding", "second"]},
+        )
+        assert response.status_code == 200, response.text
+        assert api.get("/v1/models").is_success
+        state_before = [
+            (len(upstream["gets"]), len(upstream["posts"]))
+            for upstream in (chat_upstream, embed_upstream)
+        ]
+
+        response = api.get(path, headers=headers)
+        observed = response.json()
+        assert response.is_success and observed["catalog_observed_at"]
+        assert observed["counters"] == {"completed": 2, "failed": 0, "cancelled": 0}
+        embed, chat = observed["recent"]
+        assert embed["kind"] == "embedding"
+        assert embed["embedding_inputs"] == embed["embedding_outputs"] == 2
+        assert chat["kind"] == "chat" and chat["first_text_ms"] >= 0
+        assert chat["discovery_http_requests"] == 6
+        upstream_posts = len(embed_upstream["posts"])
+        http = observed["embedding_http"]
+        assert http["by_kind"]["embedding"]["count"] == upstream_posts
+        assert http["by_kind"]["tokenize"]["count"] == 0
+        assert http["replicas"][0]["model"] == "embedding-model"
+        assert http["replicas"][0]["count"] == upstream_posts
+        assert http["peak_active_replicas"] == 1
+        for private in ("private-", "native-answer", "Authorization", "api_key"):
+            assert private not in response.text
+        assert state_before == [
+            (len(upstream["gets"]), len(upstream["posts"]))
+            for upstream in (chat_upstream, embed_upstream)
+        ]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_security_audit_distinguishes_policy_and_forwarding_across_restart(
+    native_servers, tmp_path, stream
+):
+    def responses(index, _request):
+        if index == 0:
+            delta = inspect_delta("blocked-call", '{"wrong":"PRIVATE-ARGUMENT"}')
+        else:
+            delta = inspect_delta("accepted-call", '{"key":"PRIVATE-ARGUMENT"}')
+        return [
+            _chunk(reasoning="PRIVATE-REASONING"),
+            _chunk(tools=[delta]),
+            _chunk(finish="tool_calls"),
+        ]
+
+    upstream, state = native_servers(responses=responses, key="PRIVATE-KEY")
+    config_path = tmp_path / "relay.json"
+    initial = config_for((upstream, {"api_key": "PRIVATE-KEY"}))
+    service = RelayService(RelayConfigStore(config_path, initial))
+    path, export_path = "/api/admin/audit", "/api/admin/audit/export"
+    with client(service=service) as (api, _):
+        headers = token(api)
+        assert api.get(path).status_code == 401
+        assert api.get(export_path).status_code == 401
+        response = api.post(
+            "/v1/chat/completions",
+            headers={
+                "X-Relay-Audit-Session": "session-fixture",
+                "X-Relay-Audit-Correlation": "correlation-fixture",
+                "X-Unrelated": "PRIVATE-HEADER",
+            },
+            json={
+                "model": "chat-model",
+                "messages": [{"role": "user", "content": "PRIVATE-MESSAGE"}],
+                "tools": TOOLS,
+                "stream": stream,
+            },
+        )
+        assert response.is_success, response.text
+        assert "accepted-call" in response.text and len(state["posts"]) == 2
+        count_before = (len(state["gets"]), len(state["posts"]))
+        observed = api.get(path, headers=headers).json()
+        assert observed["storage"] == "persistent"
+        assert observed["dropped_events"] == 0
+        rows = list(reversed(observed["events"]))
+        assert [
+            (row["phase"], row["outcome"], row["tool_call_id"]) for row in rows
+        ] == [
+            ("model_proposal", "proposed", "blocked-call"),
+            ("relay_decision", "blocked", "blocked-call"),
+            ("model_proposal", "proposed", "accepted-call"),
+            ("relay_decision", "approved", "accepted-call"),
+            ("relay_decision", "forwarded", "accepted-call"),
+        ]
+        assert rows[1]["reason"] == "tool_arguments_schema_mismatch"
+        assert rows[3]["verified_scope"] == "declared_tool_schema"
+        assert rows[4]["source"] == "relay_transport"
+        assert len({row["request_id"] for row in rows}) == 1
+        assert {row["correlation_id"] for row in rows} == {"correlation-fixture"}
+        assert {row["session_source"] for row in rows} == {"client_declared"}
+        assert {row["runtime"] for row in rows} == {"strata"}
+        assert observed["coverage"]["executor_dispatch"] is None
+        assert observed["coverage"]["network_connection"] is None
+        assert all(row["destination_host"] is None for row in rows)
+        for body in (json.dumps(observed), api.get(export_path, headers=headers).text):
+            assert "PRIVATE-" not in body and "arguments" not in body.replace(
+                "tool_arguments_schema_mismatch", ""
+            )
+        assert count_before == (len(state["gets"]), len(state["posts"]))
+
+    reopened = RelayService(RelayConfigStore(config_path))
+    with client(service=reopened) as (api, _):
+        headers = token(api)
+        filters = {"session_id": "session-fixture", "outcome": "blocked"}
+        found = api.get(path, headers=headers, params=filters).json()["events"]
+        assert [row["tool_call_id"] for row in found] == ["blocked-call"]
+        export = api.get(export_path, headers=headers, params=filters)
+        assert export.headers["content-type"].startswith("application/x-ndjson")
+        assert export.headers["content-disposition"].startswith("attachment")
+        assert [json.loads(line) for line in export.text.splitlines()] == found
+        assert (
+            api.get(path, headers=headers, params={"from": "invalid"}).status_code
+            == 400
+        )
+
+
+def test_security_audit_returns_only_attested_executor_and_network_events():
+    with client() as (api, app):
+        store = app.state.relay_audit.store
+        identity = {"request_id": "request-a", "correlation_id": "sequence-a"}
+        store.append(
+            **identity,
+            source="executor",
+            phase="executor_dispatch",
+            outcome="dispatched",
+            tool_name="inspect",
+            connector_id="fixture-executor",
+        )
+        store.append(
+            **identity,
+            source="network_monitor",
+            phase="network_connection",
+            outcome="observed",
+            destination_host="127.0.0.1",
+            destination_port=8080,
+            connector_id="fixture-monitor",
+        )
+        headers = token(api)
+        path = "/api/admin/audit"
+        result = api.get(path, headers=headers).json()
+        assert [row["source"] for row in result["events"]] == [
+            "network_monitor",
+            "executor",
+        ]
+        assert result["coverage"]["executor_outcome"] is None
+        network = api.get(
+            path, headers=headers, params={"destination": "127.0.0.1:8080"}
+        ).json()["events"]
+        assert len(network) == 1
+        assert network[0]["destination_class"] == "loopback"
+        assert network[0]["connector_id"] == "fixture-monitor"
+        assert not api.get(
+            path, headers=headers, params={"phase": "executor_outcome"}
+        ).json()["events"]
+        assert not api.post(path, headers=headers, json=network[0]).is_success
+
+
+def test_unavailable_audit_does_not_break_relay(tmp_path):
+    config_path = tmp_path / "relay.json"
+    database = tmp_path / "relay.json.audit.sqlite3"
+    database.write_bytes(b"not an audit database")
+    database.chmod(0o600)
+    with client(service=RelayService(RelayConfigStore(config_path))) as (api, _):
+        headers = token(api)
+        assert api.get("/health").is_success
+        assert (
+            api.get("/api/admin/audit", headers=headers).json()["storage"]
+            == "unavailable"
+        )
+        assert api.get("/api/admin/audit/export", headers=headers).status_code == 503
+    assert database.read_bytes() == b"not an audit database"
+
+
 class ControlledService(RelayService):
     """Owned SDK-work stand-in for ASGI disconnect/backpressure tests only."""
 

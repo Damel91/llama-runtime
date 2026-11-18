@@ -102,6 +102,7 @@ class ChatRequest:
     include_usage: bool
     options: dict
     num_predict: int | None = None
+    audit_context: object | None = None
 
 
 def parse_chat(body) -> ChatRequest:

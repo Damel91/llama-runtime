@@ -16,6 +16,7 @@ from runtime_llama.relay.state import (
     RelayGenerationManager,
     RelayRequestRegistry,
 )
+from runtime_llama.relay.telemetry import RelayEmbeddingTelemetry
 
 
 class Resource:
@@ -416,6 +417,16 @@ def test_registry_close_cancels_all_but_keeps_work_registered_until_finish():
     assert not registry.snapshot()["active"]
 
 
+def test_terminal_registry_publication_observes_an_accepted_bulk_stop():
+    registry = RelayRequestRegistry()
+    request = registry.start("chat", "model", 0)
+    assert registry.cancel_all() == 1
+    result = registry.finish(request.request_id, terminal_reason="completed")
+    assert result["status"] == "cancelled"
+    assert result["terminal_reason"] == "cancelled"
+    assert registry.telemetry_snapshot()["counters"]["cancelled"] == 1
+
+
 def test_duplicate_ids_are_rejected_without_mixing_request_state():
     registry = RelayRequestRegistry()
     request = registry.start("chat", "one", 0, request_id="same-id")
@@ -439,3 +450,59 @@ def test_ten_thousand_requests_have_no_admission_quota_and_release_handles():
     assert isinstance(registry.snapshot()["last_completed"], dict)
     registry.clear_last_completed()
     assert registry.snapshot() == {"active": [], "last_completed": None}
+    telemetry = registry.telemetry_snapshot()
+    assert telemetry["counters"]["completed"] == 10000
+    assert len(telemetry["recent"]) == 128
+    assert telemetry["models"][0]["samples"] == 128
+
+
+def test_telemetry_retains_concurrent_inference_completions_and_ignores_control():
+    registry = RelayRequestRegistry()
+    requests = [registry.start("chat", f"chat-{i}", 0) for i in range(4)]
+    active = registry.telemetry_snapshot()["active"]
+    assert active["chat"] == active["total"] == 4
+    assert active["embedding"] == 0
+    with ThreadPoolExecutor() as pool:
+        list(
+            pool.map(
+                lambda request: registry.finish(
+                    request.request_id, status="failed", error_code="test_failure"
+                ),
+                requests,
+            )
+        )
+    catalog = registry.start("catalog", "", 0)
+    registry.finish(catalog.request_id)
+    assert registry.snapshot()["last_completed"]["kind"] == "catalog"
+    snapshot = registry.telemetry_snapshot()
+    assert snapshot["counters"] == {"completed": 0, "failed": 4, "cancelled": 0}
+    assert {item["request_id"] for item in snapshot["recent"]} == {
+        request.request_id for request in requests
+    }
+    snapshot["recent"][0]["error_code"] = "modified"
+    assert registry.telemetry_snapshot()["recent"][0]["error_code"] == "test_failure"
+
+
+def test_embedding_http_telemetry_counts_shared_calls_and_distinct_live_replicas():
+    telemetry = RelayEmbeddingTelemetry()
+    observe = telemetry.for_endpoint("llama")
+    with observe("embedding", "replica-0"), observe("embedding", "replica-1"):
+        with observe("embedding", "replica-0"), observe("props"):
+            snapshot = telemetry.snapshot()
+            assert snapshot["by_kind"]["embedding"] == {
+                "count": 3,
+                "failed": 0,
+                "active": 3,
+                "peak": 3,
+            }
+            assert snapshot["active_replicas"] == 2
+    with pytest.raises(RuntimeError), observe("embedding", "replica-1"):
+        raise RuntimeError("simulated HTTP failure")
+    snapshot = telemetry.snapshot()
+    assert snapshot["active_replicas"] == 0
+    assert snapshot["peak_active_replicas"] == 2
+    assert snapshot["by_kind"]["props"]["count"] == 1
+    replicas = {row["model"]: row for row in snapshot["replicas"]}
+    assert replicas["replica-0"]["peak"] == 2
+    assert replicas["replica-1"]["count"] == 2
+    assert replicas["replica-1"]["failed"] == 1
