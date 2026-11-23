@@ -354,6 +354,17 @@ def test_static_assets_and_inert_admin_reads_are_served_without_native_probe():
         page = api.get("/")
         assert page.status_code == 200 and "/static/app.js" in page.text
         assert 'type="module"' in page.text
+        assert 'id="plot-metric"' in page.text and 'id="plot-canvas"' in page.text
+        for key in (
+            "prompt_tokens",
+            "output_tokens",
+            "total_tokens",
+            "prefill_rate",
+            "decode_rate",
+            "relay_latency",
+            "first_text",
+        ):
+            assert page.text.count(f'value="{key}"') == 1
         for path in STATIC_ASSETS:
             response = api.get(path)
             assert response.status_code == 200

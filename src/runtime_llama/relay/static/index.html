@@ -94,6 +94,28 @@
           <p id="telemetry-catalog">No catalog observation yet.</p>
         </div>
 
+        <section class="telemetry-section" aria-labelledby="telemetry-plot-heading">
+          <div class="section-heading">
+            <div>
+              <h3 id="telemetry-plot-heading">Observations over time</h3>
+              <p>The currently retained observations, plotted against time. Nothing is archived: the plot shows only what this relay process retains.</p>
+            </div>
+            <label class="inline-actions"><span class="revision-label">Metric</span>
+              <select id="plot-metric" class="plot-metric-select">
+                <option value="prompt_tokens">Prompt tokens</option>
+                <option value="output_tokens">Output tokens</option>
+                <option value="total_tokens" selected>Total tokens</option>
+                <option value="prefill_rate">Native prefill rate</option>
+                <option value="decode_rate">Native generation rate</option>
+                <option value="relay_latency">Relay latency</option>
+                <option value="first_text">Time to first visible text</option>
+              </select>
+            </label>
+          </div>
+          <p class="section-note" id="plot-status">Waiting for the first snapshot.</p>
+          <div id="plot-canvas"></div>
+        </section>
+
         <section class="telemetry-section" aria-labelledby="telemetry-model-heading">
           <h3 id="telemetry-model-heading">Models and connections</h3>
           <p>Outcomes and mean relay elapsed time use the retained requests below.</p>

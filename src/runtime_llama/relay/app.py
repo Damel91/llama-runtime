@@ -215,6 +215,7 @@ STATIC_ASSETS = {
     "/static/connections.js": "connections.js",
     "/static/dom.js": "dom.js",
     "/static/export.js": "export.js",
+    "/static/plot.js": "plot.js",
     "/static/settings.js": "settings.js",
     "/static/state.js": "state.js",
     "/static/style.css": "style.css",

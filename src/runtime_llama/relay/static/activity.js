@@ -4,6 +4,7 @@
 import { $, node, button, unknown, formatNumber, formatMs, formatDate, detailPair, notice } from "./dom.js";
 import { state, busy, refreshLocalState } from "./state.js";
 import { api } from "./api.js";
+import { renderTelemetryPlot } from "./plot.js";
 
 const requestCards = new WeakMap();
 
@@ -196,4 +197,5 @@ export function renderTelemetry() {
   renderTelemetryRows("telemetry-replica-rows", embedding.replicas.map((row) => [row.model, row.endpoint, ...httpCounts(row)]));
   $("telemetry-replica-empty").hidden = embedding.replicas.length > 0;
   $("telemetry-replica-table").hidden = embedding.replicas.length === 0;
+  renderTelemetryPlot();
 }

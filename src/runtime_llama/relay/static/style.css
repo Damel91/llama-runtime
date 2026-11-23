@@ -270,3 +270,11 @@
   .export-output-label textarea) { background: var(--dark-field); }
 :root[data-theme="dark"] :is(input, textarea)::placeholder { color: #92a7bb; }
 :root[data-theme="dark"] .dialog::backdrop { background: #081019b5; }
+
+.plot-metric-select { width: auto; min-width: 210px; }
+.telemetry-plot-svg { width: 100%; max-width: 760px; height: auto; display: block; margin-top: 6px; }
+.telemetry-plot-svg .plot-grid { stroke: var(--line); stroke-width: 1; }
+.telemetry-plot-svg .plot-tick { stroke: var(--muted); stroke-width: 1; }
+.telemetry-plot-svg .plot-label { fill: var(--muted); font-size: 11px; }
+.telemetry-plot-svg .plot-series { stroke: var(--accent); stroke-width: 2; fill: none; }
+.telemetry-plot-svg .plot-point { fill: var(--accent); }
