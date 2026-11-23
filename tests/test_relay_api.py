@@ -12,7 +12,7 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
-from runtime_llama.relay.app import create_app
+from runtime_llama.relay.app import STATIC_ASSETS, create_app
 from runtime_llama.relay.config import RelayConfigStore, default_config
 from runtime_llama.relay.service import RelayService
 from runtime_llama.usage import LLMCallResult, LLMStreamEvent
@@ -353,13 +353,16 @@ def test_static_assets_and_inert_admin_reads_are_served_without_native_probe():
     with client() as (api, app):
         page = api.get("/")
         assert page.status_code == 200 and "/static/app.js" in page.text
-        for path in ("/static/app.js", "/static/style.css"):
+        assert 'type="module"' in page.text
+        for path in STATIC_ASSETS:
             response = api.get(path)
             assert response.status_code == 200
             assert (
                 "frame-ancestors 'none'" in response.headers["content-security-policy"]
             )
             assert response.headers["x-content-type-options"] == "nosniff"
+        for path in ("/static/unknown.js", "/static/../app.py", "/static"):
+            assert api.get(path).status_code == 404
         headers = token(api)
         assert (
             api.get("/api/admin/catalog", headers=headers).json()["observed_at"] is None

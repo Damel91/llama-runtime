@@ -202,6 +202,25 @@ class _RelayStream(Response):
             self.cleanup()
 
 
+# Exact-path whitelist for the console assets: every served file is listed here,
+# and no other path can reach the package's static folder.
+STATIC_ASSETS = {
+    "/": "index.html",
+    "/static/app.js": "app.js",
+    "/static/activity.js": "activity.js",
+    "/static/api.js": "api.js",
+    "/static/audit.js": "audit.js",
+    "/static/catalog.js": "catalog.js",
+    "/static/config.js": "config.js",
+    "/static/connections.js": "connections.js",
+    "/static/dom.js": "dom.js",
+    "/static/export.js": "export.js",
+    "/static/settings.js": "settings.js",
+    "/static/state.js": "state.js",
+    "/static/style.css": "style.css",
+}
+
+
 def create_app(config_path=None, initial_config=None, service=None):
     """Build the optional app; listeners/helper/model loads remain explicit."""
     if service is not None and (config_path is not None or initial_config is not None):
@@ -531,11 +550,7 @@ def create_app(config_path=None, initial_config=None, service=None):
 
     async def static(request):
         authority(request)
-        name = {
-            "/": "index.html",
-            "/static/app.js": "app.js",
-            "/static/style.css": "style.css",
-        }.get(request.url.path)
+        name = STATIC_ASSETS.get(request.url.path)
         if name is None:
             raise RelayError(404, "relay_asset_not_found")
         try:
@@ -544,9 +559,8 @@ def create_app(config_path=None, initial_config=None, service=None):
             raise RelayError(503, "relay_web_assets_unavailable") from None
         content_type = {
             "index.html": "text/html",
-            "app.js": "text/javascript",
             "style.css": "text/css",
-        }[name]
+        }.get(name, "text/javascript")
         return Response(
             payload,
             media_type=content_type,
@@ -584,11 +598,7 @@ def create_app(config_path=None, initial_config=None, service=None):
 
     for method, path in ADMIN_ROUTES:
         routes.append(Route(path, admin, methods=[method]))
-    routes += [
-        Route("/", static),
-        Route("/static/app.js", static),
-        Route("/static/style.css", static),
-    ]
+    routes += [Route(path, static) for path in STATIC_ASSETS]
     app = Starlette(
         routes=routes,
         lifespan=lifespan,
