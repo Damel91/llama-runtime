@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -36,8 +37,10 @@ _CONFIG_FIELDS = frozenset(
         "embedding_defaults",
         "model_overrides",
         "tailnet",
+        "telemetry",
     }
 )
+TELEMETRY_SETTING_FIELDS = frozenset({"retained_observations", "retained_max_age_sec"})
 LLM_SETTING_FIELDS = frozenset(
     {
         "temperature",
@@ -124,6 +127,7 @@ def default_config() -> dict[str, Any]:
         },
         "model_overrides": {},
         "tailnet": None,
+        "telemetry": {"retained_observations": 128, "retained_max_age_sec": None},
     }
 
 
@@ -197,6 +201,24 @@ def _embedding_settings(value: Any) -> dict:
         )
     except (ValueError, TypeError, KeyError, OverflowError):
         raise RelayConfigError("relay_embedding_settings_invalid") from None
+    return value
+
+
+def _telemetry_settings(value: Any) -> dict:
+    value = _object(value, "relay_telemetry_settings_must_be_object")
+    if set(value) - TELEMETRY_SETTING_FIELDS:
+        raise RelayConfigError("relay_telemetry_settings_fields_invalid")
+    limit = value["retained_observations"]
+    if type(limit) is not int or limit < 1:
+        raise RelayConfigError("relay_telemetry_retained_observations_invalid")
+    max_age = value["retained_max_age_sec"]
+    if max_age is not None and (
+        isinstance(max_age, bool)
+        or not isinstance(max_age, (int, float))
+        or not math.isfinite(max_age)
+        or max_age <= 0
+    ):
+        raise RelayConfigError("relay_telemetry_retained_max_age_invalid")
     return value
 
 
@@ -318,6 +340,10 @@ def validate_config(value: Mapping, *, previous: Mapping | None = None) -> dict:
             TailnetConfig(**tailnet)
         except (ValueError, TypeError, KeyError, OverflowError):
             raise RelayConfigError("relay_tailnet_config_invalid") from None
+    telemetry = _object(config["telemetry"], "relay_telemetry_settings_must_be_object")
+    config["telemetry"] = _telemetry_settings(
+        {**default_config()["telemetry"], **telemetry}
+    )
     return config
 
 

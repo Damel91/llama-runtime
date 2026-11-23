@@ -153,11 +153,35 @@ function renderAccess() {
   });
 }
 
+function renderTelemetrySettings() {
+  const container = $("telemetry-fields"); container.replaceChildren();
+  const settings = state.config.telemetry;
+  group(container, "Retained inference observations", "The telemetry view and its plot use only these in-memory observations. Nothing is archived; a relay restart starts from an empty list.", (grid) => {
+    numberField(grid, settings, "telemetry", "retained_observations", "Retained observations", "Whole number of most recent observations kept in memory. Leaving it empty restores the default 128.", true);
+    const wrap = node("div", "field"); wrap.append(node("span", "", "Age limit"), node("small", "", "No age limit keeps observations until the count or an explicit clear removes them; an age drops older entries from the console."));
+    const row = node("div", "optional-value"); const choice = node("select");
+    choice.setAttribute("aria-label", "Observation age limit policy");
+    for (const [value, text] of [["none", "No age limit"], ["seconds", "Seconds"]]) { const option = node("option", "", text); option.value = value; choice.append(option); }
+    const input = node("input"); input.type = "number"; input.step = "any"; input.setAttribute("aria-label", "Observation age limit seconds"); input.placeholder = "Seconds";
+    choice.value = settings.retained_max_age_sec == null ? "none" : "seconds";
+    input.value = settings.retained_max_age_sec ?? ""; input.disabled = choice.value !== "seconds";
+    const update = () => {
+      input.disabled = choice.value !== "seconds";
+      if (choice.value === "seconds" && (!input.value || !Number.isFinite(Number(input.value)) || Number(input.value) <= 0)) throw new Error("Enter a positive finite age limit, or choose no age limit.");
+      optionalValue(settings, "retained_max_age_sec", choice.value === "none" ? "__null__" : input.value);
+    };
+    const errorKey = fieldKey("telemetry", "retained_max_age_sec");
+    const error = editField(input, errorKey, update);
+    choice.addEventListener("change", () => { try { update(); state.errors.delete(errorKey); error.hidden = true; } catch (failure) { state.errors.set(errorKey, failure.message); error.textContent = failure.message; error.hidden = false; } markDirty(); });
+    row.append(choice, input); wrap.append(row, error); grid.append(wrap);
+  });
+}
+
 export function renderSettings() {
   if (!state.config) return;
   renderLLM($("llm-default-fields"), state.config.llm_defaults, "global:llm");
   renderEmbedding($("embedding-default-fields"), state.config.embedding_defaults, "global:embedding");
-  renderTailnet(); renderAccess(); state.renderers.models();
+  renderTailnet(); renderTelemetrySettings(); renderAccess(); state.renderers.models();
   if ($("override-model").value) renderOverrides($("override-model").value);
   openSettingsTab(state.settingsTab);
 }

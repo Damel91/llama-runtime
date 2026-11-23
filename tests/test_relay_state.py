@@ -5,6 +5,7 @@ from copy import deepcopy
 import gc
 import json
 from threading import Event, Thread
+import time
 import weakref
 
 import pytest
@@ -381,6 +382,79 @@ def test_snapshot_and_update_do_not_share_mutable_counters():
     finished = registry.finish(request.request_id)
     finished["usage"]["total_tokens"] = 9
     assert registry.snapshot()["last_completed"]["usage"]["total_tokens"] == 5
+
+
+def _complete_chat(registry, model="model"):
+    request = registry.start("chat", model, 1)
+    registry.finish(request.request_id)
+    return request.request_id
+
+
+def test_retention_limit_keeps_only_newest_observations():
+    registry = RelayRequestRegistry(retained_observations=3)
+    identifiers = [_complete_chat(registry) for _ in range(6)]
+    snapshot = registry.telemetry_snapshot()
+    assert [row["request_id"] for row in snapshot["recent"]] == list(
+        reversed(identifiers[-3:])
+    )
+    assert snapshot["counters"]["completed"] == 6
+    registry.apply_retention(1, None)
+    assert [row["request_id"] for row in registry.telemetry_snapshot()["recent"]] == [
+        identifiers[-1]
+    ]
+    assert registry.telemetry_snapshot()["counters"]["completed"] == 6
+
+
+def test_retention_age_expiry_drops_older_observations():
+    registry = RelayRequestRegistry()
+    _complete_chat(registry)
+    assert len(registry.telemetry_snapshot()["recent"]) == 1
+    registry.apply_retention(128, 0.02)
+    time.sleep(0.05)
+    fresh = _complete_chat(registry)
+    snapshot = registry.telemetry_snapshot()
+    assert [row["request_id"] for row in snapshot["recent"]] == [fresh]
+    assert snapshot["counters"]["completed"] == 2
+    registry.apply_retention(128, None)
+    assert len(registry.telemetry_snapshot()["recent"]) == 1
+
+
+def test_clear_recent_empties_only_the_retained_list():
+    registry = RelayRequestRegistry()
+    finished = _complete_chat(registry)
+    active = registry.start("chat", "model", 1)
+    before = registry.telemetry_snapshot()
+    assert before["recent"] and before["counters"]["completed"] == 1
+    registry.clear_recent()
+    after = registry.telemetry_snapshot()
+    assert after["recent"] == []
+    assert after["counters"] == before["counters"]
+    assert after["active"]["total"] == 1
+    assert not active.cancelled()
+    assert registry.snapshot()["last_completed"]["request_id"] == finished
+
+
+def test_retention_values_are_validated_at_construction_and_apply():
+    with pytest.raises(ValueError):
+        RelayRequestRegistry(retained_observations=0)
+    with pytest.raises(ValueError):
+        RelayRequestRegistry(retained_max_age_sec=-1)
+    registry = RelayRequestRegistry()
+    _complete_chat(registry)
+    for limit, age in [
+        (0, None),
+        (-2, None),
+        (12.5, None),
+        (True, None),
+        (128, 0),
+        (128, -1),
+        (128, float("inf")),
+        (128, "60"),
+        (128, True),
+    ]:
+        with pytest.raises(ValueError):
+            registry.apply_retention(limit, age)
+    assert len(registry.telemetry_snapshot()["recent"]) == 1
 
 
 @pytest.mark.parametrize(

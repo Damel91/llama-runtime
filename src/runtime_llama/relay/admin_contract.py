@@ -21,6 +21,7 @@ ADMIN_ROUTES = (
     ("GET", "/api/admin/requests"),
     ("POST", "/api/admin/requests/{request_id}/cancel"),
     ("DELETE", "/api/admin/requests/last-completed"),
+    ("DELETE", "/api/admin/telemetry/observations"),
     ("POST", "/api/admin/tailnet/start"),
     ("POST", "/api/admin/tailnet/stop"),
     ("GET", "/api/admin/opencode"),
@@ -48,6 +49,7 @@ _CONTRACT = {
         "embedding_defaults",
         "model_overrides",
         "tailnet",
+        "telemetry",
     ],
     "secret_write_semantics": "omitted preserves; null clears; value replaces",
     "requests_response": {
@@ -73,9 +75,14 @@ _CONTRACT = {
         "active": "active inference counts and request summaries",
         "counters": "inference outcomes since observation start",
         "models": "active and retained observations grouped by route and operation",
-        "recent": "recent inference completions, newest first",
+        "recent": "retained inference completions, newest first; bounded by config telemetry.retained_observations and telemetry.retained_max_age_sec",
         "embedding_http": "relay-wide embedding adapter HTTP counters and replica activity",
     },
+    "telemetry_clear": (
+        "DELETE /api/admin/telemetry/observations clears only the retained "
+        "recent list; counters, active requests, last_completed and the "
+        "persistent security audit are untouched"
+    ),
     "audit_response": {
         "events": "sanitized recent observations, in descending event order",
         "next_before": "exclusive cursor for the next page or null",

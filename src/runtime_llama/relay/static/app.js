@@ -105,6 +105,7 @@ function bind() {
   $("refresh-requests").addEventListener("click", () => busy($("refresh-requests"), refreshLocalState));
   $("refresh-telemetry").addEventListener("click", () => busy($("refresh-telemetry"), refreshTelemetry));
   $("clear-last").addEventListener("click", () => busy($("clear-last"), async () => { await api("/requests/last-completed", {method: "DELETE"}); notice("Last-completed summary cleared."); await refreshLocalState({afterPending: true}).catch(() => {}); }));
+  $("clear-telemetry").addEventListener("click", () => busy($("clear-telemetry"), async () => { await api("/telemetry/observations", {method: "DELETE"}); notice("Retained observations cleared. Counters and the security audit are unchanged."); await refreshTelemetry().catch(() => {}); }));
   for (const tab of document.querySelectorAll("[data-settings-tab]")) {
     tab.addEventListener("click", () => openSettingsTab(tab.dataset.settingsTab));
     tab.addEventListener("keydown", (event) => { if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return; event.preventDefault(); const tabs = [...document.querySelectorAll("[data-settings-tab]")]; let index = tabs.indexOf(tab); index = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length; openSettingsTab(tabs[index].dataset.settingsTab); tabs[index].focus(); });

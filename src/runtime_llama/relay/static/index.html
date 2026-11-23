@@ -158,8 +158,14 @@
         </section>
 
         <section class="telemetry-section" aria-labelledby="telemetry-recent-heading">
-          <h3 id="telemetry-recent-heading">Recent requests</h3>
-          <p>Open a request to see its timing, token usage, and recovery details.</p>
+          <div class="section-heading">
+            <div>
+              <h3 id="telemetry-recent-heading">Recent requests</h3>
+              <p>Open a request to see its timing, token usage, and recovery details.</p>
+            </div>
+            <button type="button" class="button secondary" id="clear-telemetry">Clear list</button>
+          </div>
+          <p class="section-note" id="telemetry-retention">Retention unavailable.</p>
           <p class="section-note" id="telemetry-recent-empty">No finished inference requests observed yet.</p>
           <div id="telemetry-recent-rows" class="telemetry-request-list"></div>
         </section>
@@ -230,11 +236,12 @@
 
       <section id="view-settings" class="view" aria-labelledby="settings-heading" hidden>
         <div class="section-heading"><div><h2 id="settings-heading">Relay settings</h2><p>Defaults apply when a consumer does not supply an override. Empty optional fields inherit the SDK default.</p></div><span id="config-revision" class="revision-label">Revision —</span></div>
-        <div class="settings-tabs" role="tablist" aria-label="Settings categories"><button type="button" role="tab" id="tab-generation" aria-selected="true" aria-controls="settings-generation" data-settings-tab="generation">Generation</button><button type="button" role="tab" id="tab-embedding" aria-selected="false" aria-controls="settings-embedding" data-settings-tab="embedding">Embeddings</button><button type="button" role="tab" id="tab-overrides" aria-selected="false" aria-controls="settings-overrides" data-settings-tab="overrides">Per-model settings</button><button type="button" role="tab" id="tab-tailnet" aria-selected="false" aria-controls="settings-tailnet" data-settings-tab="tailnet">Private network</button><button type="button" role="tab" id="tab-access" aria-selected="false" aria-controls="settings-access" data-settings-tab="access">Local access</button></div>
+        <div class="settings-tabs" role="tablist" aria-label="Settings categories"><button type="button" role="tab" id="tab-generation" aria-selected="true" aria-controls="settings-generation" data-settings-tab="generation">Generation</button><button type="button" role="tab" id="tab-embedding" aria-selected="false" aria-controls="settings-embedding" data-settings-tab="embedding">Embeddings</button><button type="button" role="tab" id="tab-overrides" aria-selected="false" aria-controls="settings-overrides" data-settings-tab="overrides">Per-model settings</button><button type="button" role="tab" id="tab-tailnet" aria-selected="false" aria-controls="settings-tailnet" data-settings-tab="tailnet">Private network</button><button type="button" role="tab" id="tab-telemetry" aria-selected="false" aria-controls="settings-telemetry" data-settings-tab="telemetry">Telemetry</button><button type="button" role="tab" id="tab-access" aria-selected="false" aria-controls="settings-access" data-settings-tab="access">Local access</button></div>
         <div id="settings-generation" class="settings-panel" role="tabpanel" aria-labelledby="tab-generation"><div id="llm-default-fields"></div></div>
         <div id="settings-embedding" class="settings-panel" role="tabpanel" aria-labelledby="tab-embedding" hidden><div id="embedding-default-fields"></div></div>
         <div id="settings-overrides" class="settings-panel" role="tabpanel" aria-labelledby="tab-overrides" hidden><div class="override-picker"><label>Model selector<input type="text" id="override-model" list="known-models" placeholder="Choose or enter an exact model ID" autocomplete="off"><datalist id="known-models"></datalist></label><button type="button" class="button secondary" id="edit-override">Edit model settings</button></div><div id="override-fields"><p class="section-note">Choose an observed model or enter the selector you want to configure. This does not load a model.</p></div></div>
         <div id="settings-tailnet" class="settings-panel" role="tabpanel" aria-labelledby="tab-tailnet" hidden><div class="section-heading"><div><h3>Tailscale / Headscale helper</h3><p>Use the optional userspace helper. A stopped helper makes its selected connections unavailable.</p></div><span id="tailnet-state" class="status-tag">Unknown</span></div><label class="check-field"><input type="checkbox" id="tailnet-enabled">Configure the embedded private-network client</label><div id="tailnet-fields"></div><div class="inline-actions settings-actions"><button type="button" class="button primary" id="start-tailnet">Start saved helper</button><button type="button" class="button secondary" id="stop-tailnet">Stop helper</button></div><p class="section-note">Starting uses the saved configuration. Enrollment is explicit; no system VPN, routes or DNS are changed by this console.</p></div>
+        <div id="settings-telemetry" class="settings-panel" role="tabpanel" aria-labelledby="tab-telemetry" hidden><div class="section-heading"><div><h3>Retained observations</h3><p>The relay keeps recent inference observations in memory for the telemetry view and its plot. Nothing is written to disk.</p></div></div><div id="telemetry-fields"></div><p class="section-note">Lowering the limit or adding an age drops older observations from the console. Cumulative counters, active requests and the persistent security audit are never rewritten by these settings.</p></div>
         <div id="settings-access" class="settings-panel" role="tabpanel" aria-labelledby="tab-access" hidden><div id="access-fields"></div></div>
       </section>
       <footer class="workspace-footer"><span id="footer-state">Connecting to the local relay.</span><span>Inference API <code>/v1</code></span></footer>

@@ -287,6 +287,18 @@ def test_concurrent_writers_cannot_lose_revision(tmp_path):
         {"model_overrides": {"model": {"llm": []}}},
         {"model_overrides": {"model": {"embedding": 5}}},
         {"tailnet": {"executable": "relative-path"}},
+        {"telemetry": 5},
+        {"telemetry": {"unknown": 1}},
+        {"telemetry": {"retained_observations": 0}},
+        {"telemetry": {"retained_observations": -3}},
+        {"telemetry": {"retained_observations": 12.5}},
+        {"telemetry": {"retained_observations": "128"}},
+        {"telemetry": {"retained_observations": True}},
+        {"telemetry": {"retained_max_age_sec": 0}},
+        {"telemetry": {"retained_max_age_sec": -5}},
+        {"telemetry": {"retained_max_age_sec": float("inf")}},
+        {"telemetry": {"retained_max_age_sec": "60"}},
+        {"telemetry": {"retained_max_age_sec": True}},
     ],
 )
 def test_invalid_configuration_has_safe_error_and_no_effect(config, tmp_path):
@@ -306,9 +318,58 @@ def test_admin_contract_is_versioned_and_independent():
     assert contract["schema_version"] == 1
     assert len(contract["routes"]) == len(ADMIN_ROUTES)
     assert ("DELETE", "/api/admin/requests/last-completed") in ADMIN_ROUTES
+    assert ("DELETE", "/api/admin/telemetry/observations") in ADMIN_ROUTES
     assert contract["opencode_versions"] == ["v1", "v2"]
     contract["config_fields"].clear()
     assert "runtime_endpoints" in admin_contract()["config_fields"]
+    assert "telemetry" in admin_contract()["config_fields"]
+
+
+def test_telemetry_retention_defaults_and_valid_values():
+    assert default_config()["telemetry"] == {
+        "retained_observations": 128,
+        "retained_max_age_sec": None,
+    }
+    without_section = validate_config({"runtime_endpoints": [endpoint()]})
+    assert without_section["telemetry"] == {
+        "retained_observations": 128,
+        "retained_max_age_sec": None,
+    }
+    partial = validate_config({"telemetry": {"retained_observations": 20}})
+    assert partial["telemetry"] == {
+        "retained_observations": 20,
+        "retained_max_age_sec": None,
+    }
+    bounded = validate_config(
+        {"telemetry": {"retained_observations": 5, "retained_max_age_sec": 90.5}}
+    )
+    assert bounded["telemetry"] == {
+        "retained_observations": 5,
+        "retained_max_age_sec": 90.5,
+    }
+    assert validate_config(bounded)["telemetry"] == bounded["telemetry"]
+
+
+def test_invalid_telemetry_retention_has_dedicated_errors(tmp_path):
+    store = RelayConfigStore(tmp_path / "config.json")
+    cases = [
+        (
+            {"telemetry": {"retained_observations": 0}},
+            "relay_telemetry_retained_observations_invalid",
+        ),
+        (
+            {"telemetry": {"retained_max_age_sec": -1}},
+            "relay_telemetry_retained_max_age_invalid",
+        ),
+        ({"telemetry": {"extra": 1}}, "relay_telemetry_settings_fields_invalid"),
+        ({"telemetry": []}, "relay_telemetry_settings_must_be_object"),
+    ]
+    for config, code in cases:
+        with pytest.raises(RelayConfigError) as error:
+            store.replace(0, config)
+        assert code in str(error.value)
+    assert store.snapshot().revision == 0
+    assert store.snapshot().config["telemetry"] == default_config()["telemetry"]
 
 
 def test_config_has_no_catalog_or_model_count_quota():

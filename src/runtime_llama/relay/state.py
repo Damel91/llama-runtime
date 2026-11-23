@@ -10,8 +10,9 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable, Mapping
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
+import math
 from threading import Event, Lock, RLock
 import time
 from typing import Any
@@ -320,15 +321,37 @@ class RelayRequest:
         return self.cancel_event.is_set()
 
 
+DEFAULT_RETAINED_OBSERVATIONS = 128
+
+
+def _validate_retention(retained_observations, retained_max_age_sec) -> None:
+    if type(retained_observations) is not int or retained_observations < 1:
+        raise ValueError("relay_retention_limit_invalid")
+    if retained_max_age_sec is not None and (
+        isinstance(retained_max_age_sec, bool)
+        or not isinstance(retained_max_age_sec, (int, float))
+        or not math.isfinite(retained_max_age_sec)
+        or retained_max_age_sec <= 0
+    ):
+        raise ValueError("relay_retention_max_age_invalid")
+
+
 class RelayRequestRegistry:
     """Active state, a compatibility summary and recent inference observations."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        retained_observations: int = DEFAULT_RETAINED_OBSERVATIONS,
+        retained_max_age_sec: float | None = None,
+    ) -> None:
+        _validate_retention(retained_observations, retained_max_age_sec)
         self._lock = Lock()
         self._active: dict[str, tuple[RelayRequest, dict, float]] = {}
         self._last_completed: dict | None = None
         self._started_at = datetime.now(timezone.utc).isoformat()
-        self._recent: deque[dict] = deque(maxlen=128)
+        self._retained_observations = retained_observations
+        self._retained_max_age_sec = retained_max_age_sec
+        self._recent: deque[dict] = deque()
         self._outcomes = dict.fromkeys(OUTCOMES, 0)
         self._closed = False
 
@@ -398,6 +421,7 @@ class RelayRequestRegistry:
             if summary["kind"] in INFERENCE_KINDS and status in self._outcomes:
                 self._outcomes[status] += 1
                 self._recent.append(summary)
+                self._prune_recent_locked()
             return deepcopy(summary)
 
     def cancel(self, request_id: str) -> bool:
@@ -431,6 +455,7 @@ class RelayRequestRegistry:
     def telemetry_snapshot(self) -> dict:
         with self._lock:
             observed_at = datetime.now(timezone.utc).isoformat()
+            self._prune_recent_locked()
             active = [
                 deepcopy(summary)
                 for _, summary, _ in self._active.values()
@@ -455,3 +480,37 @@ class RelayRequestRegistry:
     def clear_last_completed(self) -> None:
         with self._lock:
             self._last_completed = None
+
+    def apply_retention(
+        self, retained_observations: int, retained_max_age_sec: float | None
+    ) -> None:
+        _validate_retention(retained_observations, retained_max_age_sec)
+        with self._lock:
+            self._retained_observations = retained_observations
+            self._retained_max_age_sec = retained_max_age_sec
+            self._prune_recent_locked()
+
+    def clear_recent(self) -> None:
+        with self._lock:
+            self._recent.clear()
+
+    def _prune_recent_locked(self) -> None:
+        max_age = self._retained_max_age_sec
+        if max_age is not None:
+            horizon = datetime.now(timezone.utc) - timedelta(seconds=max_age)
+            while self._recent:
+                stamp = self._recent[0].get("finished_at") or self._recent[0].get(
+                    "started_at"
+                )
+                try:
+                    observed = datetime.fromisoformat(stamp)
+                    if observed.tzinfo is None:
+                        observed = observed.replace(tzinfo=timezone.utc)
+                except (TypeError, ValueError):
+                    observed = None
+                if observed is not None and observed < horizon:
+                    self._recent.popleft()
+                else:
+                    break
+        while len(self._recent) > self._retained_observations:
+            self._recent.popleft()

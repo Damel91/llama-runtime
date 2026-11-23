@@ -508,6 +508,9 @@ def create_app(config_path=None, initial_config=None, service=None):
         if path == "/api/admin/requests/last-completed":
             service.registry.clear_last_completed()
             return admin_json(service.registry.snapshot())
+        if path == "/api/admin/telemetry/observations":
+            service.registry.clear_recent()
+            return admin_json(service.telemetry())
         if path.endswith("/cancel"):
             identifier = request.path_params["request_id"]
             if not service.cancel_request(identifier):

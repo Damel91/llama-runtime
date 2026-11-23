@@ -25,6 +25,7 @@ from runtime_llama.tailnet import TailnetConfig, TailnetHelper
 from runtime_llama.relay.config import RelayConfigStore
 from runtime_llama.relay.opencode_config import apply_opencode_v2
 from runtime_llama.relay.state import (
+    DEFAULT_RETAINED_OBSERVATIONS,
     RelayGeneration,
     RelayGenerationManager,
     RelayRequestRegistry,
@@ -110,7 +111,13 @@ class RelayService:
         self.config_store = (
             config_store if config_store is not None else RelayConfigStore()
         )
-        self.registry = RelayRequestRegistry()
+        telemetry_settings = self.config_store.snapshot().config.get("telemetry") or {}
+        self.registry = RelayRequestRegistry(
+            telemetry_settings.get(
+                "retained_observations", DEFAULT_RETAINED_OBSERVATIONS
+            ),
+            telemetry_settings.get("retained_max_age_sec"),
+        )
         self.generations = RelayGenerationManager(self.config_store.snapshot())
         self.listener = deepcopy(
             listener or self.config_store.snapshot().config["listener"]
@@ -731,6 +738,13 @@ class RelayService:
             old = self.config_store.snapshot()
             snapshot = self.config_store.replace(expected_revision, config)
             self.generations.replace(snapshot)
+            telemetry_settings = snapshot.config.get("telemetry") or {}
+            self.registry.apply_retention(
+                telemetry_settings.get(
+                    "retained_observations", DEFAULT_RETAINED_OBSERVATIONS
+                ),
+                telemetry_settings.get("retained_max_age_sec"),
+            )
             retired = list(self._cached.values())
             self._cached.clear()
             self._loaded_model_identities.clear()

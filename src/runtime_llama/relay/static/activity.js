@@ -169,6 +169,16 @@ function telemetryRequestCard(summary) {
   return card;
 }
 
+function renderTelemetryRetention(shown) {
+  const retention = state.config ? state.config.telemetry : null;
+  $("clear-telemetry").disabled = shown === 0;
+  if (!retention) { $("telemetry-retention").textContent = "Retention unavailable."; return; }
+  const age = retention.retained_max_age_sec == null
+    ? "no age limit"
+    : `dropped after ${retention.retained_max_age_sec.toLocaleString(undefined, {maximumFractionDigits: 1})} seconds`;
+  $("telemetry-retention").textContent = `Retention: ${formatNumber(retention.retained_observations)} most recent observations, ${age}. ${formatNumber(shown)} shown now. Clearing the list never changes counters, active requests or the security audit.`;
+}
+
 export function renderTelemetry() {
   const snapshot = state.telemetry;
   const {active, counters, models, recent, embedding_http: embedding} = snapshot;
@@ -190,6 +200,7 @@ export function renderTelemetry() {
   renderRequestCards($("telemetry-recent-rows"), recent, telemetryRequestCard);
   $("telemetry-active-empty").hidden = active.requests.length > 0;
   $("telemetry-recent-empty").hidden = recent.length > 0;
+  renderTelemetryRetention(recent.length);
   $("telemetry-active-replicas").textContent = `${formatNumber(embedding.active_replicas)} active replicas · peak ${formatNumber(embedding.peak_active_replicas)}.`;
   const httpLabels = {health: "Health", catalog: "Catalog", props: "Properties", tokenize: "Tokenization", embedding: "Embedding POST"};
   const httpCounts = (row) => [row.count, row.failed, row.active, row.peak].map(formatNumber);

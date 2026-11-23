@@ -43,7 +43,8 @@ The console shows when the configured listener differs from the running address.
    Discovery reads server metadata. Unknown capabilities and context are
    displayed as unknown.
 3. In **Settings**, adjust generation and embedding defaults, per-model
-   overrides, listener and inference access. Empty optional settings inherit
+   overrides, retained-observation retention, listener and inference access.
+   Empty optional settings inherit
    the SDK default. Explicit zero and the separate **No idle limit** choice
    retain their meanings. A successful save applies to new requests. Active
    requests keep their configuration, and listener changes require a restart.
@@ -61,7 +62,13 @@ Open **Telemetry** to see active chat and embedding requests, recent outcomes,
 and the time of the last catalog observation. Filter active and recent requests
 by runtime, model and operation. Process totals count admitted inference since
 the relay started. Per-model summaries use the active requests and retained
-completions. The relay keeps the latest 128 inference completions in memory.
+completions. The relay keeps the latest inference completions in memory, bounded
+by the **Telemetry** settings: `telemetry.retained_observations` (a whole count,
+default 128) and the optional `telemetry.retained_max_age_sec` age limit that
+drops older entries. The status line next to **Recent requests** states the
+active limit. **Clear list** empties only that retained list: cumulative
+counters, active requests, the last-completed summary and the persistent
+security audit are unchanged, and nothing is ever archived to disk.
 
 For chat, **First text at relay** is measured from admission to the first
 nonempty visible-text event of a stream. Native prefill, decode and generation

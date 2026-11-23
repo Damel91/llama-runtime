@@ -355,6 +355,14 @@ def test_static_assets_and_inert_admin_reads_are_served_without_native_probe():
         assert page.status_code == 200 and "/static/app.js" in page.text
         assert 'type="module"' in page.text
         assert 'id="plot-metric"' in page.text and 'id="plot-canvas"' in page.text
+        for retention_id in (
+            "clear-telemetry",
+            "telemetry-retention",
+            "tab-telemetry",
+            "settings-telemetry",
+            "telemetry-fields",
+        ):
+            assert f'id="{retention_id}"' in page.text
         for key in (
             "prompt_tokens",
             "output_tokens",
@@ -1462,6 +1470,65 @@ def test_telemetry_shows_local_observations_without_probing_or_leaking_content(
             (len(upstream["gets"]), len(upstream["posts"]))
             for upstream in (chat_upstream, embed_upstream)
         ]
+
+
+def test_clear_observations_route_and_configured_limit_touch_only_recent(
+    native_servers,
+):
+    chat_url, _ = native_servers(key="private-chat-key")
+    settings = config_for((chat_url, {"api_key": "private-chat-key"}))
+    with client(settings) as (api, _):
+        headers = token(api)
+        path = "/api/admin/telemetry/observations"
+        assert api.get(path, headers=headers).status_code == 405
+        assert api.delete(path).status_code == 401
+
+        def chat():
+            response = api.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "chat-model",
+                    "messages": [{"role": "user", "content": "input"}],
+                    "stream": False,
+                },
+            )
+            assert response.status_code == 200, response.text
+
+        chat()
+        before = api.get("/api/admin/telemetry", headers=headers).json()
+        assert len(before["recent"]) == 1 and before["counters"]["completed"] == 1
+        audit_before = api.get("/api/admin/audit", headers=headers).json()["events"]
+
+        cleared = api.delete(path, headers=headers)
+        assert cleared.status_code == 200, cleared.text
+        assert cleared.json()["recent"] == []
+        assert cleared.json()["counters"] == before["counters"]
+        after = api.get("/api/admin/telemetry", headers=headers).json()
+        assert after["recent"] == []
+        assert after["counters"] == before["counters"]
+        assert api.get("/api/admin/requests", headers=headers).json()["last_completed"]
+        assert (
+            api.get("/api/admin/audit", headers=headers).json()["events"]
+            == audit_before
+        )
+
+        config = api.get("/api/admin/config", headers=headers).json()
+        assert config["config"]["telemetry"] == {
+            "retained_observations": 128,
+            "retained_max_age_sec": None,
+        }
+        config["config"]["telemetry"]["retained_observations"] = 1
+        saved = api.put(
+            "/api/admin/config",
+            headers=headers,
+            json={"expected_revision": config["revision"], "config": config["config"]},
+        )
+        assert saved.status_code == 200, saved.text
+        chat()
+        chat()
+        bounded = api.get("/api/admin/telemetry", headers=headers).json()
+        assert len(bounded["recent"]) == 1
+        assert bounded["counters"]["completed"] == before["counters"]["completed"] + 2
 
 
 @pytest.mark.parametrize("stream", [False, True])
